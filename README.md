@@ -107,44 +107,43 @@ networkx==3.2
 
 ## 4. Repository Structure
 
-Current and planned structure:
-
+```plaintext
 GNN-HQC-schedular/
-├── README.md                  # This file
+├── README.md
 ├── requirements.txt
-├── simple_test.py             # Quick end-to-end sanity test (Phase 1)
-├── test_thresholds.py         # Compare segmentation across thresholds
-├── test_thresholds_visual.py  # Visualize segmentation vs threshold
+├── simple_test.py
+├── test_thresholds.py
+├── test_thresholds_visual.py
 │
 ├── src/
 │   ├── __init__.py
-│   ├── circuit_generation.py      # Generate benchmark circuits (QFT, later QAOA/random)
-│   ├── circuit_representation.py  # DAG + layers + active qubits per layer
-│   ├── circuit_segmentation.py    # Jaccard-based temporal segmentation into segments
-│   ├── circuit_visualization.py   # Circuit diagrams, layer activity heatmaps, segmentation plots
-│   ├── qubit_graph.py             # (Phase 2) Build qubit interaction graph + features
-│   ├── gnn_model.py               # (Phase 2) GNN/RNN for qubit embeddings
-│   ├── clustering.py              # (Phase 2) Soft clustering / assignment per segment
-│   ├── cost_model.py              # (Phase 2) Execution + movement cost functions
-│   ├── training.py                # (Phase 2) Training loop for GNN
-│   └── utils.py                   # Shared utilities
+│   ├── circuit_generation.py
+│   ├── circuit_representation.py
+│   ├── circuit_segmentation.py
+│   ├── circuit_visualization.py
+│   ├── qubit_graph.py
+│   ├── gnn_model.py
+│   ├── clustering.py
+│   ├── cost_model.py
+│   ├── training.py
+│   └── utils.py
 │
 ├── data/
-│   ├── circuits/                  # Saved QASM circuits
-│   └── results/                   # Logs, metrics, plots
+│   ├── circuits/
+│   └── results/
 │
 ├── notebooks/
-│   ├── 01_circuit_exploration.ipynb   # Generate circuit, layers, segmentation (Phase 1)
-│   ├── 02_qubit_graph.ipynb           # (Phase 2)
-│   ├── 03_gnn_training.ipynb          # (Phase 2)
-│   └── 04_evaluation.ipynb            # (Phase 2)
+│   ├── 01_circuit_exploration.ipynb
+│   ├── 02_qubit_graph.ipynb
+│   ├── 03_gnn_training.ipynb
+│   └── 04_evaluation.ipynb
 │
 └── tests/
-    ├── test_circuit_representation.py # (Phase 1) unit tests
-    ├── test_segmentation.py           # (Phase 1) unit tests
+    ├── test_circuit_representation.py
+    ├── test_segmentation.py
     └── ...
 
----
+
 
 ## 5. Phase 1: Working Prototype (End-to-End Skeleton)
 
