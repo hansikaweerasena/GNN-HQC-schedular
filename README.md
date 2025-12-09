@@ -143,7 +143,7 @@ GNN-HQC-schedular/
     ├── test_segmentation.py
     └── ...
 
-
+```
 
 ## 5. Phase 1: Working Prototype (End-to-End Skeleton)
 
