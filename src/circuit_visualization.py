@@ -57,7 +57,7 @@ def visualize_layer_activity(layers: List[CircuitLayer], num_qubits: int):
         for q in layer.active_qubits:
             activity[q, l_idx] = 1
 
-    plt.figure(figsize=(8, 4))
+    plt.figure(figsize=(10, 6))
     plt.imshow(activity, aspect="auto", cmap="Blues", interpolation="nearest")
     plt.colorbar(label="Active (1) / Inactive (0)")
     plt.xlabel("Layer")
@@ -73,7 +73,7 @@ def visualize_layer_activity(layers: List[CircuitLayer], num_qubits: int):
 def visualize_segmentation(activity: np.ndarray, segments, title_suffix=""):
     num_qubits, num_layers = activity.shape
 
-    plt.figure(figsize=(8, 4))
+    plt.figure(figsize=(10, 6))
     plt.imshow(activity, aspect="auto", cmap="Blues", interpolation="nearest")
     plt.colorbar(label="Active (1) / Inactive (0)")
     plt.xlabel("Layer")
