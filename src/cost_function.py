@@ -12,7 +12,7 @@ class TechCosts:
     execution_cost_2q: float        # cost contribution per qubit for 2-qubit gate
 
 
-class ExecCostOnly(nn.Module):
+class ExecCost(nn.Module):
     """
     Execution cost using per-qubit soft tech assignments.
 
@@ -68,7 +68,7 @@ class ExecCostOnly(nn.Module):
                         # P_t[q]: [K]
                         expected_cost_q = (P_t[q] * cost_vec).sum()
                         exec_cost_t += expected_cost_q
-                        
+
             total_exec += exec_cost_t
 
             per_segment.append(
@@ -84,7 +84,7 @@ class ExecCostOnly(nn.Module):
         }
     
 
-class IdleCostOnly(nn.Module):
+class IdleCost(nn.Module):
     """
     Idle cost using per-qubit soft tech assignments.
 
@@ -156,7 +156,7 @@ class IdleCostOnly(nn.Module):
 
 
 
-class MovementCostOnly(nn.Module):
+class MovementCost(nn.Module):
     """
     Movement cost using soft change in tech assignment between segments.
 
@@ -220,9 +220,9 @@ class TotalCost(nn.Module):
     Combine execution, idle, and movement costs into a single scalar.
 
     Uses:
-    - ExecCostOnly (per-qubit, per-gate)
-    - IdleCostOnly (per-qubit, per-idle-layer)
-    - MovementCostOnly (per-qubit, per-change-in-tech)
+    - ExecCost (per-qubit, per-gate)
+    - IdleCost (per-qubit, per-idle-layer)
+    - MovementCost (per-qubit, per-change-in-tech)
     """
 
     def __init__(
@@ -234,11 +234,11 @@ class TotalCost(nn.Module):
         super().__init__()
         assert len(exec_costs) == len(idle_costs) == len(move_costs)
         self.K = len(exec_costs)
-        self.exec_cost_module = ExecCostOnly(
+        self.exec_cost_module = ExecCost(
             [TechCosts(execution_cost_per_gate=c) for c in exec_costs]
         )
-        self.idle_cost_module = IdleCostOnly(idle_costs)
-        self.move_cost_module = MovementCostOnly(move_costs)
+        self.idle_cost_module = IdleCost(idle_costs)
+        self.move_cost_module = MovementCost(move_costs)
 
     def forward(
         self,

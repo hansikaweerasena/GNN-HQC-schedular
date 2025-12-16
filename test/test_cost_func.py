@@ -20,7 +20,7 @@ import torch
 from src.evolving_gnn import EvolvingGNN
 from torch_geometric.data import Data
 from src.clustering_head import SegmentClustering
-from src.cost_function import ExecCostOnly, TechCosts, IdleCostOnly, MovementCostOnly, TotalCost
+from src.cost_function import ExecCost, TechCosts, IdleCost, MovementCost, TotalCost
 
 
 def run_segmentation(rep, threshold):
@@ -151,7 +151,7 @@ if __name__ == "__main__":
         TechCosts(execution_cost_1q=0.05, execution_cost_2q=0.1),  # Tech 0
         TechCosts(execution_cost_1q=0.25, execution_cost_2q=0.5),  # Tech 1
     ]
-    exec_cost_module = ExecCostOnly(tech_costs)
+    exec_cost_module = ExecCost(tech_costs)
 
 
     print("\n=== Execution Cost Test (soft tech) ===")
@@ -167,7 +167,7 @@ if __name__ == "__main__":
     # ==============================
     # same K as clusters/techs (here K=2)
     idle_costs = [0.5, 0.1]  # Tech0 idle, Tech1 idle, example
-    idle_cost_module = IdleCostOnly(idle_costs)
+    idle_cost_module = IdleCost(idle_costs)
 
     print("\n=== Idle Cost Test (soft tech) ===")
     idle_res = idle_cost_module(P_seq, segments, rep)
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     # Movement cost test (soft tech)
     # ==============================
     move_costs = [0.3, 0.3]  # same for both techs here; can be different per tech
-    move_cost_module = MovementCostOnly(move_costs)
+    move_cost_module = MovementCost(move_costs)
 
     print("\n=== Movement Cost Test (soft tech) ===")
     move_res = move_cost_module(P_seq)
