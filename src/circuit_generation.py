@@ -38,6 +38,34 @@ def generate_qft_circuit(num_qubits: int) -> QuantumCircuit:
     
     return qc
 
+ONE_QUBIT_GATES = ['h', 'x', 'y', 'z', 's', 't']
+TWO_QUBIT_GATES = ['cx', 'cz', 'swap']
+
+def apply_random_1q_gate(qc: QuantumCircuit, q: int):
+    gate_type = np.random.choice(ONE_QUBIT_GATES)
+    if gate_type == 'h':
+        qc.h(q)
+    elif gate_type == 'x':
+        qc.x(q)
+    elif gate_type == 'y':
+        qc.y(q)
+    elif gate_type == 'z':
+        qc.z(q)
+    elif gate_type == 's':
+        qc.s(q)
+    else:  # 't'
+        qc.t(q)
+
+
+def apply_random_2q_gate(qc: QuantumCircuit, q1: int, q2: int):
+    gate_type = np.random.choice(TWO_QUBIT_GATES)
+    if gate_type == 'cx':
+        qc.cx(q1, q2)
+    elif gate_type == 'cz':
+        qc.cz(q1, q2)
+    else:  # 'swap'
+        qc.swap(q1, q2)
+
 
 def generate_random_circuit_custom(n_qubits=10, depth=20, gate_density=0.3, seed=None):
     """
@@ -66,40 +94,25 @@ def generate_random_circuit_custom(n_qubits=10, depth=20, gate_density=0.3, seed
                 active_qubits.append(q)
         
         # Add gates to active qubits
-        np.random.shuffle(active_qubits)
-        
-        # Add 2-qubit gates (pairs of qubits)
-        for i in range(0, len(active_qubits) - 1, 2):
-            q1, q2 = active_qubits[i], active_qubits[i + 1]
-            gate_type = np.random.choice(['cx', 'cz', 'swap'])
-            
-            if gate_type == 'cx':
-                qc.cx(q1, q2)
-            elif gate_type == 'cz':
-                qc.cz(q1, q2)
+                np.random.shuffle(active_qubits)
+        i = 0
+        while i < len(active_qubits):
+            if i + 1 < len(active_qubits):
+                q1, q2 = active_qubits[i], active_qubits[i + 1]
+                use_two_qubit = np.random.rand() < 0.5  # ~50% chance
+
+                if use_two_qubit:
+                    apply_random_2q_gate(qc, q1, q2)
+                else:
+                    apply_random_1q_gate(qc, q1)
+                    apply_random_1q_gate(qc, q2)
+                i += 2
             else:
-                qc.swap(q1, q2)
-        
-        # Add single-qubit gate to any leftover qubit
-        if len(active_qubits) % 2 == 1:
-            q = active_qubits[-1]
-            gate_type = np.random.choice(['h', 'x', 'y', 'z', 's', 't'])
+                q = active_qubits[i]
+                apply_random_1q_gate(qc, q)
+                i += 1
+         # Add barrier to force layer separation
+        if active_qubits:
+            qc.barrier(*active_qubits)
             
-            if gate_type == 'h':
-                qc.h(q)
-            elif gate_type == 'x':
-                qc.x(q)
-            elif gate_type == 'y':
-                qc.y(q)
-            elif gate_type == 'z':
-                qc.z(q)
-            elif gate_type == 's':
-                qc.s(q)
-            else:  # 't'
-                qc.t(q)
-        
-        # Add barrier to force layer separation
-        # if active_qubits:
-        #     qc.barrier(*active_qubits)
-    
     return qc
