@@ -9,6 +9,7 @@ from src.qubit_interaction_graph import (
     print_graph_stats,
     print_segment_info,
     visualize_segment_graph,
+    build_segment_graph_arrays,
 )
 from src.circuit_visualization import (
     visualize_circuit,
@@ -46,7 +47,7 @@ if __name__ == "__main__":
     # Visualize layer activity
     activity = visualize_layer_activity(rep.layers, rep.num_qubits)
 
-    threshold = 0.5
+    threshold = 0.3
     segments, seg_ids = run_segmentation(rep, threshold)
     stats = analyze_segmentation(segments, rep.num_qubits)
 
@@ -58,6 +59,7 @@ if __name__ == "__main__":
     # Visualize segmentation
     visualize_segmentation(activity, segments, title_suffix=f"(threshold={threshold})")
 
+    # === Global qubit interaction graph (for analysis/debug) ===
     G, x, edge_index, edge_attr = build_qubit_interaction_multigraph(rep, seg_ids)
 
     print_graph_stats(G)
@@ -65,6 +67,18 @@ if __name__ == "__main__":
 
     for seg_id in sorted(set(seg_ids)):
         visualize_segment_graph(G, seg_id, title=f"Segment {seg_id} (QFT)")
+
+    # === Per-segment graphs (for evolving GNN) ===
+    per_segment_graphs = build_segment_graph_arrays(rep, segments)
+
+    print("\n=== Per-segment graph arrays (for evolving GNN) ===")
+    for seg_id, x_s, edge_index_s, edge_attr_s in per_segment_graphs:
+        print(
+            f"Segment {seg_id}: "
+            f"x_s {x_s.shape}, "
+            f"edge_index_s {edge_index_s.shape}, "
+            f"edge_attr_s {edge_attr_s.shape}"
+        )
 
 
 
