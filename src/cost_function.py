@@ -227,15 +227,17 @@ class TotalCost(nn.Module):
 
     def __init__(
         self,
-        exec_costs: List[float],
+        exec_costs_1q: List[float],
+        exec_costs_2q: List[float],
         idle_costs: List[float],
         move_costs: List[float],
     ):
         super().__init__()
-        assert len(exec_costs) == len(idle_costs) == len(move_costs)
-        self.K = len(exec_costs)
+        assert len(exec_costs_1q) == len(exec_costs_2q) == len(idle_costs) == len(move_costs)
+        self.K = len(exec_costs_1q)
         self.exec_cost_module = ExecCost(
-            [TechCosts(execution_cost_per_gate=c) for c in exec_costs]
+            [TechCosts(execution_cost_1q=c1, execution_cost_2q=c2)
+             for c1, c2 in zip(exec_costs_1q, exec_costs_2q)]
         )
         self.idle_cost_module = IdleCost(idle_costs)
         self.move_cost_module = MovementCost(move_costs)
@@ -264,6 +266,44 @@ class TotalCost(nn.Module):
             "execution_cost": total_exec,
             "idle_cost": total_idle,
             "movement_cost": total_move,
+            "exec_per_segment": exec_res["per_segment_costs"],
+            "idle_per_segment": idle_res["per_segment_costs"],
+            "move_per_segment": move_res["per_segment_costs"],
+        }
+
+
+    def forward(self, P_seq, segments, circuit):
+        exec_res = self.exec_cost_module(P_seq, segments, circuit)
+        idle_res = self.idle_cost_module(P_seq, segments, circuit)
+        move_res = self.move_cost_module(P_seq)
+
+        total_exec = exec_res["execution_cost"]
+        total_idle = idle_res["idle_cost"]
+        total_move = move_res["movement_cost"]
+
+        # build per-segment total (Python floats list)
+        per_seg_totals = []
+        for t, seg in enumerate(segments):
+            exec_t = exec_res["per_segment_costs"][t]["execution_cost"]
+            idle_t = idle_res["per_segment_costs"][t]["idle_cost"]
+            move_t = move_res["per_segment_costs"][t]["movement_cost"]
+            per_seg_totals.append(exec_t + idle_t + move_t)
+
+        # turn into tensor [T] on the same device
+        per_seg_totals_t = torch.tensor(
+            per_seg_totals,
+            device=P_seq[0].device,
+            dtype=P_seq[0].dtype,
+        )
+
+        total_cost = per_seg_totals_t.sum()
+
+        return {
+            "total_cost": total_cost,
+            "execution_cost": total_exec,
+            "idle_cost": total_idle,
+            "movement_cost": total_move,
+            "per_segment_total": per_seg_totals_t,  # [T]
             "exec_per_segment": exec_res["per_segment_costs"],
             "idle_per_segment": idle_res["per_segment_costs"],
             "move_per_segment": move_res["per_segment_costs"],

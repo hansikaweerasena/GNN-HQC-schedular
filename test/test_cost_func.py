@@ -197,11 +197,13 @@ if __name__ == "__main__":
     # Total cost test (exec + idle + move)
     # ==============================
     # Must match K (number of clusters/techs) – here K=2
-    exec_costs = [0.1, 0.5]  # Tech0, Tech1
-    idle_costs = [0.5, 0.1]
-    move_costs = [0.3, 0.3]
+    exec_costs_1q = [0.05, 0.25]  # example per-tech 1q costs
+    exec_costs_2q = [0.10, 0.50]  # example per-tech 2q costs
+    idle_costs    = [0.5, 0.1]
+    move_costs    = [0.3, 0.3]
 
-    total_cost_module = TotalCost(exec_costs, idle_costs, move_costs)
+    total_cost_module = TotalCost(exec_costs_1q, exec_costs_2q, idle_costs, move_costs)
+
 
     print("\n=== Total Cost Test ===")
     cost_all = total_cost_module(P_seq, segments, rep)
