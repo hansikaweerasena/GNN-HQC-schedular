@@ -8,7 +8,8 @@ import torch.nn as nn
 
 @dataclass
 class TechCosts:
-    execution_cost_per_gate: float  # cost contribution per qubit per gate
+    execution_cost_1q: float        # cost contribution per qubit for 1-qubit gate
+    execution_cost_2q: float        # cost contribution per qubit for 2-qubit gate
 
 
 class ExecCostOnly(nn.Module):
@@ -23,13 +24,15 @@ class ExecCostOnly(nn.Module):
     def __init__(self, tech_costs: List[TechCosts]):
         super().__init__()
         self.K = len(tech_costs)
-        self.exec_cost = nn.Parameter(
-            torch.tensor(
-                [tc.execution_cost_per_gate for tc in tech_costs],
-                dtype=torch.float32,
-            ),
+        self.exec_cost_1q = nn.Parameter(
+            torch.tensor([tc.execution_cost_1q for tc in tech_costs], dtype=torch.float32),
             requires_grad=False,
         )
+        self.exec_cost_2q = nn.Parameter(
+            torch.tensor([tc.execution_cost_2q for tc in tech_costs], dtype=torch.float32),
+            requires_grad=False,
+        )
+
 
     def forward(
         self,
@@ -54,12 +57,18 @@ class ExecCostOnly(nn.Module):
             for layer_idx in seg.layers:
                 layer = circuit.layers[layer_idx]
                 for gate_name, qubits in layer.gates:
-                    # For each qubit in this gate, compute expected cost
-                    for q in qubits:
-                        # P_t[q]: [K], broadcast with exec_cost [K]
-                        expected_cost_q = (P_t[q] * self.exec_cost.to(device)).sum()
-                        exec_cost_t += expected_cost_q
+                    if len(qubits) == 1:
+                        cost_vec = self.exec_cost_1q.to(device)  # [K]
+                    elif len(qubits) == 2:
+                        cost_vec = self.exec_cost_2q.to(device)  # [K]
+                    else:
+                        continue  # ignore exotic gates for now
 
+                    for q in qubits:
+                        # P_t[q]: [K]
+                        expected_cost_q = (P_t[q] * cost_vec).sum()
+                        exec_cost_t += expected_cost_q
+                        
             total_exec += exec_cost_t
 
             per_segment.append(

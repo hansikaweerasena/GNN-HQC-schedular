@@ -148,10 +148,11 @@ if __name__ == "__main__":
     # Execution cost test (soft tech, no idle/move yet)
     # ==============================
     tech_costs = [
-        TechCosts(execution_cost_per_gate=0.1),  # Tech 0
-        TechCosts(execution_cost_per_gate=0.5),  # Tech 1
+        TechCosts(execution_cost_1q=0.05, execution_cost_2q=0.1),  # Tech 0
+        TechCosts(execution_cost_1q=0.25, execution_cost_2q=0.5),  # Tech 1
     ]
     exec_cost_module = ExecCostOnly(tech_costs)
+
 
     print("\n=== Execution Cost Test (soft tech) ===")
     exec_res = exec_cost_module(P_seq, segments, rep)
