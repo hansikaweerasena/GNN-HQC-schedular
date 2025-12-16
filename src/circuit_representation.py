@@ -68,11 +68,19 @@ class CircuitRepresentation:
 
             for node in subdag.op_nodes():
                 gate_name = node.op.name
+
+                # Skip non-gate structural ops
+                if gate_name in ["barrier", "measure", "reset"]:
+                    continue
+
                 qargs = tuple(qubit_index[qb] for qb in node.qargs)
                 cl.gates.append((gate_name, qargs))
                 cl.active_qubits.update(qargs)
 
-            self.layers.append(cl)
+            # Only keep layers that have at least one real gate
+            if cl.gates:
+                self.layers.append(cl)
+
 
     def summary(self):
         return {
