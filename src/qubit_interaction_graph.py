@@ -217,48 +217,41 @@ def multigraph_to_arrays(
     G: nx.MultiGraph,
     known_gate_types: List[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Convert NetworkX MultiGraph to numpy arrays for GNN input.
-
-    Returns:
-        x: Node features [num_nodes, 2] with (first_layer, gate_count)
-        edge_index: Edge connectivity [2, num_edges]
-        edge_attr: Edge features [num_edges, feature_dim]
-               where feature_dim = len(known_gate_types) + 1 (one-hot) + 2 (layer, segment)
-    """
+    ...
     if known_gate_types is None:
         known_gate_types = ['cx', 'cz']
 
-    num_nodes = G.number_of_nodes()
-
-    # Node features
+    # Node features: iterate over actual node IDs in sorted order
+    node_ids = sorted(G.nodes())
     first_layers = []
     gate_counts = []
-    for n in range(num_nodes):
+    for n in node_ids:
         data = G.nodes[n]
         first_layers.append(float(data.get('first_layer', -1)))
         gate_counts.append(float(data.get('gate_count', 0)))
 
     x = np.stack([first_layers, gate_counts], axis=-1).astype(np.float32)
 
-    # Helper: one-hot encode gate type
-    def one_hot_gate(gt: str, known_types: List[str]) -> np.ndarray:
-        vec = np.zeros(len(known_types) + 1, dtype=np.float32)  # +1 for "other"
-        try:
-            idx = known_types.index(gt.lower())
-        except ValueError:
-            idx = len(known_types)  # "other" slot
-        vec[idx] = 1.0
-        return vec
+    # map node id -> index in x
+    node_id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
 
     # Edge features
     edge_u = []
     edge_v = []
     edge_features = []
 
+    def one_hot_gate(gt: str, known_types: List[str]) -> np.ndarray:
+        vec = np.zeros(len(known_types) + 1, dtype=np.float32)
+        try:
+            idx = known_types.index(gt.lower())
+        except ValueError:
+            idx = len(known_types)
+        vec[idx] = 1.0
+        return vec
+
     for u, v, k, attr in G.edges(keys=True, data=True):
-        edge_u.append(u)
-        edge_v.append(v)
+        edge_u.append(node_id_to_idx[u])
+        edge_v.append(node_id_to_idx[v])
 
         gt_vec = one_hot_gate(attr.get('gate_type', 'other'), known_gate_types)
         layer_val = float(attr.get('layer', -1))
@@ -275,6 +268,25 @@ def multigraph_to_arrays(
     )
 
     return x, edge_index, edge_attr
+
+def build_segment_graph_arrays(
+    circuit,              # CircuitRepresentation
+    segments,             # List[Segment]
+    known_gate_types: List[str] = None
+) -> List[Tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    For each segment, build (x_s, edge_index_s, edge_attr_s) directly
+    from its own segment graph.
+
+    Returns:
+      List of (segment_idx, x_s, edge_index_s, edge_attr_s)
+    """
+    segment_graphs = build_segment_qubit_graphs(circuit, segments, known_gate_types)
+    per_segment = []
+    for seg_id, G_s in segment_graphs:
+        x_s, edge_index_s, edge_attr_s = multigraph_to_arrays(G_s, known_gate_types)
+        per_segment.append((seg_id, x_s, edge_index_s, edge_attr_s))
+    return per_segment
 
 
 # ============================================================================
@@ -319,6 +331,72 @@ def build_qubit_interaction_multigraph(
     x, edge_index, edge_attr = multigraph_to_arrays(G, known_gate_types)
 
     return G, x, edge_index, edge_attr
+
+
+def build_segment_qubit_graphs(
+    circuit,              # CircuitRepresentation
+    segments,             # List[Segment]
+    known_gate_types: List[str] = None
+) -> List[Tuple[int, nx.MultiGraph]]:
+    """
+    Build a separate qubit-interaction MultiGraph for each segment.
+
+    For each segment s:
+      - Nodes: all qubits 0..num_qubits-1 with node features (first_layer, gate_count)
+      - Edges: only 2-qubit gates whose layer is in seg.layers
+
+    Returns:
+      List of (segment_idx, G_s), where G_s is a MultiGraph for that segment.
+    """
+    if known_gate_types is None:
+        known_gate_types = ['cx', 'cz']
+
+    num_qubits = circuit.num_qubits
+
+    # Precompute global node features once
+    # (same as add_node_features, but not mutating an existing graph)
+    first_layer = [None] * num_qubits
+    gate_count = [0] * num_qubits
+    for layer_idx, layer in enumerate(circuit.layers):
+        for gate_name, qubits in layer.gates:
+            for q in qubits:
+                gate_count[q] += 1
+                if first_layer[q] is None or layer_idx < first_layer[q]:
+                    first_layer[q] = layer_idx
+    first_layer = [fl if fl is not None else -1 for fl in first_layer]
+
+    segment_graphs: List[Tuple[int, nx.MultiGraph]] = []
+
+    for seg in segments:
+        seg_id = seg.segment_idx
+        G_s = nx.MultiGraph()
+
+        # add all qubits as nodes with features
+        for q in range(num_qubits):
+            G_s.add_node(
+                q,
+                first_layer=first_layer[q],
+                gate_count=gate_count[q],
+            )
+
+        # add edges for 2-qubit gates in this segment
+        for layer_idx in seg.layers:
+            layer = circuit.layers[layer_idx]
+            for gate_name, qubits in layer.gates:
+                if len(qubits) == 2:
+                    q1, q2 = qubits
+                    G_s.add_edge(
+                        q1,
+                        q2,
+                        gate_type=gate_name,
+                        layer=layer_idx,
+                        segment=seg_id,
+                    )
+
+        segment_graphs.append((seg_id, G_s))
+
+    return segment_graphs
+
 
 
 # ============================================================================
