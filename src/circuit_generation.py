@@ -67,7 +67,7 @@ def apply_random_2q_gate(qc: QuantumCircuit, q1: int, q2: int):
         qc.swap(q1, q2)
 
 
-def generate_random_circuit_custom(n_qubits=10, depth=20, gate_density=0.3, seed=None):
+def generate_random_circuit_custom(n_qubits=10, depth=20, gate_density=0.3, seed=None, two_qubit_ratio=0.5,):
     """
     Generate a custom random circuit with controllable sparsity.
     - This creates more realistic circuits where not all qubits are active every layer.
@@ -99,7 +99,7 @@ def generate_random_circuit_custom(n_qubits=10, depth=20, gate_density=0.3, seed
         while i < len(active_qubits):
             if i + 1 < len(active_qubits):
                 q1, q2 = active_qubits[i], active_qubits[i + 1]
-                use_two_qubit = np.random.rand() < 0.5  # ~50% chance
+                use_two_qubit = np.random.rand() < two_qubit_ratio
 
                 if use_two_qubit:
                     apply_random_2q_gate(qc, q1, q2)

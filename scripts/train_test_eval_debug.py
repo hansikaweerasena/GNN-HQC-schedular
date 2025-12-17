@@ -32,23 +32,31 @@ def build_segment_data_list(rep, segments):
 
 
 class CircuitDataset(Dataset):
-    def __init__(self, n_samples=1000, n_qubits=10, depth=20, gate_density=0.3, seed_base=42):
+    def __init__(self, n_samples=1000, n_qubits=10, depth=20, gate_density=0.3, seed_base=42, two_qubit_bounds=None):
         self.n_samples = n_samples
         self.n_qubits = n_qubits
         self.depth = depth
         self.gate_density = gate_density
         self.seed_base = seed_base
+        self.two_qubit_bounds = two_qubit_bounds
+
         
     def __len__(self):
         return self.n_samples
     
     def __getitem__(self, idx):
         seed = self.seed_base + idx  # Sequential seeds = reproducible!
+        if self.two_qubit_bounds is not None:
+            low, high = self.two_qubit_bounds
+            two_qubit_ratio = np.random.uniform(low, high)
+        else:
+            two_qubit_ratio = 0.5 # default
         qc = generate_random_circuit_custom(
             n_qubits=self.n_qubits,
             depth=self.depth,
             gate_density=self.gate_density,
-            seed=seed
+            seed=seed,
+            two_qubit_ratio=two_qubit_ratio
         )
         rep = CircuitRepresentation(qc)
         segments, seg_ids = segment_circuit(rep.layers, threshold=0.3)
@@ -86,11 +94,11 @@ def main():
     N_SAMPLES_TRAIN = 800
     N_SAMPLES_TEST = 200
     BATCH_SIZE = 4  # Small batches due to variable segment lengths
-    N_EPOCHS = 10
+    N_EPOCHS = 100
     
     # Datasets (different seed bases = no overlap)
-    train_dataset = CircuitDataset(n_samples=N_SAMPLES_TRAIN, seed_base=42)
-    test_dataset = CircuitDataset(n_samples=N_SAMPLES_TEST, seed_base=1000)
+    train_dataset = CircuitDataset(n_samples=N_SAMPLES_TRAIN, seed_base=42, two_qubit_bounds=(0.1, 0.9))
+    test_dataset = CircuitDataset(n_samples=N_SAMPLES_TEST, seed_base=1000, two_qubit_bounds=(0.1, 0.9))
 
     fixed_segment_data_list, fixed_segments, fixed_rep = train_dataset[0]
     
@@ -126,7 +134,7 @@ def main():
     
     # Cost module
     exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.25, 0.20]
+    exec_costs_2q = [0.15, 0.05]
     idle_costs = [0.15, 0.10]
     move_costs = [0.3, 0.3]
     
@@ -135,7 +143,7 @@ def main():
     # Optimizer
     optimizer = torch.optim.Adam(
         list(evol_model.parameters()) + list(cluster_module.parameters()),
-        lr=1e-3,
+        lr=1e-4,
     )
     
     # Training history
