@@ -61,10 +61,10 @@ def main():
     )
 
     # costs per tech (example values)
-    exec_costs_1q = [0.05, 0.25]
-    exec_costs_2q = [0.10, 0.50]
-    idle_costs    = [0.5, 0.1]
-    move_costs    = [0.3, 0.3]
+    exec_costs_1q = [0.05, 0.15]
+    exec_costs_2q = [0.40, 0.20]
+    idle_costs = [0.5, 0.1]
+    move_costs = [0.3, 0.3]
 
     total_cost_module = TotalCost(
         exec_costs_1q,
@@ -96,6 +96,28 @@ def main():
         )
         losses.append(loss)
         per_seg_history.append(per_seg.cpu().numpy())
+        # ---- DEBUG: inspect P for single circuit ----
+        with torch.no_grad():
+            evol_model.eval()
+            cluster_module.eval()
+            h_seq, z_seq = evol_model(segment_data_list)
+
+            h0 = h_seq[0]  # [N, H]
+            print("h0 mean:", h0.mean().item(), "std:", h0.std().item())
+            print("h0[0][:5]:", h0[0][:5].detach().cpu().numpy())
+
+            P_seq = cluster_module(h_seq)  # list[T] of [N, K]
+
+            P_start = P_seq[0][0]               # qubit 0, first segment
+            P_mid   = P_seq[len(P_seq)//2][0]   # qubit 0, middle segment
+            P_end   = P_seq[-1][0]              # qubit 0, last segment
+
+        # print(
+        #     f"Epoch {epoch}: loss={loss:.4f}, "
+        #     f"P_start={P_start.detach().cpu().numpy()}, "
+        #     f"P_mid={P_mid.detach().cpu().numpy()}, "
+        #     f"P_end={P_end.detach().cpu().numpy()}"
+        # )
 
         if epoch % 10 == 0:
             print(f"Epoch {epoch}: loss={loss:.4f}, per_segment={per_seg.cpu().numpy()}")
