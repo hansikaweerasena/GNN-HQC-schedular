@@ -13,15 +13,16 @@ class ClusteringHead(nn.Module):
     Output per segment t: P_t [num_qubits, K] (soft assignments)
     """
 
-    def __init__(self, hidden_dim: int, num_clusters: int):
+    def __init__(self, hidden_dim: int, num_clusters: int, temperature: float = 2.0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_clusters = num_clusters
 
         # Learnable cluster prototypes: [K, H]
         self.cluster_prototypes = nn.Parameter(
-            torch.randn(num_clusters, hidden_dim) * 0.1
+            torch.randn(num_clusters, hidden_dim) * 0.01
         )
+        self.temperature = temperature
 
     def forward(self, h_t: torch.Tensor) -> torch.Tensor:
         """
@@ -29,12 +30,16 @@ class ClusteringHead(nn.Module):
         returns:
             P_t: [num_qubits, K] soft assignments per qubit
         """
-        # Similarity: [num_qubits, K]
-        # h_t [N,H]  vs  C [K,H] -> [N,K] via matrix multiply
-        scores = h_t @ self.cluster_prototypes.t()
+        # Per-qubit normalization
+        h_mean = h_t.mean(dim=-1, keepdim=True)
+        h_std  = h_t.std(dim=-1, keepdim=True) + 1e-6
+        h_norm = (h_t - h_mean) / h_std  # [N, H]
 
-        # Softmax over clusters
-        P_t = torch.softmax(scores, dim=-1)
+        # Similarity: [num_qubits, K]
+        scores = h_norm @ self.cluster_prototypes.t()  # [N, K]
+
+        # Temperature-scaled softmax (T > 1 -> softer, less saturated)
+        P_t = torch.softmax(scores / self.temperature, dim=-1)
         return P_t  # [num_qubits, K]
 
 
@@ -46,9 +51,9 @@ class SegmentClustering(nn.Module):
     Output: P_seq: list of [num_qubits, K]
     """
 
-    def __init__(self, hidden_dim: int, num_clusters: int):
+    def __init__(self, hidden_dim: int, num_clusters: int, temperature: float = 2.0):
         super().__init__()
-        self.head = ClusteringHead(hidden_dim, num_clusters)
+        self.head = ClusteringHead(hidden_dim, num_clusters, temperature)
 
     def forward(self, h_seq: List[torch.Tensor]) -> List[torch.Tensor]:
         return [self.head(h_t) for h_t in h_seq]
