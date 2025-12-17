@@ -20,7 +20,7 @@ class ClusteringHead(nn.Module):
 
         # Learnable cluster prototypes: [K, H]
         self.cluster_prototypes = nn.Parameter(
-            torch.randn(num_clusters, hidden_dim) * 0.01
+            torch.randn(num_clusters, hidden_dim)* 0.1
         )
         self.temperature = temperature
 
