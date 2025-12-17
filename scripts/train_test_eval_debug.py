@@ -121,13 +121,13 @@ def main():
     cluster_module = SegmentClustering(
         hidden_dim=evol_model.rnn_hidden_dim,
         num_clusters=K,
-        temperature=3.0,
+        temperature=5.0,
     ).to(device)
     
     # Cost module
     exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.40, 0.20]
-    idle_costs = [0.5, 0.1]
+    exec_costs_2q = [0.25, 0.20]
+    idle_costs = [0.15, 0.10]
     move_costs = [0.3, 0.3]
     
     total_cost_module = TotalCost(exec_costs_1q, exec_costs_2q, idle_costs, move_costs).to(device)
@@ -140,7 +140,19 @@ def main():
     
     # Training history
     train_losses, test_losses = [], []
+
+    # ---- Init debug BEFORE training loop ----
+    with torch.no_grad():
+        evol_model.eval()
+        cluster_module.eval()
+        h_seq, _ = evol_model(fixed_segment_data_list)
+        P_seq = cluster_module(h_seq)
+        print("INIT P_start(q0, seg0) =", P_seq[0][0].cpu().numpy())
     
+    # Pre-train prototypes
+    print("Pre-train prototypes mean:", cluster_module.head.cluster_prototypes.mean().item())
+    print("Pre-train prototypes std:", cluster_module.head.cluster_prototypes.std().item())
+
     # ===== Training Loop =====
     for epoch in tqdm(range(N_EPOCHS), desc="Epochs"):
         evol_model.train()
@@ -167,7 +179,7 @@ def main():
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
 
-            # ---- Fixed-circuit debug ----
+         # ---- Fixed-circuit debug ----
         with torch.no_grad():
             evol_model.eval()
             cluster_module.eval()
@@ -201,6 +213,10 @@ def main():
             print(f"Epoch {epoch:3d}: train={avg_train_loss:.4f}, test={test_loss:.4f}")
             print(f"Test per_segment mean: {test_per_seg.mean():.4f}")
     
+    # Post-train prototypes  
+    print("Post-train prototypes mean:", cluster_module.head.cluster_prototypes.mean().item())
+    print("Post-train prototypes std:", cluster_module.head.cluster_prototypes.std().item())
+
     # ===== Plot Results =====
     plt.figure(figsize=(10, 4))
     

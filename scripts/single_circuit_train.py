@@ -62,8 +62,8 @@ def main():
 
     # costs per tech (example values)
     exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.40, 0.20]
-    idle_costs = [0.5, 0.1]
+    exec_costs_2q = [0.25, 0.20]
+    idle_costs = [0.15, 0.10]
     move_costs = [0.3, 0.3]
 
     total_cost_module = TotalCost(
@@ -107,6 +107,16 @@ def main():
             print("h0[0][:5]:", h0[0][:5].detach().cpu().numpy())
 
             P_seq = cluster_module(h_seq)  # list[T] of [N, K]
+
+            exec_res = total_cost_module.exec_cost_module(P_seq, segments, rep, debug=True)
+            idle_res = total_cost_module.idle_cost_module(P_seq,  segments, rep, debug=True)
+            print("Tech0 vs Tech1 pure costs:")
+            print(f"  Exec 1q: {exec_costs_1q[0]:.2f} vs {exec_costs_1q[1]:.2f}")
+            print(f"  Exec 2q: {exec_costs_2q[0]:.2f} vs {exec_costs_2q[1]:.2f}")
+            print(f"  Idle:    {idle_costs[0]:.2f} vs {idle_costs[1]:.2f}")
+            print(f"  Move:    {move_costs[0]:.2f} vs {move_costs[1]:.2f}")
+
+            
 
             P_start = P_seq[0][0]               # qubit 0, first segment
             P_mid   = P_seq[len(P_seq)//2][0]   # qubit 0, middle segment
