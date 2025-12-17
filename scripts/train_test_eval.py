@@ -89,7 +89,7 @@ def main():
     N_EPOCHS = 100
     
     # Datasets (different seed bases = no overlap)
-    train_dataset = CircuitDataset(n_samples=N_SAMPLES_TRAIN, seed_base=42)
+    train_dataset = CircuitDataset(n_samples=N_SAMPLES_TRAIN, seed_base=1242)
     test_dataset = CircuitDataset(n_samples=N_SAMPLES_TEST, seed_base=1000)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
@@ -122,8 +122,8 @@ def main():
     ).to(device)
     
     # Cost module
-    exec_costs_1q = [0.05, 0.25]
-    exec_costs_2q = [0.10, 0.50]
+    exec_costs_1q = [0.05, 0.15]
+    exec_costs_2q = [0.40, 0.20]
     idle_costs = [0.5, 0.1]
     move_costs = [0.3, 0.3]
     
@@ -132,7 +132,7 @@ def main():
     # Optimizer
     optimizer = torch.optim.Adam(
         list(evol_model.parameters()) + list(cluster_module.parameters()),
-        lr=1e-3,
+        lr=1e-2,
     )
     
     # Training history
