@@ -62,9 +62,9 @@ def main():
 
     # costs per tech (example values)
     exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.25, 0.20]
-    idle_costs = [0.15, 0.10]
-    move_costs = [0.3, 0.3]
+    exec_costs_2q = [0.15, 0.05]
+    idle_costs = [0.10, 0.15]
+    move_costs = [0.03, 0.03]
 
     total_cost_module = TotalCost(
         exec_costs_1q,
