@@ -94,7 +94,7 @@ def main():
     N_SAMPLES_TRAIN = 800
     N_SAMPLES_TEST = 200
     BATCH_SIZE = 4  # Small batches due to variable segment lengths
-    N_EPOCHS = 100
+    N_EPOCHS = 50
     
     # Datasets (different seed bases = no overlap)
     train_dataset = CircuitDataset(n_samples=N_SAMPLES_TRAIN, seed_base=42, two_qubit_bounds=(0.1, 0.9))
@@ -134,9 +134,9 @@ def main():
     
     # Cost module
     exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.15, 0.05]
-    idle_costs = [0.15, 0.10]
-    move_costs = [0.3, 0.3]
+    exec_costs_2q = [0.20, 0.05]
+    idle_costs = [0.10, 0.12]
+    move_costs = [0.03, 0.03]
     
     total_cost_module = TotalCost(exec_costs_1q, exec_costs_2q, idle_costs, move_costs).to(device)
     
@@ -221,6 +221,9 @@ def main():
             print(f"Epoch {epoch:3d}: train={avg_train_loss:.4f}, test={test_loss:.4f}")
             print(f"Test per_segment mean: {test_per_seg.mean():.4f}")
     
+    torch.save(evol_model.state_dict(), "evol_model_final.pt")
+    torch.save(cluster_module.state_dict(), "cluster_head_final.pt")
+
     # Post-train prototypes  
     print("Post-train prototypes mean:", cluster_module.head.cluster_prototypes.mean().item())
     print("Post-train prototypes std:", cluster_module.head.cluster_prototypes.std().item())
