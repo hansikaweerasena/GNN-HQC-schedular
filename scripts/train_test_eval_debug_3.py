@@ -9,7 +9,7 @@ import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
-from src.circuit_generation import generate_random_circuit_custom
+from src.circuit_generation import generate_random_circuit_custom, generate_roi_composed_circuit
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
 from src.qubit_interaction_graph import build_segment_graph_arrays
@@ -50,15 +50,21 @@ class CircuitDataset(Dataset):
 
         if self.two_qubit_bounds is not None:
             low, high = self.two_qubit_bounds
-            two_qubit_ratio = np.random.uniform(low, high)
+            two_qubit_ratio = rng.uniform(low, high)
         else:
             two_qubit_ratio = 0.5 # default
-        qc = generate_random_circuit_custom(
-            n_qubits=self.n_qubits,
-            depth=self.depth,
-            gate_density=self.gate_density,
+        # qc = generate_random_circuit_custom(
+        #     n_qubits=self.n_qubits,
+        #     depth=self.depth,
+        #     gate_density=self.gate_density,
+        #     seed=seed,
+        #     two_qubit_ratio=two_qubit_ratio
+        # )
+        qc = generate_roi_composed_circuit(
+            num_qubits=self.n_qubits,
+            num_segments=5,
+            segment_depth=6,
             seed=seed,
-            two_qubit_ratio=two_qubit_ratio
         )
         rep = CircuitRepresentation(qc)
         segments, seg_ids = segment_circuit(rep.layers, threshold=0.3)
@@ -127,18 +133,23 @@ def main():
         heads=4,
     ).to(device)
     
-    K = 2
+    K = 4
     cluster_module = SegmentClustering(
         hidden_dim=evol_model.rnn_hidden_dim,
         num_clusters=K,
         temperature=5.0,
     ).to(device)
     
-    # Cost module
-    exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.20, 0.05]
-    idle_costs = [0.10, 0.12]
-    move_costs = [0.03, 0.03]
+    # NEW (3 techs, simple but non-trivial)
+    exec_costs_1q = [0.03, 0.06, 0.10, 0.11]   #tech0 best for 1q
+    exec_costs_2q = [0.08, 0.06, 0.15, 0.10]   #tech1 best for 2q
+    idle_costs    = [0.05, 0.04, 0.02, 0.04]   #tech2 best for idle
+    move_costs    = [0.01, 0.01, 0.01, 0.01]  # symmetric for now
+    # exec_costs_1q = [0.05, 0.08, 0.02]   # tech2 best for 1q
+    # exec_costs_2q = [0.15, 0.10, 0.25]   # tech1 best for 2q
+    # idle_costs    = [0.12, 0.06, 0.01]   # tech2 best for idle
+    # move_costs    = [0.04, 0.04, 0.04]   # symmetric for now
+
     
     total_cost_module = TotalCost(exec_costs_1q, exec_costs_2q, idle_costs, move_costs).to(device)
     

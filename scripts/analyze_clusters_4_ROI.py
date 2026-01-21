@@ -6,7 +6,7 @@ from torch_geometric.data import Data
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.circuit_generation import generate_random_circuit_custom
+from src.circuit_generation import generate_roi_composed_circuit
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
 from src.qubit_interaction_graph import build_segment_graph_arrays
@@ -50,18 +50,18 @@ def compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_ind
     return res["total_cost"].item()
 
 
-def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, device="cpu"):
-    print(f"\n=== two_qubit_ratio = {two_qubit_ratio} ===")
+def analyze_circuit(seed, evol_ckpt, cluster_ckpt, total_cost_module, device="cpu"):
+    print(f"\n=== ROI circuit (seed = {seed}) ===")
 
-    # 1) Generate one circuit with fixed ratio
-    qc = generate_random_circuit_custom(
-        n_qubits=10,
-        depth=20,
-        gate_density=0.3,
-        two_qubit_ratio=two_qubit_ratio,
-        seed=123,
+    # 1) Generate one ROI-composed circuit with fixed seed
+    qc = generate_roi_composed_circuit(
+        num_qubits=10,
+        num_segments=5,
+        segment_depth=6,
+        seed=seed,
     )
     visualize_circuit(qc)
+
 
     # 2) Representation + segmentation + activity viz
     rep = CircuitRepresentation(qc)
@@ -70,20 +70,22 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
     visualize_segmentation(
         activity,
         segments,
-        title_suffix=f"(two_qubit_ratio={two_qubit_ratio})",
+        title_suffix=f"(ROI circuit, seed={seed})",
     )
 
-    # 3) Cost sanity check: all-tech0 vs all-tech1
-    cost_all_0 = compute_total_cost_for_fixed_tech(
-        total_cost_module, segments, rep, tech_index=0, device=device
-    )
-    cost_all_1 = compute_total_cost_for_fixed_tech(
-        total_cost_module, segments, rep, tech_index=1, device=device
-    )
+
+    # 3) Cost sanity check: all-tech0, all-tech1, all-tech2
+    cost_all_0 = compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_index=0, device=device)
+    cost_all_1 = compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_index=1, device=device)
+    cost_all_2 = compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_index=2, device=device)
+    cost_all_3 = compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_index=3, device=device)
+
     print(
-        f"[Cost check] two_qubit_ratio={two_qubit_ratio:.1f}  "
-        f"Cost(all tech0)={cost_all_0:.3f},  Cost(all tech1)={cost_all_1:.3f}"
+        f"[Cost check] ROI circuit (seed={seed})   "
+        f"all0={cost_all_0:.3f},  all1={cost_all_1:.3f},  all2={cost_all_2:.3f}, all2={cost_all_3:.3f}"
     )
+    best = min(cost_all_0, cost_all_1, cost_all_2, cost_all_3)
+
 
     # 4) Build segment graphs
     segment_data_list = build_segment_data_list(rep, segments)
@@ -105,7 +107,7 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
         heads=4,
     ).to(device)
 
-    K = 2
+    K = 4
     cluster_module = SegmentClustering(
         hidden_dim=evol_model.rnn_hidden_dim,
         num_clusters=K,
@@ -124,10 +126,20 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
     # 7) Build [T, N] matrix of P(tech1)
     T = len(P_seq)
     N = P_seq[0].size(0)
-    M = torch.stack([P_seq[t][:, 1] for t in range(T)], dim=0)  # [T, N]
-    M_np = M.cpu().numpy()
+    K = total_cost_module.K   # should be 3
+
+    # Stack → [T, N, K]
+    P_stack = torch.stack(P_seq, dim=0)
+
+    # Hard assignments: argmax over tech dimension → [T, N], values in {0,1,2}
+    hard_assign = P_stack.argmax(dim=2)          # [T, N]
+    hard_np = hard_assign.cpu().numpy()
+
 
     # 8) Soft heatmap of cluster probabilities
+    M = P_stack[:, :, 2]          # [T, N] P(tech2)
+    M_np = M.cpu().numpy()
+
     plt.figure(figsize=(6, 4))
     plt.imshow(
         M_np.T,
@@ -137,47 +149,50 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
         vmin=0.0,
         vmax=1.0,
     )
-    plt.colorbar(label="P(tech1)")
+    plt.colorbar(label="P(tech2)")
     plt.xlabel("Segment index")
     plt.ylabel("Qubit index")
-    plt.title(f"Soft cluster assignments (two_qubit_ratio={two_qubit_ratio})")
+    plt.title(f"Soft P(tech2) (ROI circuit, seed={seed})")
     plt.tight_layout()
     plt.show()
 
+
     # 9) Hard 0/1 heatmap
-    hard = (M_np > 0.5).astype(float)
     plt.figure(figsize=(6, 4))
     plt.imshow(
-        hard.T,
+        hard_np.T,
         aspect="auto",
         origin="lower",
-        cmap="bwr",
+        cmap="tab10",  # categorical colormap: different color per tech
         vmin=0,
-        vmax=1,
+        vmax=K-1,
     )
     plt.xlabel("Segment index")
     plt.ylabel("Qubit index")
-    plt.title(f"Hard cluster assignments (two_qubit_ratio={two_qubit_ratio})")
+    plt.title(f"Hard tech assignments (ROI circuit, seed={seed})")
     plt.tight_layout()
     plt.show()
 
+
     # 10) Build P_seq from hard assignments
-    P_seq = []
-    T, N = hard.shape
-    K = total_cost_module.K  # = 2
+    # 10) Build P_seq from hard assignments
+    P_seq_hard = []
+    T, N = hard_np.shape
+    K = total_cost_module.K  # = 3
 
     for t in range(T):
         P_t = torch.zeros(N, K, dtype=torch.float32)
-        # tech1 where hard[t, q] == 1, tech0 otherwise
-        P_t[:, 1] = torch.from_numpy(hard[t])          # P(tech1)
-        P_t[:, 0] = 1.0 - P_t[:, 1]                    # P(tech0)
-        P_seq.append(P_t)
+        P_t[torch.arange(N), hard_np[t]] = 1.0
+        P_seq_hard.append(P_t)
 
     # 11) Compute cost for this hard schedule
-    res = total_cost_module(P_seq, segments, rep, debug=False)
+    res = total_cost_module(P_seq_hard, segments, rep, debug=False)
     total = res["total_cost"].item()
 
     print(f"[Hard schedule] total_cost={total:.3f}")
+    gap = (total - best) / best * 100
+    print(f"[Gap vs best baseline] {gap:+.2f}%")
+
 
 
 
@@ -187,10 +202,11 @@ def main():
     device = "cpu"
 
     # Use the SAME costs as in training
-    exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.20, 0.05]
-    idle_costs = [0.10, 0.12]
-    move_costs = [0.03, 0.03]
+    exec_costs_1q = [0.03, 0.06, 0.10, 0.11]   #tech0 best for 1q
+    exec_costs_2q = [0.08, 0.06, 0.15, 0.10]   #tech1 best for 2q
+    idle_costs    = [0.05, 0.04, 0.02, 0.04]   #tech2 best for idle
+    move_costs    = [0.01, 0.01, 0.01, 0.01]  # symmetric for now
+
 
     total_cost_module = TotalCost(
         exec_costs_1q,
@@ -199,8 +215,10 @@ def main():
         move_costs,
     )
 
-    for r in [0.1, 0.5, 0.9, 1.0]:
-        analyze_ratio(r, evol_ckpt, cluster_ckpt, total_cost_module, device=device)
+    fixed_seeds = [200, 30] 
+    for s in fixed_seeds:
+        analyze_circuit(s, evol_ckpt, cluster_ckpt, total_cost_module, device=device)
+
 
 
 if __name__ == "__main__":
