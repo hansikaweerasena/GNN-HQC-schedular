@@ -1,5 +1,13 @@
 # src/cost_function.py
 
+
+# This module will define a differntiable, paramterized cost function which is used to BPTT for the the learned schedular.
+# BPTT will collect sequences of soft tech assignments P_seq = [P_1, P_2, ..., P_T] where each P_t is a [num_qubits, K] tensor of probabilities.
+# The cost function will compute a single scalar by combining:
+# 1. Execution cost: based on expected gate costs given P_t and the circuit structure
+# 2. Idle cost: based on expected idle time for qubits not involved in gates
+# 3. Movement cost: based on expected changes in tech assignment between segments
+
 from typing import List, Dict
 from dataclasses import dataclass
 import torch
@@ -10,6 +18,7 @@ import torch.nn as nn
 class TechCosts:
     execution_cost_1q: float        # cost contribution per qubit for 1-qubit gate
     execution_cost_2q: float        # cost contribution per qubit for 2-qubit gate
+
 
 
 class ExecCost(nn.Module):
