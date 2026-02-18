@@ -141,6 +141,7 @@ def main():
     move_costs = [0.03, 0.03]
     
     total_cost_module = TotalCost(exec_costs_1q, exec_costs_2q, idle_costs, move_costs).to(device)
+    total_cost_module = TotalCost(config).to(device)
     
     # Optimizer
     optimizer = torch.optim.Adam(

@@ -13,32 +13,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-
-@dataclass
-class TechCosts:
-    execution_cost_1q: float        # cost contribution per qubit for 1-qubit gate
-    execution_cost_2q: float        # cost contribution per qubit for 2-qubit gate
-
-
-
 class ExecCost(nn.Module):
-    def __init__(self, tech_costs: List[TechCosts]):
+    def __init__(self, exec_costs_1q: List[float], exec_costs_2q: List[float], dtype=torch.float32):
         super().__init__()
-        self.K = len(tech_costs)
-        self.exec_cost_1q = nn.Parameter(
-            torch.tensor(
-                [tc.execution_cost_1q for tc in tech_costs],
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
-        self.exec_cost_2q = nn.Parameter(
-            torch.tensor(
-                [tc.execution_cost_2q for tc in tech_costs],
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
+        assert len(exec_costs_1q) == len(exec_costs_2q)
+        self.K = len(exec_costs_1q)
+
+        self.register_buffer("exec_cost_1q", torch.tensor(exec_costs_1q, dtype=dtype))  # [K]
+        self.register_buffer("exec_cost_2q", torch.tensor(exec_costs_2q, dtype=dtype))  # [K]
 
     def forward(
         self,
@@ -47,73 +29,46 @@ class ExecCost(nn.Module):
         circuit,                    # CircuitRepresentation
         debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        device = P_seq[0].device
-        dtype = P_seq[0].dtype
 
-        total_exec = torch.tensor(0.0, device=device, dtype=dtype)
-        per_segment_exec = []  # list of tensors [scalar per segment]
+        total_exec = torch.zeros((), device=P_seq[0].device, dtype=P_seq[0].dtype)
+        per_segment_exec = [] # list of tensors [scalar per segment]
 
-        for t, (P_t, seg) in enumerate(zip(P_seq, segments)):
-            # P_t: [num_qubits, K]
+        for P_t, seg in zip(P_seq, segments):
             N, K = P_t.shape
             assert K == self.K
 
-            exec_cost_t = torch.tensor(0.0, device=device, dtype=dtype)
+            exec_cost_t = torch.zeros((), device=P_t.device, dtype=P_t.dtype)
 
             # Go through all gates in this segment
             for layer_idx in seg.layers:
                 layer = circuit.layers[layer_idx]
                 for gate_name, qubits in layer.gates:
                     if len(qubits) == 1:
-                        cost_vec = self.exec_cost_1q.to(device)  # [K]
+                        cost_vec = self.exec_cost_1q  # already on correct device
                     elif len(qubits) == 2:
-                        cost_vec = self.exec_cost_2q.to(device)  # [K]
+                        cost_vec = self.exec_cost_2q
                     else:
                         continue  # ignore exotic gates for now
 
                     for q in qubits:
-                        # P_t[q]: [K]
-                        expected_cost_q = (P_t[q] * cost_vec).sum()
-                        exec_cost_t = exec_cost_t + expected_cost_q
+                        exec_cost_t = exec_cost_t + (P_t[q] * cost_vec).sum()
 
             total_exec = total_exec + exec_cost_t
             per_segment_exec.append(exec_cost_t)
 
             if debug:
-                # Safe debug print; does not affect gradients
-                print(
-                    f"[ExecCost] seg {seg.segment_idx} "
-                    f"exec_cost_t = {exec_cost_t.detach().cpu().item():.4f}"
-                )
-
-        # [T] tensor of per-segment exec costs
-        per_segment_exec_t = torch.stack(per_segment_exec)  # shape [T]
+                print(f"[ExecCost] seg {seg.segment_idx} exec_cost_t={exec_cost_t.detach().cpu().item():.4f}")
 
         return {
-            "execution_cost": total_exec,           # scalar tensor
-            "per_segment_costs": per_segment_exec_t,  # [T] tensor
+            "execution_cost": total_exec,
+            "per_segment_costs": torch.stack(per_segment_exec),  # [T]
         }
 
-
 class IdleCost(nn.Module):
-    """
-    Idle cost using per-qubit soft tech assignments.
-
-
-    For each segment t and qubit q:
-    idle_layers[q] = # of layers in this segment where q has no gate
-    E[idle(q,t)] = idle_layers[q] * sum_k P_{q,t,k} * idle_cost[k]
-    """
-
-
-    def __init__(self, idle_costs: List[float]):
+    def __init__(self, idle_costs: List[float], dtype=torch.float32):
         super().__init__()
         self.K = len(idle_costs)
-        self.idle_cost = nn.Parameter(
-        torch.tensor(idle_costs, dtype=torch.float32),
-        requires_grad=False,
-        )                   
-
+        self.register_buffer("idle_cost", torch.tensor(idle_costs, dtype=dtype))  # [K]
 
     def forward(
         self,
@@ -146,7 +101,7 @@ class IdleCost(nn.Module):
             idle_layers_t = torch.tensor(idle_layers, device=device, dtype=dtype)  # [N]
 
             # Expected idle cost per qubit: sum_k P_{q,k} * idle_cost[k]
-            exp_idle_per_qubit = (P_t * self.idle_cost.to(device)).sum(dim=1)  # [N]
+            exp_idle_per_qubit = (P_t * self.idle_cost).sum(dim=1)
 
             # Segment total: sum_q (idle_layers[q] * exp_idle_per_qubit[q])
             idle_cost_t = (idle_layers_t * exp_idle_per_qubit).sum()
@@ -165,25 +120,13 @@ class IdleCost(nn.Module):
             "idle_cost": total_idle,
             "per_segment_costs": per_segment_idle_t,  # tensor [T]
         }
-
 class MovementCost(nn.Module):
-    """
-    Movement cost using soft change in tech assignment between segments.
 
-
-    For each qubit q, segments t-1 -> t:
-    diff_{q,k} = |P_t[q,k] - P_{t-1}[q,k]|
-    E[move(q,t)] = sum_k diff_{q,k} * move_cost[k]
-    """
-
-
-    def __init__(self, move_costs: List[float]):
+    def __init__(self, move_costs: List[float], dtype=torch.float32):
         super().__init__()
         self.K = len(move_costs)
-        self.move_cost = nn.Parameter(
-        torch.tensor(move_costs, dtype=torch.float32),
-        requires_grad=False,
-        )
+        self.register_buffer("move_cost", torch.tensor(move_costs, dtype=dtype))  # [K]
+
 
     def forward(
         self,
@@ -207,7 +150,7 @@ class MovementCost(nn.Module):
                 # [N, K] L1 difference
                 diff = torch.abs(P_t - P_prev)
                 # Expected move per qubit: sum_k diff[q,k] * move_cost[k]
-                move_per_qubit = (diff * self.move_cost.to(device)).sum(dim=1)  # [N]
+                move_per_qubit = (diff * self.move_cost).sum(dim=1)
                 move_cost_t = move_per_qubit.sum()  # scalar
 
             total_move += move_cost_t
@@ -227,49 +170,125 @@ class MovementCost(nn.Module):
             "per_segment_costs": per_segment_move_t,  # [T] tensor
         }
 
+
+from typing import Any, Optional
+
+def _require(d: Dict[str, Any], path: str):
+    """Fetch nested key path like 'gate_fidelity.f1q' and throw a clear error if missing."""
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            raise KeyError(f"Missing config key: {path}")
+        cur = cur[k]
+    return cur
+
+def _parse_tech_buffers(config: Dict[str, Any], dtype=torch.float32) -> Dict[str, torch.Tensor]:
+    techs = config["techs"]
+    if not isinstance(techs, list) or len(techs) == 0:
+        raise ValueError("config['techs'] must be a non-empty list")
+
+    names = [t.get("name", f"tech{i}") for i, t in enumerate(techs)]
+
+    F1q = torch.tensor([_require(t, "gate_fidelity.f1q") for t in techs], dtype=dtype)
+    F2q = torch.tensor([_require(t, "gate_fidelity.f2q") for t in techs], dtype=dtype)
+    Fm  = torch.tensor([_require(t, "gate_fidelity.fm")  for t in techs], dtype=dtype)
+
+    T2  = torch.tensor([_require(t, "coherence.T2") for t in techs], dtype=dtype)
+
+    t1q = torch.tensor([_require(t, "gate_time.t1q") for t in techs], dtype=dtype)
+    t2q = torch.tensor([_require(t, "gate_time.t2q") for t in techs], dtype=dtype)
+    tm  = torch.tensor([_require(t, "gate_time.tm")  for t in techs], dtype=dtype)
+
+    rho = torch.tensor([_require(t, "routing.rho") for t in techs], dtype=dtype)
+
+    return {
+        "names": names,  # python list (not tensor)
+        "F1q": F1q, "F2q": F2q, "Fm": Fm,
+        "T2": T2,
+        "t1q": t1q, "t2q": t2q, "tm": tm,
+        "rho": rho,
+    }
+
+def _parse_comm_buffers(config: Dict[str, Any], dtype=torch.float32) -> Dict[str, torch.Tensor]:
+    comm = config.get("comm", {})
+    f_comm = torch.tensor(comm.get("f_comm", 1.0), dtype=dtype)     # default: no penalty
+    t_remote = torch.tensor(comm.get("t_remote", 0.0), dtype=dtype) # default: no latency
+    return {"f_comm": f_comm, "t_remote": t_remote}
+
+
+
 class TotalCost(nn.Module):
     """
-    Combine execution, idle, and movement costs into a single scalar.
+    Phase-1: parameterized, device-safe init.
+    Forward interface remains: (P_seq, segments, circuit) -> dict with total_cost, per_segment_total.
+
+    For now we keep legacy exec/idle/move costs from config['legacy_costs'] to keep pipeline running.
+    Next phases will replace these modules with probabilistic (LaTeX) versions using the stored buffers.
     """
-    def __init__(
-        self,
-        exec_costs_1q: List[float],
-        exec_costs_2q: List[float],
-        idle_costs: List[float],
-        move_costs: List[float],
-    ):
+
+    def __init__(self, config: Dict[str, Any], dtype=torch.float32):
         super().__init__()
-        assert len(exec_costs_1q) == len(exec_costs_2q) == len(idle_costs) == len(move_costs)
-        self.K = len(exec_costs_1q)
-        self.exec_cost_module = ExecCost(
-            [TechCosts(execution_cost_1q=c1, execution_cost_2q=c2)
-             for c1, c2 in zip(exec_costs_1q, exec_costs_2q)]
-        )
-        self.idle_cost_module = IdleCost(idle_costs)
-        self.move_cost_module = MovementCost(move_costs)
+
+        # --- Parse tech + comm profiles (buffers for later probabilistic model) ---
+        tech_bufs = _parse_tech_buffers(config, dtype=dtype)
+        comm_bufs = _parse_comm_buffers(config, dtype=dtype)
+
+        self.tech_names = tech_bufs["names"]
+        self.K = len(self.tech_names)
+
+        # Register tech buffers (device-safe constants)
+        self.register_buffer("F1q", tech_bufs["F1q"])
+        self.register_buffer("F2q", tech_bufs["F2q"])
+        self.register_buffer("Fm",  tech_bufs["Fm"])
+        self.register_buffer("T2",  tech_bufs["T2"])
+        self.register_buffer("t1q", tech_bufs["t1q"])
+        self.register_buffer("t2q", tech_bufs["t2q"])
+        self.register_buffer("tm",  tech_bufs["tm"])
+        self.register_buffer("rho", tech_bufs["rho"])
+
+        # Register comm buffers
+        self.register_buffer("f_comm", comm_bufs["f_comm"])
+        self.register_buffer("t_remote", comm_bufs["t_remote"])
+
+        # --- TEMP: legacy costs to keep training loop working until prob terms are implemented ---
+        legacy = config.get("legacy_costs", None)
+        if legacy is None:
+            raise ValueError("Phase-1 requires config['legacy_costs'] temporarily to keep pipeline runnable.")
+
+        exec_costs_1q = legacy["exec_costs_1q"]
+        exec_costs_2q = legacy["exec_costs_2q"]
+        idle_costs    = legacy["idle_costs"]
+        move_costs    = legacy["move_costs"]
+
+        assert len(exec_costs_1q) == self.K
+        assert len(exec_costs_2q) == self.K
+        assert len(idle_costs)    == self.K
+        assert len(move_costs)    == self.K
+
+        self.exec_cost_module = ExecCost(exec_costs_1q, exec_costs_2q, dtype=dtype)
+        self.idle_cost_module = IdleCost(idle_costs, dtype=dtype)
+        self.move_cost_module = MovementCost(move_costs, dtype=dtype)
 
     def forward(
         self,
-        P_seq: List[torch.Tensor],  # [T] of [num_qubits, K]
+        P_seq: List[torch.Tensor],
         segments,
         circuit,
         debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        # Run sub-modules
+
         exec_res = self.exec_cost_module(P_seq, segments, circuit, debug=debug)
         idle_res = self.idle_cost_module(P_seq, segments, circuit, debug=debug)
         move_res = self.move_cost_module(P_seq, debug=debug)
 
-        # Totals (all tensors, gradients preserved)
         total_exec = exec_res["execution_cost"]
         total_idle = idle_res["idle_cost"]
         total_move = move_res["movement_cost"]
         total_cost = total_exec + total_idle + total_move
 
-        # Per-segment totals (tensor addition, fully differentiable)
         per_segment_total = (
-            exec_res["per_segment_costs"] + 
-            idle_res["per_segment_costs"] + 
+            exec_res["per_segment_costs"] +
+            idle_res["per_segment_costs"] +
             move_res["per_segment_costs"]
         )
 
