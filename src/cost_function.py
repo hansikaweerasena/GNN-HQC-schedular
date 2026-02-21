@@ -13,10 +13,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
-from typing import Any, Optional
+from typing import Any, Dict, List, Tuple
 from collections import defaultdict
-from typing import Any, Dict, List, Set, Tuple, Optional
 
 # need not to explicitly be a nn.Module, but doing so allows us to easily register buffers for tech profiles and other config-derived tensors
 class SegmentStatsExtractor(nn.Module):
@@ -446,7 +444,7 @@ class TotalCost(nn.Module):
         self.register_buffer("rho", tech_bufs["rho"])
 
         # --- Register comm/timing buffers ---
-        self.register_buffer("f_comm", comm_bufs["f_comm"])
+        self.register_buffer("f_comm", comm_bufs["f_comm"]) # f_comm is remote gate execution fidelity
         self.register_buffer("f_move", comm_bufs["f_move"])
         self.register_buffer("t_remote", comm_bufs["t_remote"])  # optional
         self.register_buffer("delta", timing_bufs["delta"])
@@ -463,14 +461,6 @@ class TotalCost(nn.Module):
         self.exec_cost = ExecCostV3()
         self.idle_cost = IdleCostV3()
         self.comm_move_cost = CommMoveCostV3()
-
-        # --- Segment parsing / stats configuration (python attributes, not buffers) ---
-        gate_names_cfg = config.get("gate_names", {})
-        measure_list = gate_names_cfg.get("measure", ["measure", "meas", "m"])
-        self.measure_gate_names = set(_normalize_gate_name(x) for x in measure_list)
-
-        gamma_cfg = config.get("connectivity_proxy", {})
-        self.gamma_mode = gamma_cfg.get("mode", "none")  # default: no inflation unless you enable it
 
 
     def forward(
