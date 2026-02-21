@@ -211,11 +211,24 @@ def _parse_tech_buffers(config: Dict[str, Any], dtype=torch.float32) -> Dict[str
 
 def _parse_comm_buffers(config: Dict[str, Any], dtype=torch.float32) -> Dict[str, torch.Tensor]:
     comm = config.get("comm", {})
-    f_comm = torch.tensor(comm.get("f_comm", 1.0), dtype=dtype)     # default: no penalty
-    t_remote = torch.tensor(comm.get("t_remote", 0.0), dtype=dtype) # default: no latency
-    return {"f_comm": f_comm, "t_remote": t_remote}
+    f_comm  = torch.tensor(comm.get("f_comm", 1.0), dtype=dtype)   # remote entanglement primitive success
+    f_move  = torch.tensor(comm.get("f_move", 1.0), dtype=dtype)   # inter-segment movement primitive success
+    t_remote = torch.tensor(comm.get("t_remote", 0.0), dtype=dtype) # optional; may be unused in v3
+    return {"f_comm": f_comm, "f_move": f_move, "t_remote": t_remote}
 
 
+def _parse_timing_buffers(config: Dict[str, Any], dtype=torch.float32) -> Dict[str, torch.Tensor]:
+    timing = config.get("timing", {})
+    delta = torch.tensor(timing.get("delta", 1.0), dtype=dtype)  # per-layer time proxy (LaTeX δ)
+    return {"delta": delta}
+
+
+def _neglog_clamped(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Stable -log(x) for probabilities.
+    Clamps to [eps, 1.0] so we never take log(0) or log(>1).
+    """
+    return -torch.log(torch.clamp(x, min=eps, max=1.0))
 
 class TotalCost(nn.Module):
     """
@@ -229,45 +242,37 @@ class TotalCost(nn.Module):
     def __init__(self, config: Dict[str, Any], dtype=torch.float32):
         super().__init__()
 
-        # --- Parse tech + comm profiles (buffers for later probabilistic model) ---
+        # --- Parse profiles (parameterized inputs) ---
         tech_bufs = _parse_tech_buffers(config, dtype=dtype)
         comm_bufs = _parse_comm_buffers(config, dtype=dtype)
+        timing_bufs = _parse_timing_buffers(config, dtype=dtype)
 
         self.tech_names = tech_bufs["names"]
         self.K = len(self.tech_names)
 
-        # Register tech buffers (device-safe constants)
-        self.register_buffer("F1q", tech_bufs["F1q"])
-        self.register_buffer("F2q", tech_bufs["F2q"])
-        self.register_buffer("Fm",  tech_bufs["Fm"])
-        self.register_buffer("T2",  tech_bufs["T2"])
+        # --- Register tech buffers (interpreted as success probs / timescales) ---
+        self.register_buffer("F1q", tech_bufs["F1q"])   # treat as p_{1q}^k in LaTeX
+        self.register_buffer("F2q", tech_bufs["F2q"])   # treat as p_{2q}^k
+        self.register_buffer("Fm",  tech_bufs["Fm"])    # treat as p_m^k
+        self.register_buffer("T2",  tech_bufs["T2"])    # treat as T^k (effective coherence timescale)
         self.register_buffer("t1q", tech_bufs["t1q"])
         self.register_buffer("t2q", tech_bufs["t2q"])
         self.register_buffer("tm",  tech_bufs["tm"])
         self.register_buffer("rho", tech_bufs["rho"])
 
-        # Register comm buffers
+        # --- Register comm/timing buffers ---
         self.register_buffer("f_comm", comm_bufs["f_comm"])
-        self.register_buffer("t_remote", comm_bufs["t_remote"])
+        self.register_buffer("f_move", comm_bufs["f_move"])
+        self.register_buffer("t_remote", comm_bufs["t_remote"])  # optional
+        self.register_buffer("delta", timing_bufs["delta"])
 
-        # --- TEMP: legacy costs to keep training loop working until prob terms are implemented ---
-        legacy = config.get("legacy_costs", None)
-        if legacy is None:
-            raise ValueError("Phase-1 requires config['legacy_costs'] temporarily to keep pipeline runnable.")
-
-        exec_costs_1q = legacy["exec_costs_1q"]
-        exec_costs_2q = legacy["exec_costs_2q"]
-        idle_costs    = legacy["idle_costs"]
-        move_costs    = legacy["move_costs"]
-
-        assert len(exec_costs_1q) == self.K
-        assert len(exec_costs_2q) == self.K
-        assert len(idle_costs)    == self.K
-        assert len(move_costs)    == self.K
-
-        self.exec_cost_module = ExecCost(exec_costs_1q, exec_costs_2q, dtype=dtype)
-        self.idle_cost_module = IdleCost(idle_costs, dtype=dtype)
-        self.move_cost_module = MovementCost(move_costs, dtype=dtype)
+        # --- NEW: Precompute LaTeX additive failure costs (negative log success) ---
+        # c_{1q}^k = -log(p_{1q}^k), etc.
+        self.register_buffer("c1q", _neglog_clamped(self.F1q))       # [K]
+        self.register_buffer("c2q", _neglog_clamped(self.F2q))       # [K]
+        self.register_buffer("cm",  _neglog_clamped(self.Fm))        # [K]
+        self.register_buffer("ccomm", _neglog_clamped(self.f_comm))  # scalar
+        self.register_buffer("cmove", _neglog_clamped(self.f_move))  # scalar
 
     def forward(
         self,
@@ -277,29 +282,30 @@ class TotalCost(nn.Module):
         debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
 
-        exec_res = self.exec_cost_module(P_seq, segments, circuit, debug=debug)
-        idle_res = self.idle_cost_module(P_seq, segments, circuit, debug=debug)
-        move_res = self.move_cost_module(P_seq, debug=debug)
+        device = P_seq[0].device
+        dtype = P_seq[0].dtype
+        S = len(P_seq)
 
-        total_exec = exec_res["execution_cost"]
-        total_idle = idle_res["idle_cost"]
-        total_move = move_res["movement_cost"]
-        total_cost = total_exec + total_idle + total_move
+        # PLACEHOLDER for Phase A: keep interface stable.
+        # Next phases will compute these from circuit segment stats per LaTeX.
+        per_segment_exec = torch.zeros(S, device=device, dtype=dtype)
+        per_segment_idle = torch.zeros(S, device=device, dtype=dtype)
+        per_segment_comm = torch.zeros(S, device=device, dtype=dtype)
+        per_segment_move = torch.zeros(S, device=device, dtype=dtype)
 
-        per_segment_total = (
-            exec_res["per_segment_costs"] +
-            idle_res["per_segment_costs"] +
-            move_res["per_segment_costs"]
-        )
+        per_segment_total = per_segment_exec + per_segment_idle + per_segment_comm + per_segment_move
+        total_cost = per_segment_total.sum()
 
         if debug:
-            print(f"[TotalCost] total={total_cost.detach().cpu().item():.4f}")
-            print(f"[TotalCost] per_segment_total sum={per_segment_total.sum().detach().cpu().item():.4f}")
-            print(f"[TotalCost] exec={total_exec.detach().cpu().item():.4f}")
-            print(f"[TotalCost] idle={total_idle.detach().cpu().item():.4f}")
-            print(f"[TotalCost] move={total_move.detach().cpu().item():.4f}")
+            print("[TotalCost v3] Phase A placeholder forward. Costs are zero until exec/idle/comm/move are implemented.")
 
         return {
             "total_cost": total_cost,
             "per_segment_total": per_segment_total,
+
+            # interpretability (safe additions)
+            "per_segment_exec": per_segment_exec,
+            "per_segment_idle": per_segment_idle,
+            "per_segment_comm": per_segment_comm,
+            "per_segment_move": per_segment_move,
         }
