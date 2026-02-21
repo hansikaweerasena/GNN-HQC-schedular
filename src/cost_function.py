@@ -12,166 +12,123 @@ from typing import List, Dict
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
-class ExecCost(nn.Module):
-    def __init__(self, exec_costs_1q: List[float], exec_costs_2q: List[float], dtype=torch.float32):
+
+from collections import defaultdict
+from typing import Any, Dict, List, Set, Tuple, Optional
+
+class SegmentStatsExtractor(nn.Module):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        assert len(exec_costs_1q) == len(exec_costs_2q)
-        self.K = len(exec_costs_1q)
 
-        self.register_buffer("exec_cost_1q", torch.tensor(exec_costs_1q, dtype=dtype))  # [K]
-        self.register_buffer("exec_cost_2q", torch.tensor(exec_costs_2q, dtype=dtype))  # [K]
+        gate_names_cfg = config.get("gate_names", {})
+        measure_list = gate_names_cfg.get("measure", ["measure", "meas", "m"])
+        self.measure_gate_names = set(str(x).strip().lower() for x in measure_list)
+
+        gamma_cfg = config.get("connectivity_proxy", {})
+        self.gamma_mode = gamma_cfg.get("mode", "none")
+
+        self._cached_key = None
+        self._cached_val = None
+
+    def _is_measure_gate(self, gate_name: Any) -> bool:
+        return str(gate_name).strip().lower() in self.measure_gate_names
+
+    def _compute_gamma_value(
+        self,
+        *,
+        N: int,
+        L_s: int,
+        edge_counts: Dict[Tuple[int, int], int],
+    ) -> float:
+        mode = (self.gamma_mode or "none").lower()
+        if mode == "none":
+            return 0.0
+        if mode == "edge_density":
+            denom = max(1.0, (N * (N - 1)) / 2.0)
+            return float(len(edge_counts)) / denom
+        if mode == "twoq_per_layer":
+            total_2q = float(sum(edge_counts.values()))
+            return total_2q / max(1.0, float(L_s))
+        return 0.0
 
     def forward(
         self,
-        P_seq: List[torch.Tensor],  # list of [num_qubits, K]
-        segments,                   # List[Segment]
-        circuit,                    # CircuitRepresentation
-        debug: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-
-        total_exec = torch.zeros((), device=P_seq[0].device, dtype=P_seq[0].dtype)
-        per_segment_exec = [] # list of tensors [scalar per segment]
-
-        for P_t, seg in zip(P_seq, segments):
-            N, K = P_t.shape
-            assert K == self.K
-
-            exec_cost_t = torch.zeros((), device=P_t.device, dtype=P_t.dtype)
-
-            # Go through all gates in this segment
-            for layer_idx in seg.layers:
-                layer = circuit.layers[layer_idx]
-                for gate_name, qubits in layer.gates:
-                    if len(qubits) == 1:
-                        cost_vec = self.exec_cost_1q  # already on correct device
-                    elif len(qubits) == 2:
-                        cost_vec = self.exec_cost_2q
-                    else:
-                        continue  # ignore exotic gates for now
-
-                    for q in qubits:
-                        exec_cost_t = exec_cost_t + (P_t[q] * cost_vec).sum()
-
-            total_exec = total_exec + exec_cost_t
-            per_segment_exec.append(exec_cost_t)
-
-            if debug:
-                print(f"[ExecCost] seg {seg.segment_idx} exec_cost_t={exec_cost_t.detach().cpu().item():.4f}")
-
-        return {
-            "execution_cost": total_exec,
-            "per_segment_costs": torch.stack(per_segment_exec),  # [T]
-        }
-
-class IdleCost(nn.Module):
-    def __init__(self, idle_costs: List[float], dtype=torch.float32):
-        super().__init__()
-        self.K = len(idle_costs)
-        self.register_buffer("idle_cost", torch.tensor(idle_costs, dtype=dtype))  # [K]
-
-    def forward(
-        self,
-        P_seq: List[torch.Tensor],
         segments,
         circuit,
-        debug: bool = False,
-    ):
-        device = P_seq[0].device
-        dtype = P_seq[0].dtype
+        N: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        cache_key = (id(segments), id(circuit), int(N), str(device), str(dtype))
+        if self._cached_key == cache_key and self._cached_val is not None:
+            return self._cached_val
 
-        total_idle = torch.tensor(0.0, device=device, dtype=dtype)
-        per_segment_idle = []  # list of tensors
+        S = len(segments)
+        n1q = torch.zeros((S, N), device=device, dtype=dtype)
+        nm  = torch.zeros((S, N), device=device, dtype=dtype)
+        L   = torch.zeros((S,), device=device, dtype=dtype)
+        gamma = torch.zeros((S,), device=device, dtype=dtype)
+        edges: List[Dict[str, torch.Tensor]] = []
 
-        for t, (P_t, seg) in enumerate(zip(P_seq, segments)):
-            N, K = P_t.shape
-            assert K == self.K
+        for s, seg in enumerate(segments):
+            layers = getattr(seg, "layers", seg)
+            L_s = len(layers)
+            L[s] = float(L_s)
 
-            # Compute idle_layers[q] for this segment [Python list → tensor]
-            idle_layers = [0] * N
-            for layer_idx in seg.layers:
-                layer = circuit.layers[layer_idx]
-                active_qubits = set()
-                for gate_name, qubits in layer.gates:
-                    active_qubits.update(qubits)  # faster than nested loop
-                for q in range(N):
-                    if q not in active_qubits:
-                        idle_layers[q] += 1
-            
-            idle_layers_t = torch.tensor(idle_layers, device=device, dtype=dtype)  # [N]
+            edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
 
-            # Expected idle cost per qubit: sum_k P_{q,k} * idle_cost[k]
-            exp_idle_per_qubit = (P_t * self.idle_cost).sum(dim=1)
+            for layer in layers:
+                gates = getattr(layer, "gates", [])
+                for gate_name, qubits in gates:
+                    if qubits is None:
+                        continue
+                    qlist = list(qubits)
 
-            # Segment total: sum_q (idle_layers[q] * exp_idle_per_qubit[q])
-            idle_cost_t = (idle_layers_t * exp_idle_per_qubit).sum()
+                    if len(qlist) == 1:
+                        u = int(qlist[0])
+                        if 0 <= u < N:
+                            if self._is_measure_gate(gate_name):
+                                nm[s, u] += 1.0
+                            else:
+                                n1q[s, u] += 1.0
 
-            total_idle += idle_cost_t
-            per_segment_idle.append(idle_cost_t)
+                    elif len(qlist) == 2:
+                        u = int(qlist[0]); v = int(qlist[1])
+                        if u == v:
+                            continue
+                        if not (0 <= u < N and 0 <= v < N):
+                            continue
+                        a, b = (u, v) if u < v else (v, u)
+                        edge_counts[(a, b)] += 1
 
-            if debug:
-                print(f"[IdleCost] seg {seg.segment_idx} "
-                    f"idle_layers_sum={idle_layers_t.sum().item():.1f} "
-                    f"idle_cost_t={idle_cost_t.detach().cpu().item():.4f}")
+                    else:
+                        # Multi-qubit gates ignored for now to avoid silent assumption breaks
+                        continue
 
-        per_segment_idle_t = torch.stack(per_segment_idle)  # [T]
-
-        return {
-            "idle_cost": total_idle,
-            "per_segment_costs": per_segment_idle_t,  # tensor [T]
-        }
-class MovementCost(nn.Module):
-
-    def __init__(self, move_costs: List[float], dtype=torch.float32):
-        super().__init__()
-        self.K = len(move_costs)
-        self.register_buffer("move_cost", torch.tensor(move_costs, dtype=dtype))  # [K]
-
-
-    def forward(
-        self,
-        P_seq: List[torch.Tensor],  # list of [num_qubits, K]
-        debug: bool = False,
-    ):
-        device = P_seq[0].device
-        dtype = P_seq[0].dtype
-
-        total_move = torch.tensor(0.0, device=device, dtype=dtype)
-        per_segment_move = []  # list of tensors
-
-        P_prev = None
-        for t, P_t in enumerate(P_seq):
-            N, K = P_t.shape
-            assert K == self.K
-
-            if P_prev is None:
-                move_cost_t = torch.tensor(0.0, device=device, dtype=dtype)
+            if len(edge_counts) == 0:
+                e_u = torch.empty((0,), device=device, dtype=torch.long)
+                e_v = torch.empty((0,), device=device, dtype=torch.long)
+                e_w = torch.empty((0,), device=device, dtype=dtype)
             else:
-                # [N, K] L1 difference
-                diff = torch.abs(P_t - P_prev)
-                # Expected move per qubit: sum_k diff[q,k] * move_cost[k]
-                move_per_qubit = (diff * self.move_cost).sum(dim=1)
-                move_cost_t = move_per_qubit.sum()  # scalar
+                pairs = list(edge_counts.keys())
+                weights = [edge_counts[p] for p in pairs]
+                e_u = torch.tensor([p[0] for p in pairs], device=device, dtype=torch.long)
+                e_v = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
+                e_w = torch.tensor(weights, device=device, dtype=dtype)
 
-            total_move += move_cost_t
-            per_segment_move.append(move_cost_t)
+            edges.append({"u": e_u, "v": e_v, "w": e_w})
 
-            if debug:
-                print(f"[MoveCost] seg {t} "
-                    f"move_cost_t={move_cost_t.detach().cpu().item():.4f} "
-                    f"L1_change_avg={(torch.norm(P_t - P_prev, p=1, dim=1).mean().item() if P_prev is not None else 0):.4f}")
+            gamma[s] = float(self._compute_gamma_value(N=N, L_s=L_s, edge_counts=edge_counts))
 
-            P_prev = P_t
+        stats = {"L": L, "n1q": n1q, "nm": nm, "edges": edges, "gamma": gamma}
+        self._cached_key = cache_key
+        self._cached_val = stats
+        return stats
 
-        per_segment_move_t = torch.stack(per_segment_move)  # [T]
-
-        return {
-            "movement_cost": total_move,           # scalar tensor
-            "per_segment_costs": per_segment_move_t,  # [T] tensor
-        }
-
-
-from typing import Any, Optional
 
 def _require(d: Dict[str, Any], path: str):
     """Fetch nested key path like 'gate_fidelity.f1q' and throw a clear error if missing."""
@@ -230,6 +187,11 @@ def _neglog_clamped(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     return -torch.log(torch.clamp(x, min=eps, max=1.0))
 
+
+def _normalize_gate_name(name: Any) -> str:
+    return str(name).strip().lower()
+
+
 class TotalCost(nn.Module):
     """
     Phase-1: parameterized, device-safe init.
@@ -274,6 +236,119 @@ class TotalCost(nn.Module):
         self.register_buffer("ccomm", _neglog_clamped(self.f_comm))  # scalar
         self.register_buffer("cmove", _neglog_clamped(self.f_move))  # scalar
 
+        # --- Segment parsing / stats configuration (python attributes, not buffers) ---
+        gate_names_cfg = config.get("gate_names", {})
+        measure_list = gate_names_cfg.get("measure", ["measure", "meas", "m"])
+        self.measure_gate_names = set(_normalize_gate_name(x) for x in measure_list)
+
+        gamma_cfg = config.get("connectivity_proxy", {})
+        self.gamma_mode = gamma_cfg.get("mode", "none")  # default: no inflation unless you enable it
+
+        # Optional: tiny cache for repeated calls on the same circuit/segments object
+        self._cached_stats_key = None
+        self._cached_stats_val = None
+
+
+    def _extract_segment_stats(
+        self,
+        segments,
+        circuit,
+        N: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        """
+        Extract LaTeX-v3 primitives per segment:
+        L[s], n1q[s,u], nm[s,u], edges[s] = {u,v,w}, gamma[s]
+        Output is ready for downstream cost computation on `device`.
+        """
+
+        # Simple cache keyed by object identity (stats depend only on circuit/segments, not on P_seq)
+        cache_key = (id(segments), id(circuit), int(N))
+        if self._cached_stats_key == cache_key and self._cached_stats_val is not None:
+            return self._cached_stats_val
+
+        S = len(segments)
+
+        # Counts as float tensors (we will multiply by weights later)
+        n1q = torch.zeros((S, N), device=device, dtype=dtype)
+        nm  = torch.zeros((S, N), device=device, dtype=dtype)
+        L   = torch.zeros((S,), device=device, dtype=dtype)
+        gamma = torch.zeros((S,), device=device, dtype=dtype)
+
+        edges: List[Dict[str, torch.Tensor]] = []
+
+        for s, seg in enumerate(segments):
+            layers = getattr(seg, "layers", seg)  # allow seg itself to be iterable as layers
+            L_s = len(layers)
+            L[s] = float(L_s)
+
+            edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+
+            for layer in layers:
+                gates = getattr(layer, "gates", [])
+                for gate_name, qubits in gates:
+                    if qubits is None:
+                        continue
+
+                    qlist = list(qubits)
+                    if len(qlist) == 1:
+                        u = int(qlist[0])
+                        if 0 <= u < N:
+                            if _is_measure_gate(gate_name, self.measure_gate_names):
+                                nm[s, u] += 1.0
+                            else:
+                                n1q[s, u] += 1.0
+
+                    elif len(qlist) == 2:
+                        u = int(qlist[0]); v = int(qlist[1])
+                        if u == v:
+                            continue
+                        if not (0 <= u < N and 0 <= v < N):
+                            continue
+                        a, b = (u, v) if u < v else (v, u)
+                        edge_counts[(a, b)] += 1
+
+                    else:
+                        # If multi-qubit gates appear, you can decide later how to decompose.
+                        # For now, ignore to avoid silently breaking assumptions.
+                        continue
+
+            # Convert edge multiset to tensors
+            if len(edge_counts) == 0:
+                e_u = torch.empty((0,), device=device, dtype=torch.long)
+                e_v = torch.empty((0,), device=device, dtype=torch.long)
+                e_w = torch.empty((0,), device=device, dtype=dtype)
+            else:
+                pairs = list(edge_counts.keys())
+                weights = [edge_counts[p] for p in pairs]
+                e_u = torch.tensor([p[0] for p in pairs], device=device, dtype=torch.long)
+                e_v = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
+                e_w = torch.tensor(weights, device=device, dtype=dtype)
+
+            edges.append({"u": e_u, "v": e_v, "w": e_w})
+
+            # Γ(s) proxy (default 0)
+            gamma_val = _compute_gamma_value(
+                mode=self.gamma_mode,
+                N=N,
+                L_s=L_s,
+                edge_counts=edge_counts,
+            )
+            gamma[s] = float(gamma_val)
+
+        stats = {
+            "L": L,               # [S]
+            "n1q": n1q,           # [S, N]
+            "nm": nm,             # [S, N]
+            "edges": edges,       # list length S, each has u,v,w
+            "gamma": gamma,       # [S]
+        }
+
+        self._cached_stats_key = cache_key
+        self._cached_stats_val = stats
+        return stats
+
     def forward(
         self,
         P_seq: List[torch.Tensor],
@@ -281,6 +356,15 @@ class TotalCost(nn.Module):
         circuit,
         debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        
+        N = P_seq[0].shape[0]
+        stats = self._extract_segment_stats(
+            segments=segments,
+            circuit=circuit,
+            N=N,
+            device=device,
+            dtype=dtype,
+        )
 
         device = P_seq[0].device
         dtype = P_seq[0].dtype
@@ -299,13 +383,21 @@ class TotalCost(nn.Module):
         if debug:
             print("[TotalCost v3] Phase A placeholder forward. Costs are zero until exec/idle/comm/move are implemented.")
 
-        return {
+        out = {
             "total_cost": total_cost,
             "per_segment_total": per_segment_total,
-
-            # interpretability (safe additions)
             "per_segment_exec": per_segment_exec,
             "per_segment_idle": per_segment_idle,
             "per_segment_comm": per_segment_comm,
             "per_segment_move": per_segment_move,
         }
+        if debug:
+            out["debug_stats"] = {
+                "L": stats["L"].detach(),
+                "gamma": stats["gamma"].detach(),
+                "n1q_sum": stats["n1q"].sum(dim=1).detach(),
+                "nm_sum": stats["nm"].sum(dim=1).detach(),
+                "num_edges": torch.tensor([e["w"].numel() for e in stats["edges"]], device=device, dtype=dtype),
+                "twoq_ops": torch.tensor([e["w"].sum().item() for e in stats["edges"]], device=device, dtype=dtype),
+            }
+        return out
