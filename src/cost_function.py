@@ -52,6 +52,19 @@ class SegmentStatsExtractor(nn.Module):
             return total_2q / max(1.0, float(L_s))
         return 0.0
 
+    def _resolve_gates(self, layer_ref, circuit):
+        """
+        layer_ref can be:
+        - int: layer id into circuit.layers
+        - CircuitLayer: already resolved
+        Returns List[(gate_name, qargs_tuple)].
+        """
+        if hasattr(layer_ref, "gates"):
+            return layer_ref.gates
+        if isinstance(layer_ref, int):
+            return circuit.layers[layer_ref].gates
+        return []
+
     def forward(
         self,
         segments,
@@ -78,8 +91,8 @@ class SegmentStatsExtractor(nn.Module):
 
             edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
 
-            for layer in layers:
-                gates = getattr(layer, "gates", [])
+            for layer_id in layers:
+                gates = self._resolve_gates(layer_id, circuit)
                 for gate_name, qubits in gates:
                     if qubits is None:
                         continue
