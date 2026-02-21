@@ -15,8 +15,6 @@ import torch.nn as nn
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 from typing import Any, Optional
-
-
 from collections import defaultdict
 from typing import Any, Dict, List, Set, Tuple, Optional
 
@@ -143,6 +141,7 @@ class ExecCostV3(nn.Module):
         c2q: torch.Tensor,                 # [K]
         cm: torch.Tensor,                  # [K]
         rho: torch.Tensor,                 # [K]
+        debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
 
         device = P_seq[0].device
@@ -159,12 +158,18 @@ class ExecCostV3(nn.Module):
         E_cm = torch.einsum("suk,k->su", W, cm.to(dtype))
         Cm = (stats["nm"] * E_cm).sum(dim=1)    # [S]
 
-        # Local 2Q with inflation: Σ_(u,v) ω_uv * Σ_k w_u,k w_v,k (1 + rho_k Γ[s]) c2q_k
+        # Local 2Q with inflation
         Gamma = stats["gamma"].to(dtype)  # [S]
         infl_base = rho.to(dtype)         # [K]
         c2q = c2q.to(dtype)
 
         C2q_local = torch.zeros((S,), device=device, dtype=dtype)
+
+        # Debug accumulators
+        if debug:
+            num_edges = torch.zeros((S,), device=device, dtype=dtype)
+            twoq_ops  = torch.zeros((S,), device=device, dtype=dtype)
+            avg_local_prob = torch.zeros((S,), device=device, dtype=dtype)  # avg Σ_k w_u,k w_v,k over edges (weighted)
 
         for s in range(S):
             e = stats["edges"][s]
@@ -172,26 +177,46 @@ class ExecCostV3(nn.Module):
             v_idx = e["v"]
             omega = e["w"].to(dtype)
 
-            if u_idx.numel() == 0:
+            E = int(u_idx.numel())
+            if E == 0:
                 continue
 
             Wu = W[s, u_idx, :]  # [E,K]
             Wv = W[s, v_idx, :]  # [E,K]
             joint = Wu * Wv      # [E,K]
 
-            infl = (1.0 + infl_base * Gamma[s])     # [K]
+            infl = (1.0 + infl_base * Gamma[s])             # [K]
             per_edge_cost = torch.einsum("ek,k->e", joint, infl * c2q)  # [E]
-
             C2q_local[s] = (omega * per_edge_cost).sum()
+
+            if debug:
+                num_edges[s] = float(E)
+                twoq_ops[s] = omega.sum()
+
+                # local_prob(e) = Σ_k joint[e,k]
+                local_prob = joint.sum(dim=1)  # [E]
+                denom = torch.clamp(omega.sum(), min=1e-12)
+                avg_local_prob[s] = (omega * local_prob).sum() / denom
 
         Cexec = C1q + Cm + C2q_local
 
-        return {
+        out = {
             "per_segment_C1q": C1q,
             "per_segment_Cm": Cm,
             "per_segment_C2q_local": C2q_local,
             "per_segment_exec": Cexec,
         }
+
+        if debug:
+            out["exec_num_edges"] = num_edges.detach()
+            out["exec_twoq_ops"] = twoq_ops.detach()
+            out["exec_gamma"] = Gamma.detach()
+            out["exec_avg_local_prob"] = avg_local_prob.detach()
+            # Helpful “rates” for interpretability
+            out["exec_1q_ops"] = stats["n1q"].sum(dim=1).detach()
+            out["exec_meas_ops"] = stats["nm"].sum(dim=1).detach()
+
+        return out
     
 
 class IdleCostV3(nn.Module):
@@ -205,13 +230,31 @@ class IdleCostV3(nn.Module):
         *,
         delta: torch.Tensor,     # scalar
         T2: torch.Tensor,        # [K]
+        debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        S = len(P_seq)
-        device = P_seq[0].device
-        dtype = P_seq[0].dtype
-        # placeholder until next phase
-        return {"per_segment_idle": torch.zeros((S,), device=device, dtype=dtype)}
 
+        dtype = P_seq[0].dtype
+        S = len(P_seq)
+
+        # Stack assignments: W[s,u,k]
+        W = torch.stack(P_seq, dim=0).to(dtype)   # [S,N,K]
+
+        # Δt(s) = L(s) * δ
+        L = stats["L"].to(dtype)                  # [S]
+        dt = L * delta.to(dtype)                  # [S]
+
+        # 1/T^k (clamp to avoid divide-by-zero)
+        invT = 1.0 / torch.clamp(T2.to(dtype), min=1e-12)  # [K]
+
+        # Cidle[s] = dt[s] * Σ_u Σ_k W[s,u,k] * invT[k]
+        sum_w_invT = torch.einsum("suk,k->s", W, invT)      # [S]
+        Cidle = dt * sum_w_invT                              # [S]
+
+        out = {"per_segment_idle": Cidle}
+        if debug:
+            out["idle_dt"] = dt.detach()
+            out["idle_sum_w_invT"] = sum_w_invT.detach()
+        return out
 
 class CommMoveCostV3(nn.Module):
     def __init__(self):
@@ -224,15 +267,90 @@ class CommMoveCostV3(nn.Module):
         *,
         ccomm: torch.Tensor,     # scalar
         cmove: torch.Tensor,     # scalar
+        debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        S = len(P_seq)
+
         device = P_seq[0].device
         dtype = P_seq[0].dtype
-        # placeholder until later phases
-        return {
-            "per_segment_comm": torch.zeros((S,), device=device, dtype=dtype),
-            "per_segment_move": torch.zeros((S,), device=device, dtype=dtype),
+        S = len(P_seq)
+
+        W = torch.stack(P_seq, dim=0).to(dtype)  # [S,N,K]
+
+        # -------------------------
+        # Communication: per segment
+        # -------------------------
+        per_segment_comm = torch.zeros((S,), device=device, dtype=dtype)
+
+        if debug:
+            comm_num_edges = torch.zeros((S,), device=device, dtype=dtype)
+            comm_twoq_ops = torch.zeros((S,), device=device, dtype=dtype)
+            comm_avg_cut_prob = torch.zeros((S,), device=device, dtype=dtype)
+
+        ccomm_s = ccomm.to(dtype)  # scalar
+
+        for s in range(S):
+            e = stats["edges"][s]
+            u_idx = e["u"]
+            v_idx = e["v"]
+            omega = e["w"].to(dtype)
+
+            E = int(u_idx.numel())
+            if E == 0:
+                continue
+
+            Wu = W[s, u_idx, :]          # [E,K]
+            Wv = W[s, v_idx, :]          # [E,K]
+            local_prob = (Wu * Wv).sum(dim=1)     # [E]  = Σ_k w_u,k w_v,k
+            cut_prob = 1.0 - local_prob           # [E]
+
+            # C_comm(s) = ccomm * Σ_e ω_e * cut_prob_e
+            weighted_cut = (omega * cut_prob).sum()         # scalar
+            per_segment_comm[s] = ccomm_s * weighted_cut
+
+            if debug:
+                comm_num_edges[s] = float(E)
+                comm_twoq_ops[s] = omega.sum()
+                denom = torch.clamp(omega.sum(), min=1e-12)
+                comm_avg_cut_prob[s] = (omega * cut_prob).sum() / denom
+
+        # -------------------------
+        # Movement: between segments
+        # -------------------------
+        per_segment_move = torch.zeros((S,), device=device, dtype=dtype)
+        cmove_s = cmove.to(dtype)  # scalar
+
+        if S >= 2:
+            # stay_prob[s,u] = Σ_k w[s,u,k] * w[s+1,u,k]
+            stay_prob = (W[:-1, :, :] * W[1:, :, :]).sum(dim=2)  # [S-1, N]
+            change_prob = 1.0 - stay_prob                        # [S-1, N]
+
+            # per_segment_move[s] = cmove * Σ_u change_prob[s,u]
+            per_segment_move[:-1] = cmove_s * change_prob.sum(dim=1)
+
+            if debug:
+                move_total_change = change_prob.sum(dim=1)        # [S-1]
+                move_avg_change = change_prob.mean(dim=1)         # [S-1]
+                # pad to length S for easy plotting
+                move_total_change_padded = torch.zeros((S,), device=device, dtype=dtype)
+                move_avg_change_padded = torch.zeros((S,), device=device, dtype=dtype)
+                move_total_change_padded[:-1] = move_total_change
+                move_avg_change_padded[:-1] = move_avg_change
+
+        out = {
+            "per_segment_comm": per_segment_comm,
+            "per_segment_move": per_segment_move,
         }
+
+        if debug:
+            out["comm_num_edges"] = comm_num_edges.detach()
+            out["comm_twoq_ops"] = comm_twoq_ops.detach()
+            out["comm_avg_cut_prob"] = comm_avg_cut_prob.detach()
+
+            if S >= 2:
+                out["move_total_change"] = move_total_change_padded.detach()
+                out["move_avg_change"] = move_avg_change_padded.detach()
+
+        return out
 
 
 def _require(d: Dict[str, Any], path: str):
@@ -370,9 +488,9 @@ class TotalCost(nn.Module):
 
         stats = self.stats_extractor(segments, circuit, N=N, device=device, dtype=dtype)
 
-        exec_out = self.exec_cost(P_seq, stats, c1q=self.c1q, c2q=self.c2q, cm=self.cm, rho=self.rho)
-        idle_out = self.idle_cost(P_seq, stats, delta=self.delta, T2=self.T2)
-        comm_out = self.comm_move_cost(P_seq, stats, ccomm=self.ccomm, cmove=self.cmove)
+        exec_out = self.exec_cost(P_seq, stats, c1q=self.c1q, c2q=self.c2q, cm=self.cm, rho=self.rho, debug=debug)
+        idle_out = self.idle_cost(P_seq, stats, delta=self.delta, T2=self.T2, debug=debug)
+        comm_out = self.comm_move_cost(P_seq, stats, ccomm=self.ccomm, cmove=self.cmove, debug=debug)
 
         per_segment_exec = exec_out["per_segment_exec"]
         per_segment_idle = idle_out["per_segment_idle"]
