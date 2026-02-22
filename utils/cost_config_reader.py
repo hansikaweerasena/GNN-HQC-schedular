@@ -1,6 +1,11 @@
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
+import importlib
+
+def load_scheduler_cfg(module_path: str):
+    m = importlib.import_module(module_path)
+    return m.MODEL_CFG, m.CLUSTER_CFG, m.TRAIN_CFG, m.DATASET_CFG, m.CIRCUIT_SOURCE_CFG
 
 
 def _default_data_dir() -> Path:

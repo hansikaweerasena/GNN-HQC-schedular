@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from torch_geometric.data import Data
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -25,6 +26,7 @@ from src.cost_function import TotalCost
 from utils.cost_config_reader import load_cost_config
 from utils.plot_utils import compute_drivers, plot_cost_dashboard
 from utils.print_utils import print_run_config_analyze
+from utils.cost_config_reader import load_scheduler_cfg
 
 def build_segment_data_list(rep, segments):
     per_segment_graphs = build_segment_graph_arrays(rep, segments)
@@ -175,14 +177,19 @@ def analyze_circuit(seed, circuit_cfg, evol_ckpt, cluster_ckpt, total_cost_modul
         save_path_prefix=None,
     )
 
-
-
 def main():
     evol_ckpt    = "evol_model_final.pt"
     cluster_ckpt = "cluster_head_final.pt"
     device = "cpu"
 
-    cfg_path = os.path.join(os.path.dirname(__file__), "..", "data", "cost_config_v3.json")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sched_cfg", type=str, default="utils.scheduler_config")
+    parser.add_argument("--cost_cfg", type=str, default="cost_config_v3.json")
+    args = parser.parse_args()
+
+    MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG = load_scheduler_cfg(args.sched_cfg)
+
+    cfg_path = os.path.join(os.path.dirname(__file__), "..", "data", args.cost_cfg)
     config = load_cost_config(cfg_path)
     K = len(config["techs"])
     tech_names = [t.get("name", f"tech{k}") for k, t in enumerate(config["techs"])]

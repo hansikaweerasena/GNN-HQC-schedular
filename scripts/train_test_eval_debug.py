@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from torch_geometric.data import Data
 from tqdm import tqdm
 import os, sys
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.scheduler_config import MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG
@@ -19,6 +20,7 @@ from src.cost_function import TotalCost
 from utils.train_utils import train_step
 from utils.cost_config_reader import load_cost_config
 from utils.print_utils import print_run_config
+from utils.cost_config_reader import load_scheduler_cfg
 
 
 def build_segment_data_list(rep, segments):
@@ -74,10 +76,17 @@ def evaluate_model(model, cluster_module, cost_module, test_loader, device):
     return total_loss / len(test_loader.dataset), np.concatenate(all_per_seg)
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sched_cfg", type=str, default="utils.scheduler_config")
+    parser.add_argument("--cost_cfg", type=str, default="cost_config_v3.json")
+    args = parser.parse_args()
+
+    MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG = load_scheduler_cfg(args.sched_cfg)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    COST_CFG = os.path.join(os.path.dirname(__file__), "..", "data", "cost_config_v3.json")
+    COST_CFG = os.path.join(os.path.dirname(__file__), "..", "data", args.cost_cfg)
     config = load_cost_config(COST_CFG)
 
     # derive K from config
