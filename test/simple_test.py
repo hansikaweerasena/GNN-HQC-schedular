@@ -28,7 +28,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.circuit_generation import generate_qft_circuit
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit, analyze_segmentation
-from src.circuit_visualization import (
+from utils.circuit_visualization import (
     visualize_circuit,
     visualize_layer_activity,
     visualize_segmentation,

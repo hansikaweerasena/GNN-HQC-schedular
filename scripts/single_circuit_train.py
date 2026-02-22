@@ -12,7 +12,7 @@ from src.qubit_interaction_graph import build_segment_graph_arrays
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
-from src.train_utils import train_step
+from utils.train_utils import train_step
 
 
 def build_segment_data_list(rep, segments):

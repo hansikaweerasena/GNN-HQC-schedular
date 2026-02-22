@@ -12,7 +12,7 @@ from src.circuit_segmentation import segment_circuit
 from src.qubit_interaction_graph import build_segment_graph_arrays
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
-from src.circuit_visualization import (
+from utils.circuit_visualization import (
     visualize_circuit,
     visualize_layer_activity,
     visualize_segmentation,

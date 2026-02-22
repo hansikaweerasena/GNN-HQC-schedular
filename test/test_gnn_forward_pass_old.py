@@ -10,7 +10,7 @@ from src.qubit_interaction_graph import (
     print_segment_info,
     visualize_segment_graph,
 )
-from src.circuit_visualization import (
+from utils.circuit_visualization import (
     visualize_circuit,
     visualize_layer_activity,
     visualize_segmentation,

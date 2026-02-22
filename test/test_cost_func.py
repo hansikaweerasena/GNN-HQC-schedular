@@ -11,7 +11,7 @@ from src.qubit_interaction_graph import (
     visualize_segment_graph,
     build_segment_graph_arrays,
 )
-from src.circuit_visualization import (
+from utils.circuit_visualization import (
     visualize_circuit,
     visualize_layer_activity,
     visualize_segmentation,
@@ -21,7 +21,7 @@ from src.evolving_gnn import EvolvingGNN
 from torch_geometric.data import Data
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
-from src.cost_config_reader import load_cost_config
+from utils.cost_config_reader import load_cost_config
 
 
 def run_segmentation(rep, threshold):

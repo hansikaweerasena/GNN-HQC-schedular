@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from src.circuit_generation import generate_qft_circuit
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
-from src.circuit_visualization import visualize_layer_activity, visualize_segmentation
+from utils.circuit_visualization import visualize_layer_activity, visualize_segmentation
 
 
 def main():
