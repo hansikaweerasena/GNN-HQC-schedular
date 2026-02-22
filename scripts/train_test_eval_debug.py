@@ -16,7 +16,8 @@ from src.qubit_interaction_graph import build_segment_graph_arrays
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
-from src.train_utils import train_step
+from utils.train_utils import train_step
+from utils.cost_config_reader import load_cost_config
 
 
 # ADD THIS FUNCTION (from your single test script)
@@ -91,6 +92,12 @@ def evaluate_model(model, cluster_module, cost_module, test_loader, device):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    COST_CFG = os.path.join(os.path.dirname(__file__), "..", "data", "cost_config_v3.json")
+    config = load_cost_config(COST_CFG)
+
+    # derive K from config
+    K = len(config["techs"])
     
     # Hyperparameters
     N_SAMPLES_TRAIN = 800
@@ -127,20 +134,12 @@ def main():
         heads=4,
     ).to(device)
     
-    K = 2
     cluster_module = SegmentClustering(
         hidden_dim=evol_model.rnn_hidden_dim,
         num_clusters=K,
         temperature=5.0,
     ).to(device)
-    
-    # Cost module
-    exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.20, 0.05]
-    idle_costs = [0.10, 0.12]
-    move_costs = [0.03, 0.03]
-    
-    total_cost_module = TotalCost(exec_costs_1q, exec_costs_2q, idle_costs, move_costs).to(device)
+
     total_cost_module = TotalCost(config).to(device)
     
     # Optimizer

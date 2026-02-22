@@ -42,7 +42,7 @@ from typing import List
 
 from qiskit import QuantumCircuit
 
-from .circuit_representation import CircuitLayer
+from ..src.circuit_representation import CircuitLayer
 
 
 def visualize_circuit(circuit: QuantumCircuit):

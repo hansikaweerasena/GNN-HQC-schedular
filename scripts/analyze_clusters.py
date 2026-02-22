@@ -12,12 +12,14 @@ from src.circuit_segmentation import segment_circuit
 from src.qubit_interaction_graph import build_segment_graph_arrays
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
-from src.circuit_visualization import (
+from utils.circuit_visualization import (
     visualize_circuit,
     visualize_layer_activity,
     visualize_segmentation,
 )
 from src.cost_function import TotalCost
+from utils.cost_config_reader import load_cost_config
+from utils.plot_utils import compute_drivers, plot_cost_dashboard
 
 
 def build_segment_data_list(rep, segments):
@@ -32,25 +34,21 @@ def build_segment_data_list(rep, segments):
 
 
 def compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_index, device="cpu"):
-    """
-    Compute total cost if ALL qubits use a single tech (0 or 1) in all segments.
-    """
-    T = len(segments)
     N = rep.num_qubits
     K = total_cost_module.K
+    T = len(segments)
 
     P_seq = []
     for _ in range(T):
-        P_t = torch.zeros(N, K, device=device)
+        P_t = torch.zeros(N, K, dtype=torch.float32, device=device)
         P_t[:, tech_index] = 1.0
         P_seq.append(P_t)
 
-    with torch.no_grad():
-        res = total_cost_module(P_seq, segments, rep, debug=False)
-    return res["total_cost"].item()
+    out = total_cost_module(P_seq, segments, rep, debug=False)
+    return out["total_cost"].item()
 
 
-def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, device="cpu"):
+def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device="cpu"):
     print(f"\n=== two_qubit_ratio = {two_qubit_ratio} ===")
 
     # 1) Generate one circuit with fixed ratio
@@ -73,17 +71,21 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
         title_suffix=f"(two_qubit_ratio={two_qubit_ratio})",
     )
 
-    # 3) Cost sanity check: all-tech0 vs all-tech1
-    cost_all_0 = compute_total_cost_for_fixed_tech(
-        total_cost_module, segments, rep, tech_index=0, device=device
-    )
-    cost_all_1 = compute_total_cost_for_fixed_tech(
-        total_cost_module, segments, rep, tech_index=1, device=device
-    )
+    # 3) Cost sanity check: all-tech-k baselines (K-generic)
+    costs_all = []
+    for k in range(K):
+        c = compute_total_cost_for_fixed_tech(
+            total_cost_module, segments, rep, tech_index=k, device=device
+        )
+        costs_all.append(c)
+
     print(
-        f"[Cost check] two_qubit_ratio={two_qubit_ratio:.1f}  "
-        f"Cost(all tech0)={cost_all_0:.3f},  Cost(all tech1)={cost_all_1:.3f}"
+        f"[Cost check] two_qubit_ratio={two_qubit_ratio:.1f}  " +
+        ",  ".join([f"Cost(all {tech_names[k]})={costs_all[k]:.3f}" for k in range(K)])
     )
+
+    best_k = min(range(K), key=lambda k: costs_all[k])
+    print(f"[Cost check] best single-tech baseline = {tech_names[best_k]}")
 
     # 4) Build segment graphs
     segment_data_list = build_segment_data_list(rep, segments)
@@ -105,7 +107,6 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
         heads=4,
     ).to(device)
 
-    K = 2
     cluster_module = SegmentClustering(
         hidden_dim=evol_model.rnn_hidden_dim,
         num_clusters=K,
@@ -121,87 +122,122 @@ def analyze_ratio(two_qubit_ratio, evol_ckpt, cluster_ckpt, total_cost_module, d
         h_seq, z_seq = evol_model(segment_data_list)   # list[T] of [N,H]
         P_seq = cluster_module(h_seq)                  # list[T] of [N,2]
 
-    # 7) Build [T, N] matrix of P(tech1)
+    # --- Cost + dashboard for SOFT schedule ---
+    cost_soft = total_cost_module(P_seq, segments, rep, debug=False)
+    drivers_soft = compute_drivers(total_cost_module, P_seq, segments, rep, device=device)
+    plot_cost_dashboard(
+        cost_soft,
+        drivers_soft,
+        title_prefix=f"SOFT schedule (two_qubit_ratio={two_qubit_ratio})",
+        show=True,
+        save_path_prefix=None,  # or f"soft_r{two_qubit_ratio}"
+    )
+
+    # 7) Stack soft assignments: [T, N, K]
     T = len(P_seq)
     N = P_seq[0].size(0)
-    M = torch.stack([P_seq[t][:, 1] for t in range(T)], dim=0)  # [T, N]
-    M_np = M.cpu().numpy()
+    K = P_seq[0].size(1)
+    P_stack = torch.stack(P_seq, dim=0)  # [T, N, K]
 
-    # 8) Soft heatmap of cluster probabilities
+    # Soft visualization:
+    # - if K==2, show P(tech1)
+    # - else, show max probability (confidence)
+    if K == 2:
+        M_np = P_stack[:, :, 1].cpu().numpy()  # [T, N]
+        plt.figure(figsize=(6, 4))
+        plt.imshow(M_np.T, aspect="auto", origin="lower", cmap="bwr", vmin=0.0, vmax=1.0)
+        plt.colorbar(label=f"P({tech_names[1]})")
+        plt.xlabel("Segment index"); plt.ylabel("Qubit index")
+        plt.title(f"Soft cluster assignments (two_qubit_ratio={two_qubit_ratio})")
+        plt.tight_layout(); plt.show()
+    else:
+        conf_np = P_stack.max(dim=2).values.cpu().numpy()  # [T, N]
+        # Optional: entropy heatmap for K>2 (uncertainty)
+        eps = 1e-12
+        P_np = P_stack.cpu().numpy()  # [T,N,K]
+        entropy = -(P_np * np.log(P_np + eps)).sum(axis=2)  # [T,N]
+        plt.figure(figsize=(6, 4))
+        plt.imshow(entropy.T, aspect="auto", origin="lower")
+        plt.colorbar(label="Assignment entropy")
+        plt.xlabel("Segment index"); plt.ylabel("Qubit index")
+        plt.title(f"Soft assignment uncertainty (entropy) (two_qubit_ratio={two_qubit_ratio})")
+        plt.tight_layout(); plt.show()
+
+    # 8 Hard assignment via argmax for ANY K: [T, N]
+    hard_idx = P_stack.argmax(dim=2)  # [T, N]
+    hard_np = hard_idx.cpu().numpy()
+
     plt.figure(figsize=(6, 4))
-    plt.imshow(
-        M_np.T,
-        aspect="auto",
-        origin="lower",
-        cmap="bwr",
-        vmin=0.0,
-        vmax=1.0,
-    )
-    plt.colorbar(label="P(tech1)")
-    plt.xlabel("Segment index")
-    plt.ylabel("Qubit index")
-    plt.title(f"Soft cluster assignments (two_qubit_ratio={two_qubit_ratio})")
-    plt.tight_layout()
-    plt.show()
+    plt.imshow(hard_np.T, aspect="auto", origin="lower", vmin=0, vmax=K-1, cmap="tab20")
+    cbar = plt.colorbar(ticks=list(range(K)))
+    cbar.ax.set_yticklabels(tech_names)
+    cbar.set_label("Technology")
+    plt.xlabel("Segment index"); plt.ylabel("Qubit index")
+    plt.title(f"Hard cluster assignments (argmax) (two_qubit_ratio={two_qubit_ratio})")
+    plt.tight_layout(); plt.show()
 
-    # 9) Hard 0/1 heatmap
-    hard = (M_np > 0.5).astype(float)
-    plt.figure(figsize=(6, 4))
-    plt.imshow(
-        hard.T,
-        aspect="auto",
-        origin="lower",
-        cmap="bwr",
-        vmin=0,
-        vmax=1,
-    )
-    plt.xlabel("Segment index")
-    plt.ylabel("Qubit index")
-    plt.title(f"Hard cluster assignments (two_qubit_ratio={two_qubit_ratio})")
-    plt.tight_layout()
-    plt.show()
-
-    # 10) Build P_seq from hard assignments
-    P_seq = []
-    T, N = hard.shape
-    K = total_cost_module.K  # = 2
-
+    # 9 Tech usage per segment (fraction of qubits assigned to each tech)
+    usage = np.zeros((T, K), dtype=float)
     for t in range(T):
-        P_t = torch.zeros(N, K, dtype=torch.float32)
-        # tech1 where hard[t, q] == 1, tech0 otherwise
-        P_t[:, 1] = torch.from_numpy(hard[t])          # P(tech1)
-        P_t[:, 0] = 1.0 - P_t[:, 1]                    # P(tech0)
-        P_seq.append(P_t)
+        idx = hard_np[t]  # [N]
+        for k in range(K):
+            usage[t, k] = (idx == k).mean()
+
+    plt.figure(figsize=(7, 3.5))
+    for k in range(K):
+        plt.plot(np.arange(T), usage[:, k], label=tech_names[k])
+    plt.xlabel("Segment index")
+    plt.ylabel("Fraction of qubits (hard assigned)")
+    plt.title(f"Tech usage over segments (two_qubit_ratio={two_qubit_ratio})")
+    plt.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+    # 10) Build P_seq from hard assignments (one-hot), ANY K
+    P_seq_hard = []
+    for t in range(T):
+        P_t = torch.zeros(N, K, dtype=torch.float32, device=device)
+        idx = hard_idx[t].to(device)  # [N]
+        P_t[torch.arange(N, device=device), idx] = 1.0
+        P_seq_hard.append(P_t)
 
     # 11) Compute cost for this hard schedule
-    res = total_cost_module(P_seq, segments, rep, debug=False)
-    total = res["total_cost"].item()
+    res = total_cost_module(P_seq_hard, segments, rep, debug=False)
 
+    # Optional: show final overall tech usage across all segments/qubits
+    overall_counts = np.bincount(hard_np.reshape(-1), minlength=K)
+    overall_frac = overall_counts / overall_counts.sum()
+    print("[Hard schedule] overall tech fractions:",
+        ", ".join([f"{tech_names[k]}={overall_frac[k]:.2f}" for k in range(K)]))
+    total = res["total_cost"].item()
     print(f"[Hard schedule] total_cost={total:.3f}")
+
+    # --- Cost + dashboard for HARD schedule ---
+    drivers_hard = compute_drivers(total_cost_module, P_seq_hard, segments, rep, device=device)
+    plot_cost_dashboard(
+        res,
+        drivers_hard,
+        title_prefix=f"HARD schedule (two_qubit_ratio={two_qubit_ratio})",
+        show=True,
+        save_path_prefix=None,  # or f"hard_r{two_qubit_ratio}"
+    )
 
 
 
 def main():
     evol_ckpt    = "evol_model_final.pt"
     cluster_ckpt = "cluster_head_final.pt"
-    device = "cpu"
+    device = "cpu"  # or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Use the SAME costs as in training
-    exec_costs_1q = [0.05, 0.15]
-    exec_costs_2q = [0.20, 0.05]
-    idle_costs = [0.10, 0.12]
-    move_costs = [0.03, 0.03]
+    cfg_path = os.path.join(os.path.dirname(__file__), "..", "data", "cost_config_v3.json")
+    config = load_cost_config(cfg_path)
+    K = len(config["techs"])
+    tech_names = [t.get("name", f"tech{k}") for k, t in enumerate(config["techs"])]
 
-    total_cost_module = TotalCost(
-        exec_costs_1q,
-        exec_costs_2q,
-        idle_costs,
-        move_costs,
-    )
+    total_cost_module = TotalCost(config).to(device)
 
     for r in [0.1, 0.5, 0.9, 1.0]:
-        analyze_ratio(r, evol_ckpt, cluster_ckpt, total_cost_module, device=device)
-
+        analyze_ratio(r, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device=device)
 
 if __name__ == "__main__":
     main()
