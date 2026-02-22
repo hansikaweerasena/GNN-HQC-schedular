@@ -26,7 +26,7 @@ from utils.plot_utils import compute_drivers, plot_cost_dashboard
 
 
 def run_segmentation(rep, threshold):
-    segments, seg_ids = segment_circuit(rep.layers, threshold=threshold)
+    segments, seg_ids = segment_circuit(rep.layers, mode="jaccard", threshold=threshold)
     print("Segment IDs per layer:", seg_ids)
     for seg in segments:
         print(
