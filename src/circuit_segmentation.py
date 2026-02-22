@@ -44,6 +44,7 @@ from typing import List, Set, Tuple
 import numpy as np
 
 from .circuit_representation import CircuitLayer
+from typing import List, Tuple, Optional
 
 
 @dataclass
@@ -62,10 +63,32 @@ def jaccard_similarity(a: Set[int], b: Set[int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def segment_circuit(layers: List[CircuitLayer], threshold: float = 0.3):
+def segment_circuit(
+    layers: List[CircuitLayer],
+    threshold: float = 0.3,
+    mode: str = "jaccard",   # "jaccard" (current) | "layer" (no segmentation)
+):
     if not layers:
         return [], []
 
+    if mode == "layer":
+        segments: List["Segment"] = []
+        segment_ids: List[int] = []
+        for i, layer in enumerate(layers):
+            seg = Segment(
+                segment_idx=i,
+                layer_range=(i, i),
+                layers=[i],
+            )
+            seg.active_qubits.update(layer.active_qubits)
+            segments.append(seg)
+            segment_ids.append(i)   # 1 layer -> 1 segment
+        return segments, segment_ids
+
+    if mode != "jaccard":
+        raise ValueError(f"Unknown segmentation mode '{mode}'. Use 'jaccard' or 'layer'.")
+
+    # ---- previous jaccard code unchanged below ----
     segments: List[Segment] = []
     segment_ids: List[int] = []
 

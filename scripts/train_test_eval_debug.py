@@ -33,10 +33,11 @@ def build_segment_data_list(rep, segments):
 
 
 class CircuitDataset(Dataset):
-    def __init__(self, provider, n_samples: int, segment_threshold: float):
+    def __init__(self, provider, n_samples: int, segemnt_mode: str, segment_threshold: float):
         self.provider = provider
         self.n_samples = int(n_samples)
         self.segment_threshold = float(segment_threshold)
+        self.segment_mode = segemnt_mode
 
     def __len__(self):
         return self.n_samples
@@ -44,7 +45,7 @@ class CircuitDataset(Dataset):
     def __getitem__(self, idx):
         qc = self.provider.get(idx)
         rep = CircuitRepresentation(qc)
-        segments, seg_ids = segment_circuit(rep.layers, threshold=self.segment_threshold)
+        segments, seg_ids = segment_circuit(rep.layers, mode=self.segemnt_mode, threshold=self.segment_threshold)
         segment_data_list = build_segment_data_list(rep, segments)
         return segment_data_list, segments, rep
 
@@ -103,14 +104,15 @@ def main():
     LR              = TRAIN_CFG["lr"]
 
     segment_threshold = DATASET_CFG["segment_threshold"]
+    segment_mode = DATASET_CFG["segmentation_mode"]
     
     # Providers (different seed bases => no overlap)
     train_provider = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_train"])
     test_provider  = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_test"])
 
     # Datasets
-    train_dataset = CircuitDataset(train_provider, n_samples=N_SAMPLES_TRAIN, segment_threshold=segment_threshold)
-    test_dataset  = CircuitDataset(test_provider,  n_samples=N_SAMPLES_TEST,  segment_threshold=segment_threshold)
+    train_dataset = CircuitDataset(train_provider, n_samples=N_SAMPLES_TRAIN, segemnt_mode=segment_mode, segment_threshold=segment_threshold)
+    test_dataset  = CircuitDataset(test_provider,  n_samples=N_SAMPLES_TEST, segemnt_mode=segment_mode, segment_threshold=segment_threshold)
 
     fixed_segment_data_list, fixed_segments, fixed_rep = train_dataset[0]
     

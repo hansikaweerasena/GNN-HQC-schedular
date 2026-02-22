@@ -36,6 +36,7 @@ TRAIN_CFG = {
 # Dataset/segmentation parameters
 # ----------------------------
 DATASET_CFG = {
+    "segmentation_mode": "jaccard",   # or "layer"
     "segment_threshold": 0.3,
 }
 

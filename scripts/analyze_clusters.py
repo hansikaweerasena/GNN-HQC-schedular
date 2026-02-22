@@ -66,7 +66,8 @@ def analyze_circuit(seed, circuit_cfg, evol_ckpt, cluster_ckpt, total_cost_modul
     activity = visualize_layer_activity(rep.layers, rep.num_qubits)
 
     thr = DATASET_CFG["segment_threshold"]
-    segments, seg_ids = segment_circuit(rep.layers, threshold=thr)
+    segment_mode = DATASET_CFG["segmentation_mode"]
+    segments, seg_ids = segment_circuit(rep.layers, mode=segment_mode, threshold=thr)
 
     visualize_segmentation(
         activity,
