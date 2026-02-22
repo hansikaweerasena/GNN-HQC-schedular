@@ -22,6 +22,7 @@ from torch_geometric.data import Data
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
 from utils.cost_config_reader import load_cost_config
+from utils.plot_utils import compute_drivers, plot_cost_dashboard
 
 
 def run_segmentation(rep, threshold):
@@ -113,191 +114,6 @@ def dump_cost_out_debug(cost_out, max_items=5):
         if k in cost_out:
             _print_vec(k, cost_out[k], max_items=max_items, fmt="{:.6f}")
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-
-def compute_drivers(total_cost_module, P_seq, segments, rep, device):
-    """
-    Computes interpretable drivers:
-      - L, dt
-      - twoq_ops, avg_cut_prob
-      - avg_move_change
-    using the same stats_extractor used by the cost model.
-    """
-    dtype = P_seq[0].dtype
-    N = P_seq[0].shape[0]
-    S = len(P_seq)
-
-    stats = total_cost_module.stats_extractor(segments, rep, N=N, device=device, dtype=dtype)
-
-    L = stats["L"]                               # [S]
-    dt = L * total_cost_module.delta.to(dtype)   # [S]
-
-    W = torch.stack(P_seq, dim=0).to(dtype)      # [S,N,K]
-
-    # --- comm drivers: twoq_ops + avg_cut_prob ---
-    twoq_ops = torch.zeros((S,), device=device, dtype=dtype)
-    avg_cut_prob = torch.zeros((S,), device=device, dtype=dtype)
-
-    for s in range(S):
-        e = stats["edges"][s]
-        u_idx, v_idx = e["u"], e["v"]
-        omega = e["w"].to(dtype)
-
-        if u_idx.numel() == 0:
-            continue
-
-        Wu = W[s, u_idx, :]                 # [E,K]
-        Wv = W[s, v_idx, :]                 # [E,K]
-        local_prob = (Wu * Wv).sum(dim=1)   # [E]
-        cut_prob = 1.0 - local_prob         # [E]
-
-        twoq_ops[s] = omega.sum()
-        denom = torch.clamp(omega.sum(), min=1e-12)
-        avg_cut_prob[s] = (omega * cut_prob).sum() / denom
-
-    # --- move driver: avg_change_prob ---
-    avg_move_change = torch.zeros((S,), device=device, dtype=dtype)
-    if S >= 2:
-        stay_prob = (W[:-1] * W[1:]).sum(dim=2)     # [S-1,N]
-        change_prob = 1.0 - stay_prob               # [S-1,N]
-        avg_move_change[:-1] = change_prob.mean(dim=1)
-        avg_move_change[-1] = 0.0
-
-    # return cpu numpy for plotting
-    def to_np(x): return x.detach().cpu().numpy()
-    return {
-        "L": to_np(L),
-        "dt": to_np(dt),
-        "twoq_ops": to_np(twoq_ops),
-        "avg_cut_prob": to_np(avg_cut_prob),
-        "avg_move_change": to_np(avg_move_change),
-    }
-
-
-def plot_costs(cost_out, drivers):
-    """
-    Draws:
-      (1) stacked breakdown over segments
-      (2) heatmap components x segments
-      (3) overlays with drivers
-    """
-    # segment axis
-    total = cost_out["per_segment_total"].detach().cpu().numpy()
-    exec_c = cost_out["per_segment_exec"].detach().cpu().numpy()
-    idle_c = cost_out["per_segment_idle"].detach().cpu().numpy()
-    comm_c = cost_out["per_segment_comm"].detach().cpu().numpy()
-    move_c = cost_out["per_segment_move"].detach().cpu().numpy()
-    S = len(total)
-    x = np.arange(S)
-
-    # --------------------------
-    # (1) Stacked area breakdown
-    # --------------------------
-    plt.figure(figsize=(12, 4))
-    plt.stackplot(x, exec_c, idle_c, comm_c, move_c, labels=["exec", "idle", "comm", "move"])
-    plt.plot(x, total, linewidth=2, label="total")
-    plt.xlabel("Segment index")
-    plt.ylabel("Cost")
-    plt.title("Cost breakdown across segments (stacked)")
-    plt.legend(loc="upper right")
-    plt.tight_layout()
-
-    # --------------------------
-    # (2) Heatmap (components x segments)
-    # --------------------------
-    # include total + exec sub-breakdown if present
-    rows = [
-        ("exec", exec_c),
-        ("idle", idle_c),
-        ("comm", comm_c),
-        ("move", move_c),
-        ("total", total),
-    ]
-
-    # optional: exec subcomponents
-    if "per_segment_C1q" in cost_out:
-        rows.insert(1, ("C1q", cost_out["per_segment_C1q"].detach().cpu().numpy()))
-    if "per_segment_C2q_local" in cost_out:
-        rows.insert(2, ("C2q_local", cost_out["per_segment_C2q_local"].detach().cpu().numpy()))
-    if "per_segment_Cm" in cost_out:
-        rows.insert(3, ("Cm", cost_out["per_segment_Cm"].detach().cpu().numpy()))
-
-    labels = [r[0] for r in rows]
-    mat = np.vstack([r[1] for r in rows])  # [R,S]
-
-    # log1p scaling helps visibility when one term dominates
-    mat_show = np.log1p(mat)
-
-    plt.figure(figsize=(12, 3.5))
-    plt.imshow(mat_show, aspect="auto")
-    plt.yticks(np.arange(len(labels)), labels)
-    plt.xticks(np.arange(S))
-    plt.xlabel("Segment index")
-    plt.title("Heatmap of costs (log1p scaled)")
-    plt.colorbar(label="log(1 + cost)")
-    plt.tight_layout()
-
-    # --------------------------
-    # (3) Overlays with drivers
-    # --------------------------
-
-    # (3a) Comm cost vs avg cut prob (with twoq_ops as context)
-    plt.figure(figsize=(12, 4))
-    ax1 = plt.gca()
-    ax1.plot(x, comm_c, linewidth=2)
-    ax1.set_xlabel("Segment index")
-    ax1.set_ylabel("Comm cost")
-    ax1.set_title("Comm cost vs avg cut probability")
-
-    ax2 = ax1.twinx()
-    ax2.plot(x, drivers["avg_cut_prob"], linestyle="--", linewidth=2)
-    ax2.set_ylabel("Avg cut probability")
-
-    plt.tight_layout()
-
-    # (3b) Comm cost vs 2Q ops (helps separate “many edges” vs “high cut”)
-    plt.figure(figsize=(12, 4))
-    ax1 = plt.gca()
-    ax1.plot(x, comm_c, linewidth=2)
-    ax1.set_xlabel("Segment index")
-    ax1.set_ylabel("Comm cost")
-    ax1.set_title("Comm cost vs total 2Q ops")
-
-    ax2 = ax1.twinx()
-    ax2.plot(x, drivers["twoq_ops"], linestyle="--", linewidth=2)
-    ax2.set_ylabel("Total 2Q ops (sum ω)")
-    plt.tight_layout()
-
-    # (3c) Idle cost vs dt = L * delta
-    plt.figure(figsize=(12, 4))
-    ax1 = plt.gca()
-    ax1.plot(x, idle_c, linewidth=2)
-    ax1.set_xlabel("Segment index")
-    ax1.set_ylabel("Idle cost")
-    ax1.set_title("Idle cost vs segment duration proxy (L * delta)")
-
-    ax2 = ax1.twinx()
-    ax2.plot(x, drivers["dt"], linestyle="--", linewidth=2)
-    ax2.set_ylabel("dt = L * delta")
-    plt.tight_layout()
-
-    # (3d) Move cost vs avg move change
-    plt.figure(figsize=(12, 4))
-    ax1 = plt.gca()
-    ax1.plot(x, move_c, linewidth=2)
-    ax1.set_xlabel("Segment index")
-    ax1.set_ylabel("Move cost")
-    ax1.set_title("Move cost vs avg assignment change probability")
-
-    ax2 = ax1.twinx()
-    ax2.plot(x, drivers["avg_move_change"], linestyle="--", linewidth=2)
-    ax2.set_ylabel("Avg change probability")
-    plt.tight_layout()
-
-    plt.show()
 
 if __name__ == "__main__":
 
@@ -461,9 +277,14 @@ if __name__ == "__main__":
             f"Cm={cost_out['per_segment_Cm'][s].item():.6f}"
         )
 
-    dump_cost_out_debug(cost_out, max_items=5)
     drivers = compute_drivers(total_cost_module, P_seq, segments, rep, device=device)
-    plot_costs(cost_out, drivers)
+    plot_cost_dashboard(
+        cost_out,
+        drivers,
+        title_prefix="Cost breakdown (soft schedule)",
+        show=True,
+        save_path_prefix=None
+    )
 
     # Optional debug-only fields (exist only when debug=True)
     if "comm_avg_cut_prob" in cost_out and cost_out["comm_avg_cut_prob"] is not None:

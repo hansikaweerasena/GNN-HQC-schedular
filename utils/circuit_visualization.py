@@ -35,14 +35,15 @@ Usage:
     activity = visualize_layer_activity(rep.layers, rep.num_qubits)
     visualize_segmentation(activity, segments, "(threshold=0.3)")
 """
-
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List
 
 from qiskit import QuantumCircuit
 
-from ..src.circuit_representation import CircuitLayer
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.circuit_representation import CircuitLayer
 
 
 def visualize_circuit(circuit: QuantumCircuit):
