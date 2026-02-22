@@ -9,7 +9,6 @@ import os, sys
 import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from utils.scheduler_config import MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG
 from utils.circuit_sources import build_provider
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
@@ -35,11 +34,11 @@ def build_segment_data_list(rep, segments):
 
 
 class CircuitDataset(Dataset):
-    def __init__(self, provider, n_samples: int, segemnt_mode: str, segment_threshold: float):
+    def __init__(self, provider, n_samples: int, segment_mode: str, segment_threshold: float):
         self.provider = provider
         self.n_samples = int(n_samples)
         self.segment_threshold = float(segment_threshold)
-        self.segment_mode = segemnt_mode
+        self.segment_mode = segment_mode
 
     def __len__(self):
         return self.n_samples
@@ -47,7 +46,7 @@ class CircuitDataset(Dataset):
     def __getitem__(self, idx):
         qc = self.provider.get(idx)
         rep = CircuitRepresentation(qc)
-        segments, seg_ids = segment_circuit(rep.layers, mode=self.segemnt_mode, threshold=self.segment_threshold)
+        segments, seg_ids = segment_circuit(rep.layers, mode=self.segment_mode, threshold=self.segment_threshold)
         segment_data_list = build_segment_data_list(rep, segments)
         return segment_data_list, segments, rep
 
@@ -77,7 +76,7 @@ def evaluate_model(model, cluster_module, cost_module, test_loader, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sched_cfg", type=str, default="utils.scheduler_config")
+    parser.add_argument("--sched_cfg", type=str, default="configs.scheduler_config")
     parser.add_argument("--cost_cfg", type=str, default="cost_config_v3.json")
     args = parser.parse_args()
 
@@ -86,8 +85,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    COST_CFG = os.path.join(os.path.dirname(__file__), "..", "data", args.cost_cfg)
-    config = load_cost_config(COST_CFG)
+    config = load_cost_config(args.cost_cfg)
 
     # derive K from config
     K = len(config["techs"])
@@ -120,8 +118,8 @@ def main():
     test_provider  = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_test"])
 
     # Datasets
-    train_dataset = CircuitDataset(train_provider, n_samples=N_SAMPLES_TRAIN, segemnt_mode=segment_mode, segment_threshold=segment_threshold)
-    test_dataset  = CircuitDataset(test_provider,  n_samples=N_SAMPLES_TEST, segemnt_mode=segment_mode, segment_threshold=segment_threshold)
+    train_dataset = CircuitDataset(train_provider, n_samples=N_SAMPLES_TRAIN, segment_mode=segment_mode, segment_threshold=segment_threshold)
+    test_dataset  = CircuitDataset(test_provider,  n_samples=N_SAMPLES_TEST, segment_mode=segment_mode, segment_threshold=segment_threshold)
 
     fixed_segment_data_list, fixed_segments, fixed_rep = train_dataset[0]
     

@@ -9,8 +9,6 @@ from torch_geometric.data import Data
 import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from utils.scheduler_config import MODEL_CFG, CLUSTER_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG
 from utils.circuit_sources import build_provider
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
@@ -54,7 +52,7 @@ def compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_ind
     return out["total_cost"].item()
 
 
-def analyze_circuit(seed, circuit_cfg, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device="cpu"):
+def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device="cpu"):
     src_name = circuit_cfg["name"]
     print(f"\n=== circuit_source={src_name} | seed={seed} ===")
 
@@ -67,8 +65,8 @@ def analyze_circuit(seed, circuit_cfg, evol_ckpt, cluster_ckpt, total_cost_modul
     rep = CircuitRepresentation(qc)
     activity = visualize_layer_activity(rep.layers, rep.num_qubits)
 
-    thr = DATASET_CFG["segment_threshold"]
-    segment_mode = DATASET_CFG["segmentation_mode"]
+    thr = dataset_cfg["segment_threshold"]
+    segment_mode = dataset_cfg["segmentation_mode"]
     segments, seg_ids = segment_circuit(rep.layers, mode=segment_mode, threshold=thr)
 
     visualize_segmentation(
@@ -100,17 +98,17 @@ def analyze_circuit(seed, circuit_cfg, evol_ckpt, cluster_ckpt, total_cost_modul
     evol_model = EvolvingGNN(
         in_dim_node=in_dim_node,
         in_dim_edge=in_dim_edge,
-        gnn_hidden_dim=MODEL_CFG["gnn_hidden_dim"],
-        gnn_out_dim=MODEL_CFG["gnn_out_dim"],
-        rnn_hidden_dim=MODEL_CFG["rnn_hidden_dim"],
-        heads=MODEL_CFG["heads"],
+        gnn_hidden_dim=model_cfg["gnn_hidden_dim"],
+        gnn_out_dim=model_cfg["gnn_out_dim"],
+        rnn_hidden_dim=model_cfg["rnn_hidden_dim"],
+        heads=model_cfg["heads"],
     ).to(device)
 
     # SegmentClustering: pass temperature only if your class supports it
     cluster_kwargs = dict(hidden_dim=evol_model.rnn_hidden_dim, num_clusters=K)
     sig = inspect.signature(SegmentClustering.__init__)
     if "temperature" in sig.parameters:
-        cluster_kwargs["temperature"] = CLUSTER_CFG["temperature"]
+        cluster_kwargs["temperature"] = cluster_cfg["temperature"]
 
     cluster_module = SegmentClustering(**cluster_kwargs).to(device)
 
@@ -183,14 +181,13 @@ def main():
     device = "cpu"
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sched_cfg", type=str, default="utils.scheduler_config")
+    parser.add_argument("--sched_cfg", type=str, default="configs.scheduler_config")
     parser.add_argument("--cost_cfg", type=str, default="cost_config_v3.json")
     args = parser.parse_args()
 
     MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG = load_scheduler_cfg(args.sched_cfg)
 
-    cfg_path = os.path.join(os.path.dirname(__file__), "..", "data", args.cost_cfg)
-    config = load_cost_config(cfg_path)
+    config = load_cost_config(args.cost_cfg)
     K = len(config["techs"])
     tech_names = [t.get("name", f"tech{k}") for k, t in enumerate(config["techs"])]
 
@@ -209,7 +206,7 @@ def main():
     # If you want ROI / fixed-seed analysis:
     fixed_seeds = [200, 30]
     for seed in fixed_seeds:
-        analyze_circuit(seed, CIRCUIT_SOURCE_CFG, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device=device)
+        analyze_circuit(seed, CIRCUIT_SOURCE_CFG, DATASET_CFG, MODEL_CFG, CLUSTER_CFG, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device=device)
 
     # Optional: keep your old ratio sweep when source is random_custom
     # ratios = [0.1, 0.5, 0.9, 1.0]

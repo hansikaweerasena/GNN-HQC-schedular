@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 import importlib
+import os
 
 def load_scheduler_cfg(module_path: str):
     m = importlib.import_module(module_path)
@@ -100,7 +101,7 @@ def _validate(cfg: Dict[str, Any]) -> None:
 
 
 def load_cost_config(
-    filename: Union[str, Path],
+    filename: str,
     *,
     data_dir: Optional[Union[str, Path]] = None
 ) -> Dict[str, Any]:
@@ -111,6 +112,7 @@ def load_cost_config(
     - If relative: resolve under `data_dir` (defaults to ../data relative to src/).
     - If filename has no suffix, '.json' is appended.
     """
+    filename = os.path.join(os.path.dirname(__file__), "..", "configs", filename)
     p = Path(filename)
 
     if p.suffix == "":
