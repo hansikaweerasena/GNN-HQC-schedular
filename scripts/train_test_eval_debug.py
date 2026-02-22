@@ -6,10 +6,10 @@ import matplotlib.pyplot as plt
 from torch_geometric.data import Data
 from tqdm import tqdm
 import os, sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-
-from src.circuit_generation import generate_random_circuit_custom
+from utils.scheduler_config import MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG
+from utils.circuit_sources import build_provider
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
 from src.qubit_interaction_graph import build_segment_graph_arrays
@@ -18,9 +18,9 @@ from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
 from utils.train_utils import train_step
 from utils.cost_config_reader import load_cost_config
+from utils.print_utils import print_run_config
 
 
-# ADD THIS FUNCTION (from your single test script)
 def build_segment_data_list(rep, segments):
     per_segment_graphs = build_segment_graph_arrays(rep, segments)
     segment_data_list = []
@@ -33,38 +33,21 @@ def build_segment_data_list(rep, segments):
 
 
 class CircuitDataset(Dataset):
-    def __init__(self, n_samples=1000, n_qubits=10, depth=20, gate_density=0.3, seed_base=42, two_qubit_bounds=None):
-        self.n_samples = n_samples
-        self.n_qubits = n_qubits
-        self.depth = depth
-        self.gate_density = gate_density
-        self.seed_base = seed_base
-        self.two_qubit_bounds = two_qubit_bounds
+    def __init__(self, provider, n_samples: int, segment_threshold: float):
+        self.provider = provider
+        self.n_samples = int(n_samples)
+        self.segment_threshold = float(segment_threshold)
 
-        
     def __len__(self):
         return self.n_samples
-    
-    def __getitem__(self, idx):
-        seed = self.seed_base + idx  # Sequential seeds = reproducible!
-        rng = np.random.RandomState(seed + 10000)
 
-        if self.two_qubit_bounds is not None:
-            low, high = self.two_qubit_bounds
-            two_qubit_ratio = np.random.uniform(low, high)
-        else:
-            two_qubit_ratio = 0.5 # default
-        qc = generate_random_circuit_custom(
-            n_qubits=self.n_qubits,
-            depth=self.depth,
-            gate_density=self.gate_density,
-            seed=seed,
-            two_qubit_ratio=two_qubit_ratio
-        )
+    def __getitem__(self, idx):
+        qc = self.provider.get(idx)
         rep = CircuitRepresentation(qc)
-        segments, seg_ids = segment_circuit(rep.layers, threshold=0.3)
+        segments, seg_ids = segment_circuit(rep.layers, threshold=self.segment_threshold)
         segment_data_list = build_segment_data_list(rep, segments)
         return segment_data_list, segments, rep
+
 
 def collate_fn(batch):
     # Variable length segments, return as-is
@@ -98,16 +81,36 @@ def main():
 
     # derive K from config
     K = len(config["techs"])
+
+    derived = {
+    "device": str(device),
+    "K_num_clusters": K,
+    }
+    print_run_config(
+        MODEL_CFG=MODEL_CFG,
+        CLUSTER_CFG=CLUSTER_CFG,
+        TRAIN_CFG=TRAIN_CFG,
+        DATASET_CFG=DATASET_CFG,
+        CIRCUIT_SOURCE_CFG=CIRCUIT_SOURCE_CFG,
+        derived=derived,
+    )
     
     # Hyperparameters
-    N_SAMPLES_TRAIN = 800
-    N_SAMPLES_TEST = 200
-    BATCH_SIZE = 4  # Small batches due to variable segment lengths
-    N_EPOCHS = 50
+    N_SAMPLES_TRAIN = TRAIN_CFG["n_samples_train"]
+    N_SAMPLES_TEST  = TRAIN_CFG["n_samples_test"]
+    BATCH_SIZE      = TRAIN_CFG["batch_size"]
+    N_EPOCHS        = TRAIN_CFG["n_epochs"]
+    LR              = TRAIN_CFG["lr"]
+
+    segment_threshold = DATASET_CFG["segment_threshold"]
     
-    # Datasets (different seed bases = no overlap)
-    train_dataset = CircuitDataset(n_samples=N_SAMPLES_TRAIN, seed_base=42, two_qubit_bounds=(0.1, 0.9))
-    test_dataset = CircuitDataset(n_samples=N_SAMPLES_TEST, seed_base=1000, two_qubit_bounds=(0.1, 0.9))
+    # Providers (different seed bases => no overlap)
+    train_provider = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_train"])
+    test_provider  = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_test"])
+
+    # Datasets
+    train_dataset = CircuitDataset(train_provider, n_samples=N_SAMPLES_TRAIN, segment_threshold=segment_threshold)
+    test_dataset  = CircuitDataset(test_provider,  n_samples=N_SAMPLES_TEST,  segment_threshold=segment_threshold)
 
     fixed_segment_data_list, fixed_segments, fixed_rep = train_dataset[0]
     
@@ -128,16 +131,16 @@ def main():
     evol_model = EvolvingGNN(
         in_dim_node=in_dim_node,
         in_dim_edge=in_dim_edge,
-        gnn_hidden_dim=32,
-        gnn_out_dim=16,
-        rnn_hidden_dim=32,
-        heads=4,
+        gnn_hidden_dim=MODEL_CFG["gnn_hidden_dim"],
+        gnn_out_dim=MODEL_CFG["gnn_out_dim"],
+        rnn_hidden_dim=MODEL_CFG["rnn_hidden_dim"],
+        heads=MODEL_CFG["heads"],
     ).to(device)
     
     cluster_module = SegmentClustering(
         hidden_dim=evol_model.rnn_hidden_dim,
         num_clusters=K,
-        temperature=5.0,
+        temperature=CLUSTER_CFG["temperature"],
     ).to(device)
 
     total_cost_module = TotalCost(config).to(device)
@@ -145,7 +148,7 @@ def main():
     # Optimizer
     optimizer = torch.optim.Adam(
         list(evol_model.parameters()) + list(cluster_module.parameters()),
-        lr=1e-4,
+        lr=LR,
     )
     
     # Training history
