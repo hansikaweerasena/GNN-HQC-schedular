@@ -25,8 +25,8 @@ from utils.cost_config_reader import load_cost_config
 from utils.plot_utils import compute_drivers, plot_cost_dashboard
 
 
-def run_segmentation(rep, threshold):
-    segments, seg_ids = segment_circuit(rep.layers, mode="jaccard", threshold=threshold)
+def run_segmentation(rep, threshold, mode="jaccard"):
+    segments, seg_ids = segment_circuit(rep.layers, mode=mode, threshold=threshold)
     print("Segment IDs per layer:", seg_ids)
     for seg in segments:
         print(
@@ -134,7 +134,7 @@ if __name__ == "__main__":
     activity = visualize_layer_activity(rep.layers, rep.num_qubits)
 
     threshold = 0.2
-    segments, seg_ids = run_segmentation(rep, threshold)
+    segments, seg_ids = run_segmentation(rep, threshold, mode="layer")
     stats = analyze_segmentation(segments, rep.num_qubits)
 
     print(f"\n✓ Segmentation (threshold={threshold})")
@@ -244,8 +244,28 @@ if __name__ == "__main__":
     # Instantiate v3 cost model
     total_cost_module = TotalCost(config).to(device)
 
+    stats = total_cost_module.stats_extractor(segments, rep, N=P_seq[0].shape[0], device=device, dtype=P_seq[0].dtype)
+
+    mode = (config.get("connectivity_proxy", {}).get("mode", "") or "").lower()
+    expect_pair = mode.startswith("pair_")
+
+    for s, e in enumerate(stats["edges"]):
+        E = int(e["u"].numel())
+        if E == 0:
+            continue
+
+    has_gamma_e = "gamma_e" in e
+    print(f"[seg {s}] E={E} has_gamma_e={has_gamma_e}")
+
+    if expect_pair:
+        assert has_gamma_e, f"Expected gamma_e for mode={mode}, but missing in segment {s}"
+        print("  gamma_e sample:", e["gamma_e"][: min(5, E)].detach().cpu().tolist())
+
     print("\n=== Total Cost v3 Test ===")
     cost_out = total_cost_module(P_seq, segments, rep, debug=True)
+    # loss = cost_out["total_cost"]
+    # loss.backward()
+
 
     # Core outputs
     print(f"Total cost: {cost_out['total_cost'].item():.6f}")

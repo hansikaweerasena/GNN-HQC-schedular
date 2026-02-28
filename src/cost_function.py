@@ -12,8 +12,9 @@ from typing import List, Dict
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import networkx as nx
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from collections import defaultdict
 
 # need not to explicitly be a nn.Module, but doing so allows us to easily register buffers for tech profiles and other config-derived tensors
@@ -27,6 +28,9 @@ class SegmentStatsExtractor(nn.Module):
 
         gamma_cfg = config.get("connectivity_proxy", {})
         self.gamma_mode = gamma_cfg.get("mode", "none")
+        self.gamma_eps = float(gamma_cfg.get("eps", 1e-12))
+        hyb = gamma_cfg.get("hyb_weights", {}) or {}
+        self.gamma_hyb = [float(hyb.get(f"a{i}", 0.0)) for i in range(4)]
 
         self._cached_key = None
         self._cached_val = None
@@ -34,23 +38,172 @@ class SegmentStatsExtractor(nn.Module):
     def _is_measure_gate(self, gate_name: Any) -> bool:
         return str(gate_name).strip().lower() in self.measure_gate_names
 
+    def _segment_nodes_and_deg(
+        self,
+        edge_counts: Dict[Tuple[int, int], int],
+    ) -> Tuple[Dict[int, float], List[int], float]:
+        """Return (deg_s, V_s, bar_d_s) for the segment interaction graph."""
+        deg_s: Dict[int, float] = defaultdict(float)
+        nodes = set()
+        for (a, b), n in edge_counts.items():
+            nn = float(n)
+            deg_s[a] += nn
+            deg_s[b] += nn
+            nodes.add(a)
+            nodes.add(b)
+        V_s = list(nodes)
+        if len(V_s) == 0:
+            bar_d_s = 0.0
+        else:
+            bar_d_s = float(sum(deg_s[u] for u in V_s)) / float(len(V_s))
+        return deg_s, V_s, bar_d_s
+
+
+    def _weighted_mean_over_edges(
+        self,
+        edge_counts: Dict[Tuple[int, int], int],
+        val_map: Dict[Tuple[int, int], float],
+    ) -> float:
+        """Weighted mean of val_map over edges using multiplicities as weights."""
+        total = float(sum(edge_counts.values()))
+        if total <= 0.0:
+            return 0.0
+        acc = 0.0
+        for e, w in edge_counts.items():
+            acc += float(w) * float(val_map.get(e, 0.0))
+        return acc / total
+
+
+    def _gamma_pair_degree_pressure(
+        self,
+        *,
+        edge_counts: Dict[Tuple[int, int], int],
+    ) -> Dict[Tuple[int, int], float]:
+        deg_s, _, bar_d_s = self._segment_nodes_and_deg(edge_counts)
+        denom = 2.0 * bar_d_s + self.gamma_eps
+        out: Dict[Tuple[int, int], float] = {}
+        for (a, b), _n_uv in edge_counts.items():
+            out[(a, b)] = (deg_s.get(a, 0.0) + deg_s.get(b, 0.0)) / denom
+        return out
+
+
+    def _gamma_pair_congestion(
+        self,
+        *,
+        edge_counts: Dict[Tuple[int, int], int],
+    ) -> Dict[Tuple[int, int], float]:
+        deg_s, _, bar_d_s = self._segment_nodes_and_deg(edge_counts)
+        denom = 2.0 * bar_d_s + self.gamma_eps
+        out: Dict[Tuple[int, int], float] = {}
+        for (a, b), n_uv in edge_counts.items():
+            nn = float(n_uv)
+            out[(a, b)] = ((deg_s.get(a, 0.0) - nn) + (deg_s.get(b, 0.0) - nn)) / denom
+        return out
+
+
+    def _gamma_pair_betweeness(
+        self,
+        *,
+        edge_counts: Dict[Tuple[int, int], int],
+    ) -> Dict[Tuple[int, int], float]:
+        """
+        Pair proxy based on edge betweenness centrality, weighted by multiplicity.
+
+        We treat multiplicity n_uv as a *stronger/shorter* connection by setting a distance-like
+        attribute: length(u,v) = 1 / (n_uv + eps). Then compute weighted betweenness on this length.
+        Finally normalize by max betweenness within the segment.
+        """
+        if len(edge_counts) == 0:
+            return {}
+
+        G = nx.Graph()
+        for (a, b), n_uv in edge_counts.items():
+            length = 1.0 / (float(n_uv) + self.gamma_eps)
+            G.add_edge(int(a), int(b), length=length)
+
+        btw = nx.edge_betweenness_centrality(G, weight="length", normalized=True)
+
+        raw: Dict[Tuple[int, int], float] = {}
+        for (u, v), val in btw.items():
+            uu, vv = int(u), int(v)
+            if uu > vv:
+                uu, vv = vv, uu
+            raw[(uu, vv)] = float(val)
+
+        max_b = max(raw.values()) if len(raw) > 0 else 0.0
+        denom = max_b + self.gamma_eps
+
+        out: Dict[Tuple[int, int], float] = {}
+        for e in edge_counts.keys():
+            out[e] = float(raw.get(e, 0.0)) / denom
+        return out
+
+
+    def _gamma_pair_hybrid(
+        self,
+        *,
+        edge_counts: Dict[Tuple[int, int], int],
+    ) -> Dict[Tuple[int, int], float]:
+        g_deg = self._gamma_pair_degree_pressure(edge_counts=edge_counts)
+        g_con = self._gamma_pair_congestion(edge_counts=edge_counts)
+        g_btw = self._gamma_pair_betweeness(edge_counts=edge_counts)
+
+        out: Dict[Tuple[int, int], float] = {}
+        for e in edge_counts.keys():
+            out[e] = (
+                self.gamma_hyb[0]
+                + self.gamma_hyb[1] * float(g_deg.get(e, 0.0))
+                + self.gamma_hyb[2] * float(g_con.get(e, 0.0))
+                + self.gamma_hyb[3] * float(g_btw.get(e, 0.0))
+            )
+        return out
+
+
     def _compute_gamma_value(
         self,
         *,
         N: int,
         L_s: int,
         edge_counts: Dict[Tuple[int, int], int],
-    ) -> float:
+    ) -> Tuple[float, Optional[Dict[Tuple[int, int], float]]]:
+        """
+        Returns:
+        gamma_s: scalar proxy for segment s (for dashboards/backward-compat).
+        gamma_map: optional per-edge proxy {(u,v)->Gamma(u,v,s)} for pair_* modes.
+        """
         mode = (self.gamma_mode or "none").lower()
+
+        # --- legacy scalar modes (no per-edge map) ---
         if mode == "none":
-            return 0.0
+            return 0.0, None
         if mode == "edge_density":
             denom = max(1.0, (N * (N - 1)) / 2.0)
-            return float(len(edge_counts)) / denom
+            return float(len(edge_counts)) / denom, None
         if mode == "twoq_per_layer":
             total_2q = float(sum(edge_counts.values()))
-            return total_2q / max(1.0, float(L_s))
-        return 0.0
+            return total_2q / max(1.0, float(L_s)), None
+
+        # --- pair modes (return per-edge map + scalar summary) ---
+        # accept a couple safe aliases (optional)
+        if mode == "pair_congestion":
+            mode = "pair_congestion_"
+        if mode in {"pair_betweenness", "pair_btw"}:
+            mode = "pair_betweeness"
+
+        if mode == "pair_degree_pressure":
+            gmap = self._gamma_pair_degree_pressure(edge_counts=edge_counts)
+            return self._weighted_mean_over_edges(edge_counts, gmap), gmap
+        if mode == "pair_congestion_":
+            gmap = self._gamma_pair_congestion(edge_counts=edge_counts)
+            return self._weighted_mean_over_edges(edge_counts, gmap), gmap
+        if mode == "pair_betweeness":
+            gmap = self._gamma_pair_betweeness(edge_counts=edge_counts)
+            return self._weighted_mean_over_edges(edge_counts, gmap), gmap
+        if mode == "pair_hybrid":
+            gmap = self._gamma_pair_hybrid(edge_counts=edge_counts)
+            return self._weighted_mean_over_edges(edge_counts, gmap), gmap
+
+        return 0.0, None
 
     def _resolve_gates(self, layer_ref, circuit):
         """
@@ -119,10 +272,14 @@ class SegmentStatsExtractor(nn.Module):
                         # Multi-qubit gates ignored for now to avoid silent assumption breaks
                         continue
 
+            gamma_s, gamma_map = self._compute_gamma_value(N=N, L_s=L_s, edge_counts=edge_counts)
+            gamma[s] = float(gamma_s)
+
             if len(edge_counts) == 0:
                 e_u = torch.empty((0,), device=device, dtype=torch.long)
                 e_v = torch.empty((0,), device=device, dtype=torch.long)
                 e_w = torch.empty((0,), device=device, dtype=dtype)
+                e_dict = {"u": e_u, "v": e_v, "w": e_w}
             else:
                 pairs = list(edge_counts.keys())
                 weights = [edge_counts[p] for p in pairs]
@@ -130,9 +287,15 @@ class SegmentStatsExtractor(nn.Module):
                 e_v = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
                 e_w = torch.tensor(weights, device=device, dtype=dtype)
 
-            edges.append({"u": e_u, "v": e_v, "w": e_w})
+                e_dict = {"u": e_u, "v": e_v, "w": e_w}
+                if gamma_map is not None:
+                    e_dict["gamma_e"] = torch.tensor(
+                        [float(gamma_map.get(p, 0.0)) for p in pairs],
+                        device=device,
+                        dtype=dtype,
+                    )
 
-            gamma[s] = float(self._compute_gamma_value(N=N, L_s=L_s, edge_counts=edge_counts))
+            edges.append(e_dict)
 
         stats = {"L": L, "n1q": n1q, "nm": nm, "edges": edges, "gamma": gamma}
         self._cached_key = cache_key
@@ -196,8 +359,16 @@ class ExecCostV3(nn.Module):
             Wv = W[s, v_idx, :]  # [E,K]
             joint = Wu * Wv      # [E,K]
 
-            infl = (1.0 + infl_base * Gamma[s])             # [K]
-            per_edge_cost = torch.einsum("ek,k->e", joint, infl * c2q)  # [E]
+            gamma_e = e.get("gamma_e", None)
+
+            if gamma_e is None:
+                infl = (1.0 + infl_base * Gamma[s])             # [K]
+                per_edge_cost = torch.einsum("ek,k->e", joint, infl * c2q)  # [E]
+            else:
+                Ge = gamma_e.to(dtype)                          # [E]
+                infl_e = 1.0 + Ge[:, None] * infl_base[None, :] # [E,K]
+                per_edge_cost = (joint * infl_e * c2q[None, :]).sum(dim=1)  # [E]
+
             C2q_local[s] = (omega * per_edge_cost).sum()
 
             if debug:
