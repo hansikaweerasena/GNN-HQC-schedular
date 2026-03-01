@@ -1,13 +1,98 @@
-{
+========================
+HQC Cost Config Reference
+========================
 
-    connectivity_proxy modes : pair_degree_pressure
+A) timing_model (NEW; controls differentiable time model)
+--------------------------------------------------------
+timing_model.mode : string
+  - "none"        : disable timing model; fall back to legacy dt = L * timing.delta
+  - "smooth_max"  : layer time = LogSumExp smooth max over per-gate expected times
+  - "hybrid"      : layer time = λ*smooth_max + (1-λ)*average (more stable early)
 
-pair_congestion_
+timing_model.tau0 : float (>0)
+  - initial temperature for smooth max (same units as gate times)
+  - typical: around median gate time scale (e.g., 100–2000)
 
-pair_betweeness
+timing_model.tau_min : float (>0)
+  - floor for tau (prevents too-sharp max early)
+  - typical: tau0/10 to tau0/50 (e.g., 5–200)
 
-pair_hybrid
+timing_model.tau_gamma : float in (0,1]
+  - exponential decay per epoch: tau = max(tau_min, tau0 * tau_gamma^epoch)
+  - typical: 0.95–0.995
+  - if 1.0 => no annealing
 
-look at segment extractor
+timing_model.lambda0 : float in [0,1]  (used only when mode="hybrid")
+timing_model.lambda_max : float in [0,1]  (used only when mode="hybrid")
+timing_model.lambda_gamma : float >= 1.0  (used only when mode="hybrid")
+  - hybrid schedule: lambda = min(lambda_max, lambda0 * lambda_gamma^epoch)
+  - typical: lambda0=0.1–0.4, lambda_max=1.0, lambda_gamma=1.02–1.10
+  - if lambda_gamma=1.0 => constant λ
 
-}
+timing_model.use_routing_inflation_time : bool
+  - true  : inflate LOCAL 2Q gate times using Gamma (segment-level or edge-level if available)
+  - false : do not inflate time
+
+NOTE: tau annealing only happens if your training loop calls:
+  total_cost_module.set_epoch(epoch)
+
+B) decoherence_model (NEW; controls which qubits get T2 decoherence)
+-------------------------------------------------------------------
+decoherence_model.mode : string
+  - "all_qubits" : apply T2 decoherence to all qubits during dt(s) (legacy-like)
+  - "idle_only"  : apply T2 decoherence only to idle qubits per layer (recommended to avoid double count)
+
+IMPORTANT:
+  If decoherence_model.mode="idle_only", timing_model.mode must be "smooth_max" or "hybrid",
+  because idle-only needs per-layer durations.
+
+C) timing (LEGACY fallback; used only when timing_model.mode="none" or dt_override absent)
+----------------------------------------------------------------------------------------
+timing.delta : float (>0)
+  - legacy per-layer constant δ used in dt(s) = L(s) * delta
+
+D) comm (time + fidelity for remote and movement)
+-------------------------------------------------
+comm.t_remote : float (>=0)
+  - time penalty for remote/split 2Q gates
+  - MUST be > 0 if you want cuts/remote to affect time/decoherence
+  - typical: 5x–100x of local t2q (depends on assumed network)
+
+comm.f_comm : float in (0,1]
+  - fidelity penalty for remote comm (used in cost; independent from time)
+
+comm.f_move : float in (0,1]
+  - fidelity penalty for “move” across segments
+
+E) connectivity_proxy (controls Gamma; required for routing inflation)
+---------------------------------------------------------------------
+connectivity_proxy.mode : string
+  Segment-level Gamma modes (no per-edge gamma):
+    - "edge_density" | "degree_pressure" | "congestion" | "betweenness" | "hybrid"
+
+  Per-edge Gamma modes (produce gamma_e / twoq_gamma for gate-level inflation):
+    - "pair_degree_pressure" | "pair_congestion" | "pair_betweenness" | "pair_hybrid"
+
+connectivity_proxy.eps : float (small, >0)
+  - numerical stability (e.g., 1e-12)
+
+connectivity_proxy.hyb_weights : object (only for hybrid / pair_hybrid)
+  - example keys: a0,a1,a2,a3 (depends on your code’s definition)
+  - used to mix components into Gamma
+
+IMPORTANT:
+  If you want per-edge (gate-level) routing inflation, you must use a "pair_*" mode.
+
+F) techs[*] (existing, but now time matters)
+--------------------------------------------
+techs[i].gate_time.t1q, t2q, tm : float (>0)
+  - used by SegmentTimeV3 to compute per-gate expected time
+
+techs[i].routing.rho : float (>=0)
+  - inflation scaling; affects time if use_routing_inflation_time=true
+
+techs[i].coherence.T2 : float (>0)
+  - used in decoherence cost (idle_only or all_qubits)
+
+techs[i].gate_fidelity.f1q, f2q, fm : float in (0,1]
+  - used in exec cost (separate from time)
