@@ -177,6 +177,7 @@ def main():
 
     # ===== Training Loop =====
     for epoch in tqdm(range(N_EPOCHS), desc="Epochs"):
+        total_cost_module.set_epoch(epoch)  # anneal timing temperature (and hybrid weight)
         evol_model.train()
         cluster_module.train()
         
