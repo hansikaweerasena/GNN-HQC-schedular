@@ -24,7 +24,7 @@ def gamma_mode_compare(modes, dataset, total_cost_module, device, n_eval=200):
     orig = getattr(total_cost_module, "gamma_mode", None)
 
     for mode in modes:
-        total_cost_module.gamma_mode = mode
+        total_cost_module.stats_extractor.gamma_mode = mode
         winners = np.zeros((total_cost_module.K,), dtype=np.int64)
 
         n = min(n_eval, len(dataset))
