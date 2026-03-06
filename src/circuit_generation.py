@@ -24,6 +24,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from qiskit import QuantumCircuit
+from collections import Counter
 
 
 # -----------------------------------------------------------------------------
@@ -362,6 +363,30 @@ def _sprinkle_block_noise(
                 apply_random_2q_gate(qc, int(q1), int(q2), rng)
 
 
+def _debug_plot_rects(rects, num_layers, num_qubits):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle as MplRect
+
+    fig, ax = plt.subplots(figsize=(max(8, num_layers/6), max(3, num_qubits/3)))
+    ax.set_xlim(0, num_layers)
+    ax.set_ylim(0, num_qubits)
+    ax.invert_yaxis()
+    ax.set_xlabel("layer")
+    ax.set_ylabel("qubit")
+
+    for r in rects:
+        w = r.t1 - r.t0
+        h = r.q1 - r.q0
+        ax.add_patch(MplRect((r.t0, r.q0), w, h, fill=False, linewidth=1.5))
+
+        # label only if rectangle is reasonably large
+        if w >= 6 and h >= 3:
+            ax.text(r.t0 + w/2, r.q0 + h/2, r.roi,
+                    ha="center", va="center", fontsize=8)
+
+    fig.tight_layout()
+    plt.show()
+
 def generate_roi_composed_circuit(
     num_qubits: int,
     num_layers: int,
@@ -435,6 +460,18 @@ def generate_roi_composed_circuit(
     # Long/tall modularity knobs per circuit.
     n_long_i = _as_int(n_long, rng)
     n_tall_i = _as_int(n_tall, rng)
+
+    if debug:
+        print("\n[ROI-GEN DEBUG] ===== per-circuit sampled knobs =====")
+        print(f"num_qubits={num_qubits} num_layers={num_layers} option={opt}")
+        print(f"seed={seed}")
+        print(f"n_rois={n_rois} chosen_rois={chosen_rois}")
+        print(f"twoq_to_oneq_ratio={twoq_to_oneq_ratio} -> p2_default={p2_default:.3f}")
+        print(f"idle_density={idle_density} idle_target={idle_density*num_qubits*num_layers:.1f}")
+        print(f"p_bridge_boundary={p_bdry:.4f} p_bridge_interior={p_int:.4f}")
+        print(f"noise_1q_prob={noise_1q_prob} noise_2q_prob={noise_2q_prob}")
+        print(f"n_long_i={n_long_i} (long_w_min={long_w_min}, long_w_max={long_w_max})")
+        print(f"n_tall_i={n_tall_i} (tall_h_min={tall_h_min}, tall_h_max={tall_h_max})")
 
     rects: List[Rect] = []
 
@@ -513,6 +550,24 @@ def generate_roi_composed_circuit(
 
     if not rects:
         raise RuntimeError("Failed to tile canvas into rectangles")
+    
+    if debug:
+        print("\n[ROI-GEN DEBUG] ===== tiling summary =====")
+        print(f"#rects={len(rects)}  coverage={sum(r.area for r in rects)} "
+            f"(expected {num_qubits*num_layers})")
+
+        # Basic sanity: detect degenerate tiling
+        uniq_t_starts = sorted({r.t0 for r in rects})
+        uniq_t_ends   = sorted({r.t1 for r in rects})
+        uniq_q_starts = sorted({r.q0 for r in rects})
+        uniq_q_ends   = sorted({r.q1 for r in rects})
+        print(f"unique time starts={len(uniq_t_starts)} unique time ends={len(uniq_t_ends)}")
+        print(f"unique qubit starts={len(uniq_q_starts)} unique qubit ends={len(uniq_q_ends)}")
+
+        # Largest rectangles (often reveals the issue)
+        top = sorted(rects, key=lambda r: r.area, reverse=True)[:5]
+        for i, r in enumerate(top):
+            print(f"  top[{i}] area={r.area}  t=[{r.t0},{r.t1})  q=[{r.q0},{r.q1})")
 
     # Step 3: idle-first assignment until budget reached (overshoot allowed).
     total_volume = float(num_qubits * num_layers)
@@ -538,6 +593,24 @@ def generate_roi_composed_circuit(
             assigned.append(Rect(r.t0, r.t1, r.q0, r.q1, roi=str(rng.choice(chosen_rois))))
     rects = assigned
 
+    if debug:
+        print("\n[ROI-GEN DEBUG] ===== ROI assignment =====")
+        roi_counts = Counter(r.roi for r in rects)
+        roi_area = Counter()
+        for r in rects:
+            roi_area[r.roi] += r.area
+
+        print("ROI counts:", dict(roi_counts))
+        print("ROI area (volume):", dict(roi_area))
+        print(f"idle_volume={roi_area.get('idle', 0)}  "
+            f"target={idle_density*num_qubits*num_layers:.1f}")
+
+        # Flag the problematic case explicitly
+        non_idle_area = sum(v for k, v in roi_area.items() if k != "idle")
+        if non_idle_area == 0:
+            print("!!! WARNING: all rectangles are idle -> circuit will have no gates "
+                "(except barriers / bridges / noise).")
+
     # Per-layer lookups
     rects_by_layer: List[List[int]] = [[] for _ in range(num_layers)]
     boundary_layer = np.zeros(num_layers, dtype=bool)
@@ -549,6 +622,17 @@ def generate_roi_composed_circuit(
             boundary_layer[r.t0] = True
         if 0 <= (r.t1 - 1) < num_layers:
             boundary_layer[r.t1 - 1] = True
+
+    if debug:
+        active_counts = [len(lst) for lst in rects_by_layer]
+        print("\n[ROI-GEN DEBUG] ===== per-layer activity =====")
+        print(f"active rects per layer: min={min(active_counts)} "
+            f"max={max(active_counts)} avg={sum(active_counts)/len(active_counts):.2f}")
+
+        # Bridges impossible if <2 active rects
+        layers_lt2 = sum(1 for c in active_counts if c < 2)
+        print(f"layers with <2 active rects (no bridging possible): {layers_lt2}/{num_layers}")
+        _debug_plot_rects(rects, num_layers, num_qubits)
 
     # Allocate classical bits only if measuring.
     m = int(np.ceil(float(measure_frac) * num_qubits)) if measure_frac > 0 else 0

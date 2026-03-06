@@ -56,7 +56,7 @@ if __name__ == "__main__":
         qc = generate_roi_composed_circuit(
             num_qubits=20,
             num_layers=60,
-            option="op1",          # op1 | op2a | op2b | op3
+            option="op3",          # op1 | op2a | op2b | op3
             n_rois=3,                # excluding idle
             twoq_to_oneq_ratio=0.1,   # default bias for non-2Q-dense ROIs
             idle_density=0.20,
@@ -78,7 +78,7 @@ if __name__ == "__main__":
             tall_h_min=6,
             tall_h_max=10,
             use_barriers=True,
-            seed=69,
+            seed=49,
             debug=True
         )
         title = "ROI"
