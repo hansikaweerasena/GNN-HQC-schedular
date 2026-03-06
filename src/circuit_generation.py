@@ -204,15 +204,31 @@ def _partition_1d(
 
         segs: List[int] = list(big_sizes)
 
+        # Fill the remainder with "small" segments while respecting small_min.
+        # We allow the *last* segment to be < small_min only when total < small_min.
         while remaining > 0:
-            if remaining <= small_max:
-                segs.append(max(small_min, remaining))
-                remaining = total - sum(segs)
-                continue
+            # If what's left is smaller than small_min, merge it into the previous segment.
+            if remaining < small_min:
+                if segs:
+                    segs[-1] += remaining
+                    remaining = 0
+                    break
+                # Degenerate case: total itself is smaller than small_min.
+                segs.append(remaining)
+                remaining = 0
+                break
 
+            # If the remainder fits into one segment, finish.
+            if remaining <= small_max:
+                segs.append(remaining)
+                remaining = 0
+                break
+
+            # Sample a segment size, but leave enough room for a final segment >= small_min.
             s = int(rng.randint(small_min, small_max + 1))
-            if s > remaining:
-                s = remaining
+            if remaining - s < small_min:
+                s = remaining - small_min
+            s = max(small_min, min(s, remaining))
             segs.append(s)
             remaining -= s
 
@@ -239,12 +255,28 @@ def _segments_to_bounds(sizes: List[int]) -> List[Tuple[int, int]]:
 
 # ROI library (non-idle). A circuit samples a subset of these (n_rois).
 ROI_LIBRARY: Tuple[str, ...] = (
+    # 1Q-dominant / temporal-profile ROIs
     "1q_heavy",
+    "streaming",
+
+    # 2Q ROIs (distinct corners of density/range/topology space)
+    # NOTE: "2q_dense_short" has been redefined to mean *short-range but not dense*
+    # (dense+short patterns are covered by brickwork_entangler and swap_network).
     "2q_dense_short",
     "2q_sparse_long",
-    "streaming",
+    "2q_dense_long",
+
+    # Structured dense/local patterns
     "brickwork_entangler",
     "swap_network",
+
+    # New structured motifs
+    "star_entangler",     # GHZ / hub-and-spoke
+    "nn_ladder",          # nearest-neighbor ladder (moving rung)
+    "ripple_carry",       # ripple-like chain propagation (long rectangles)
+    "enc_dec",            # encode/decode motif (long rectangles)
+    "qft_like",           # QFT-like long-range structured interactions (long rectangles)
+    "bridge_burst",       # triggers extra cross-ROI bridges for a few layers
 )
 
 
@@ -253,12 +285,16 @@ def _fill_roi_layer(
     roi: str,
     qubits: List[int],
     t_local: int,
+    t_len: int,
     rng: np.random.RandomState,
     p2_default: float,
+    dist_thr_long: int,
+    rect_key: int,
 ) -> None:
     """Emit operations for a single ROI for one atomic layer.
 
     Soft layering: we do not guarantee disjointness within a layer.
+    `t_local` is the layer index within the rectangle; `t_len` is rectangle duration.
     """
     if not qubits:
         return
@@ -268,41 +304,101 @@ def _fill_roi_layer(
     if roi == "idle":
         return
 
+    # ----------------------------
+    # 1Q-heavy ROI
+    # ----------------------------
     if roi == "1q_heavy":
         for q in qubits:
             if rng.rand() < 0.75:
                 apply_random_1q_gate(qc, q, rng)
-        if n >= 2 and rng.rand() < 0.5 * p2_default:
+        # Occasional 2Q (biased by default p2) just to avoid being perfectly 1Q-only.
+        if n >= 2 and rng.rand() < 0.35 * p2_default:
             q1, q2 = rng.choice(qubits, size=2, replace=False)
             apply_random_2q_gate(qc, int(q1), int(q2), rng)
         return
 
-    if roi == "2q_dense_short":
-        offset = 0 if (t_local % 2 == 0) else 1
-        for i in range(offset, n - 1, 2):
-            if rng.rand() < 0.85:
-                apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+    # ----------------------------
+    # Short-range (NOT dense) 2Q
+    # (dense+short is covered by brickwork_entangler and swap_network)
+    # ----------------------------
+    if roi in {"2q_dense_short", "2q_short_range"}:
+        if n >= 2 and rng.rand() < (0.55 + 0.35 * p2_default):
+            i = int((rect_key + t_local) % (n - 1))
+            apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+        # Light 1Q sprinkle
         for q in qubits:
             if rng.rand() < 0.15:
                 apply_random_1q_gate(qc, q, rng)
         return
 
+    # ----------------------------
+    # Sparse long-range 2Q
+    # ----------------------------
     if roi == "2q_sparse_long":
-        max_pairs = 1 if n < 8 else 2
-        dist_thr = max(2, n // 2)
+        if n < 2:
+            # Can't form 2Q pairs; fall back to a few 1Q gates.
+            for q in qubits:
+                if rng.rand() < 0.35:
+                    apply_random_1q_gate(qc, q, rng)
+            return
+
+        dist_thr = int(max(2, dist_thr_long))
+        dist_thr = min(dist_thr, n - 1)  # clamp to ROI size
+
+        # At most 1-2 long-range pairs per layer (sparse)
+        max_pairs = 1 if n < 10 else 2
         pairs_added = 0
-        for _ in range(6):
+        for _ in range(10):
             if pairs_added >= max_pairs:
                 break
             q1, q2 = rng.choice(qubits, size=2, replace=False)
             if abs(int(q1) - int(q2)) >= dist_thr:
                 apply_random_2q_gate(qc, int(q1), int(q2), rng)
                 pairs_added += 1
+
         for q in qubits:
-            if rng.rand() < 0.25:
+            if rng.rand() < 0.20:
                 apply_random_1q_gate(qc, q, rng)
         return
 
+    # ----------------------------
+    # Dense long-range 2Q
+    # (random long-range matching across the band)
+    # ----------------------------
+    if roi == "2q_dense_long":
+        if n < 2:
+            for q in qubits:
+                if rng.rand() < 0.4:
+                    apply_random_1q_gate(qc, q, rng)
+            return
+
+        dist_thr = int(max(2, dist_thr_long))
+        dist_thr = min(dist_thr, n - 1)
+
+        # Pair across halves to encourage large |i-j|
+        qs_sorted = sorted(qubits)
+        half = n // 2
+        left = qs_sorted[:half]
+        right = qs_sorted[half:]
+        rng.shuffle(left)
+        rng.shuffle(right)
+
+        # Apply as many cross-half pairs as possible (dense)
+        k = min(len(left), len(right))
+        for i in range(k):
+            a, b = int(left[i]), int(right[i])
+            if abs(a - b) >= dist_thr or rng.rand() < 0.15:
+                apply_random_2q_gate(qc, a, b, rng)
+
+        # Small 1Q sprinkle
+        for q in qubits:
+            if rng.rand() < 0.10:
+                apply_random_1q_gate(qc, q, rng)
+        return
+
+    # ----------------------------
+    # Brickwork entangler (dense, structured, local)
+    # ----------------------------
     if roi == "brickwork_entangler":
         offset = 0 if (t_local % 2 == 0) else 1
         for i in range(offset, n - 1, 2):
@@ -312,6 +408,9 @@ def _fill_roi_layer(
                 apply_random_1q_gate(qc, q, rng)
         return
 
+    # ----------------------------
+    # Swap network (dense, routing-heavy)
+    # ----------------------------
     if roi == "swap_network":
         offset = 0 if (t_local % 2 == 0) else 1
         for i in range(offset, n - 1, 2):
@@ -321,6 +420,9 @@ def _fill_roi_layer(
                 apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
         return
 
+    # ----------------------------
+    # Streaming (gradually activates more qubits over time)
+    # ----------------------------
     if roi == "streaming":
         max_active = min(n, 1 + t_local // 2)
         eligible = qubits[:max_active]
@@ -335,9 +437,128 @@ def _fill_roi_layer(
             apply_random_2q_gate(qc, int(q1), int(q2), rng)
         return
 
+    # ----------------------------
+    # Star / GHZ-like entangler (hub interacts with many)
+    # ----------------------------
+    if roi == "star_entangler":
+        if n < 2:
+            return
+        hub = qubits[int(rect_key % n)]
+        others = [q for q in qubits if q != hub]
+        if not others:
+            return
+        p1 = others[(t_local + (rect_key // 7)) % len(others)]
+        apply_random_2q_gate(qc, int(hub), int(p1), rng)
+        if len(others) >= 2 and rng.rand() < 0.35:
+            p2 = others[(t_local + (rect_key // 13) + 1) % len(others)]
+            if p2 != p1:
+                apply_random_2q_gate(qc, int(hub), int(p2), rng)
+        if rng.rand() < 0.25:
+            apply_random_1q_gate(qc, int(hub), rng)
+        return
+
+    # ----------------------------
+    # Nearest-neighbor ladder (moving rung)
+    # ----------------------------
+    if roi == "nn_ladder":
+        if n < 2:
+            return
+        i = int((rect_key + t_local) % (n - 1))
+        apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+        if rng.rand() < 0.25:
+            apply_random_1q_gate(qc, qubits[i], rng)
+        if rng.rand() < 0.25:
+            apply_random_1q_gate(qc, qubits[i + 1], rng)
+        return
+
+    # ----------------------------
+    # Ripple-carry-like (chain propagation; meaningful on long rectangles)
+    # ----------------------------
+    if roi == "ripple_carry":
+        if n < 2:
+            return
+        if t_len < max(6, n):
+            i = int((rect_key + t_local) % (n - 1))
+            apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+            return
+        i = int((t_local + (rect_key // 5)) % (n - 1))
+        apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+        if (t_local % 3 == 2) and (i + 2 < n):
+            apply_random_2q_gate(qc, qubits[i + 1], qubits[i + 2], rng)
+        return
+
+    # ----------------------------
+    # Encoding/decoding motif (bookends on long rectangles)
+    # ----------------------------
+    if roi == "enc_dec":
+        if n < 2:
+            return
+        if t_len < max(10, n + 4):
+            i = int((rect_key + t_local) % (n - 1))
+            apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+            return
+        span = max(2, min(6, t_len // 5))
+        if t_local < span:
+            i = int((t_local + (rect_key // 11)) % (n - 1))
+            apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+        elif t_local >= (t_len - span):
+            i = int((t_len - 1 - t_local + (rect_key // 11)) % (n - 1))
+            j = (n - 2 - i)
+            j = max(0, min(j, n - 2))
+            apply_random_2q_gate(qc, qubits[j], qubits[j + 1], rng)
+        else:
+            for q in qubits:
+                if rng.rand() < 0.35:
+                    apply_random_1q_gate(qc, q, rng)
+        return
+
+    # ----------------------------
+    # QFT-like structured long-range interactions (long rectangles)
+    # ----------------------------
+    if roi == "qft_like":
+        if n < 2:
+            return
+        if t_len < max(8, n):
+            dist_thr = int(max(2, dist_thr_long))
+            dist_thr = min(dist_thr, n - 1)
+            for _ in range(6):
+                q1, q2 = rng.choice(qubits, size=2, replace=False)
+                if abs(int(q1) - int(q2)) >= dist_thr:
+                    apply_random_2q_gate(qc, int(q1), int(q2), rng)
+                    break
+            return
+
+        ctrl_idx = int((rect_key + t_local) % n)
+        ctrl = qubits[ctrl_idx]
+        targets = []
+        for k in range(1, min(4, n)):
+            tidx = (ctrl_idx + (n // 2) + k) % n
+            if tidx != ctrl_idx:
+                targets.append(qubits[tidx])
+        for tgt in targets:
+            qc.cz(int(ctrl), int(tgt))
+        if rng.rand() < 0.35:
+            qc.h(int(ctrl))
+        return
+
+    # ----------------------------
+    # Bridge-burst ROI: handled at generator-level (adds extra inter-ROI bridges)
+    # Still add a bit of local structure here so it's not empty.
+    # ----------------------------
+    if roi == "bridge_burst":
+        for q in qubits:
+            if rng.rand() < 0.25:
+                apply_random_1q_gate(qc, q, rng)
+        if n >= 2 and rng.rand() < 0.25:
+            q1, q2 = rng.choice(qubits, size=2, replace=False)
+            apply_random_2q_gate(qc, int(q1), int(q2), rng)
+        return
+
+    # Fallback: mild 1Q activity
     for q in qubits:
         if rng.rand() < 0.5:
             apply_random_1q_gate(qc, q, rng)
+
 
 
 def _sprinkle_block_noise(
@@ -358,7 +579,7 @@ def _sprinkle_block_noise(
     if len(qubits) >= 2:
         attempts = max(1, len(qubits) // 4)
         for _ in range(attempts):
-            if rng.rand() < noise_2q_prob:
+            if len(qubits) >= 2 and rng.rand() < noise_2q_prob:
                 q1, q2 = rng.choice(qubits, size=2, replace=False)
                 apply_random_2q_gate(qc, int(q1), int(q2), rng)
 
@@ -438,6 +659,8 @@ def generate_roi_composed_circuit(
     Returns:
         Qiskit QuantumCircuit.
     """
+    # TODO: make this apercentage based instead a count
+    dist_thr_long = min(12, int(0.5 * num_qubits))
 
     if num_qubits <= 0 or num_layers <= 0:
         raise ValueError("num_qubits and num_layers must be positive")
@@ -585,13 +808,78 @@ def generate_roi_composed_circuit(
         is_idle[idx] = True
         idle_volume += rects[idx].area
 
+    non_idle_idxs = [i for i in range(len(rects)) if not is_idle[i]]
+
+    # --- Force-assign some eligible rectangles to 2q_sparse_long (if present in chosen_rois) ---
+    forced_sparse = set()
+    if "2q_sparse_long" in chosen_rois and len(non_idle_idxs) > 0:
+        eligible = [
+            i for i in non_idle_idxs
+            if (rects[i].q1 - rects[i].q0) >= int(dist_thr_long) + 1
+        ]
+        rng.shuffle(eligible)
+
+        # As requested: assign to floor(blocks/rois), where blocks ≈ non-idle rectangles.
+        n_force = int(len(non_idle_idxs) // max(1, len(chosen_rois)))
+        if n_force > 0 and len(eligible) > 0:
+            forced_sparse = set(eligible[: min(n_force, len(eligible))])
+
+    # Long-rectangle eligibility thresholds (relative to whole circuit length).
+    ripple_min_w = int(np.ceil(0.30 * float(num_layers)))
+    encdec_min_w = int(np.ceil(0.30 * float(num_layers)))
+    qft_min_w = int(np.ceil(0.20 * float(num_layers)))
+
+    def _roi_eligible_for_rect(roi_name: str, r: Rect) -> bool:
+        w = int(r.t1 - r.t0)
+        if roi_name == "ripple_carry":
+            return w >= ripple_min_w
+        if roi_name == "enc_dec":
+            return w >= encdec_min_w
+        if roi_name == "qft_like":
+            return w >= qft_min_w
+        return True
+
+    def _sample_roi_for_rect(r: Rect) -> str:
+        # Try a few times to respect eligibility; otherwise fall back to a safe ROI.
+        for _ in range(12):
+            cand = str(rng.choice(chosen_rois))
+            if _roi_eligible_for_rect(cand, r):
+                return cand
+
+        # Fallback preference order
+        for pref in ("brickwork_entangler", "swap_network", "2q_dense_short", "1q_heavy", "streaming"):
+            if pref in chosen_rois:
+                return pref
+        return str(chosen_rois[0])
+
     assigned: List[Rect] = []
     for i, r in enumerate(rects):
         if is_idle[i]:
             assigned.append(Rect(r.t0, r.t1, r.q0, r.q1, roi="idle"))
+        elif i in forced_sparse:
+            assigned.append(Rect(r.t0, r.t1, r.q0, r.q1, roi="2q_sparse_long"))
         else:
-            assigned.append(Rect(r.t0, r.t1, r.q0, r.q1, roi=str(rng.choice(chosen_rois))))
+            assigned.append(Rect(r.t0, r.t1, r.q0, r.q1, roi=_sample_roi_for_rect(r)))
+
     rects = assigned
+
+    # Per-rectangle stable keys and RNGs.
+    # These support ROIs that require cross-layer stickiness (e.g., star hub),
+    # without introducing global hidden state.
+    base_seed = int(seed) if seed is not None else 0
+    rect_keys: List[int] = []
+    rect_rngs: List[np.random.RandomState] = []
+    for ridx, r in enumerate(rects):
+        key = (
+            (base_seed * 1315423911)
+            + (ridx * 2654435761)
+            + (r.t0 * 97)
+            + (r.t1 * 193)
+            + (r.q0 * 389)
+            + (r.q1 * 911)
+        ) & 0xFFFFFFFF
+        rect_keys.append(int(key))
+        rect_rngs.append(np.random.RandomState(int(key)))
 
     if debug:
         print("\n[ROI-GEN DEBUG] ===== ROI assignment =====")
@@ -646,8 +934,8 @@ def generate_roi_composed_circuit(
             r = rects[ridx]
             qs = r.qubits()
             t_local = t - r.t0
-            _fill_roi_layer(qc, r.roi, qs, t_local, rng, p2_default)
-            _sprinkle_block_noise(qc, qs, rng, noise_1q_prob, noise_2q_prob)
+            _fill_roi_layer(qc, r.roi, qs, t_local, (r.t1 - r.t0), rect_rngs[ridx], p2_default, dist_thr_long, rect_keys[ridx])
+            _sprinkle_block_noise(qc, qs, rect_rngs[ridx], noise_1q_prob, noise_2q_prob)
 
         # Bridges
         if len(active_rects) >= 2:
@@ -661,6 +949,25 @@ def generate_roi_composed_circuit(
                     apply_random_2q_gate(qc, qa, qb, rng)
                     if rng.rand() < 0.5:
                         break
+        # Bridge-burst ROI: for a few layers, inject multiple inter-ROI edges (controlled comm spikes).
+        if len(active_rects) >= 2:
+            burst_edges = 0
+            for rr_idx in active_rects:
+                rr = rects[rr_idx]
+                if rr.roi != "bridge_burst":
+                    continue
+                tl = t - rr.t0
+                w = rr.t1 - rr.t0
+                # burst near start/end of the burst-ROI rectangle
+                if tl < 3 or tl >= (w - 3):
+                    burst_edges += 3  # per active burst ROI
+            burst_edges = int(min(burst_edges, 10))
+            for _ in range(burst_edges):
+                ra, rb = rng.choice(active_rects, size=2, replace=False)
+                qa = int(rng.choice(rects[ra].qubits()))
+                qb = int(rng.choice(rects[rb].qubits()))
+                apply_random_2q_gate(qc, qa, qb, rng)
+
 
         if use_barriers:
             qc.barrier(*range(num_qubits))
