@@ -47,25 +47,29 @@ DATASET_CFG = {
 #   - "random_custom"
 #   - "roi_composed"
 #
-# For future sources, we just add them to utils/circuit_sources.py registry.
+# For future sources, add them to utils/circuit_sources.py registry.
 CIRCUIT_SOURCE_CFG = {
     "name": "roi_composed",
+
+    # These kwargs are passed directly into generate_roi_composed_circuit(...)
     "kwargs": {
         # Core size
-        "num_qubits": 50,
-        "num_layers": 160,
+        "num_qubits": 20,
+        "num_layers": 60,
 
+        # Fallback option if no mix is enabled
         # One of: "op1", "op2a", "op2b", "op3"
         "option": "op2a",
 
         # Per-circuit ROI subset size (excluding idle)
-        "n_rois": 3,
+        "n_rois": 5,
 
         # Defaults / targets
-        "twoq_to_oneq_ratio": 0.7,
-        "idle_density": 0.20,  # volume fraction of (num_qubits * num_layers)
+        "twoq_to_oneq_ratio": 0.4,
+        "idle_density": 0.20,  # fraction of total (num_qubits * num_layers) canvas
 
-        # Bridge probabilities are sampled per circuit from these ranges
+        # Bridge probabilities are sampled INSIDE the generator per circuit
+        # from these ranges
         "p_bridge_boundary": (0.10, 0.20),
         "p_bridge_interior": (0.01, 0.05),
 
@@ -80,23 +84,38 @@ CIRCUIT_SOURCE_CFG = {
         "min_block_w": 2,
         "max_block_w": 18,
         "min_block_h": 2,
-        "max_block_h": 16,
+        "max_block_h": 12,
 
         # Long/tall blocks (spatial/temporal modularity proxies)
         "n_long": (2, 5),
         "long_w_min": 12,
         "long_w_max": 40,
         "n_tall": (1, 3),
-        "tall_h_min": 10,
-        "tall_h_max": 30,
+        "tall_h_min": 6,
+        "tall_h_max": 15,
 
-        "use_barriers": True,
+        "use_barriers": False,
+    },
+
+    # Provider-side per-sample sampling knobs.
+    # For ROI circuits, this samples the option per circuit using the seed derived
+    # from seed_base + idx, so train/test remain reproducible.
+    #
+    # Remove this block (or set to {}) if you want a single fixed option only.
+    "sampled_kwargs": {
+        "option_mix": {
+            "op1": 0.25,
+            "op2a": 0.25,
+            "op2b": 0.25,
+            "op3": 0.25,
+        }
     },
 
     # Only used by "random_custom" provider.
     # If not None, provider samples per-circuit two_qubit_ratio ~ Uniform(low, high).
     "two_qubit_bounds": None,
 }
+
 
 # Example for random_custom:
 # CIRCUIT_SOURCE_CFG = {
@@ -107,5 +126,6 @@ CIRCUIT_SOURCE_CFG = {
 #         "gate_density": 0.3,
 #         "use_barriers": True,
 #     },
+#     "sampled_kwargs": {},
 #     "two_qubit_bounds": (0.1, 0.9),
 # }
