@@ -1,4 +1,5 @@
 quantum-gnn/*
+roi_gen_diagnostics*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
