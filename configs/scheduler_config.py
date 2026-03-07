@@ -70,29 +70,29 @@ CIRCUIT_SOURCE_CFG = {
 
         # Bridge probabilities are sampled INSIDE the generator per circuit
         # from these ranges
-        "p_bridge_boundary": (0.10, 0.20),
-        "p_bridge_interior": (0.01, 0.05),
+        "p_bridge_boundary": (0.15, 0.25),
+        "p_bridge_interior": (0.05, 0.10),
 
         # Block-local noise (softly breaks layer guarantees)
-        "noise_1q_prob": 0.02,
-        "noise_2q_prob": 0.004,
+        "noise_1q_prob": 0.05,
+        "noise_2q_prob": 0.02,
 
         # End-only measurements (set 0.0 to omit measure ops)
         "measure_frac": 0.0,
 
         # Rectangle bounds
         "min_block_w": 2,
-        "max_block_w": 18,
+        "max_block_w": 15,
         "min_block_h": 2,
-        "max_block_h": 12,
+        "max_block_h": 10,
 
         # Long/tall blocks (spatial/temporal modularity proxies)
         "n_long": (2, 5),
         "long_w_min": 12,
-        "long_w_max": 40,
+        "long_w_max": 18,
         "n_tall": (1, 3),
         "tall_h_min": 6,
-        "tall_h_max": 15,
+        "tall_h_max": 10,
 
         "use_barriers": False,
     },
