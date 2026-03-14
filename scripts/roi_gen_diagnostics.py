@@ -402,29 +402,29 @@ def _print_option_summary(rows: List[Dict[str, Any]], group_key: str, metrics: L
 
 @dataclass
 class ExperimentConfig:
-    num_qubits: int = 20
-    num_layers: int = 60
+    num_qubits: int = 30
+    num_layers: int = 80
     n: int = 50
     seed_base: int = 0
 
     # Baseline params
-    n_rois: int = 3
+    n_rois: int = 5
     twoq_to_oneq_ratio: float = 0.7
     idle_density: float = 0.2
-    p_bridge_boundary: Tuple[float, float] = (0.10, 0.20)
-    p_bridge_interior: Tuple[float, float] = (0.01, 0.05)
-    noise_1q_prob: float = 0.02
-    noise_2q_prob: float = 0.004
+    p_bridge_boundary: Tuple[float, float] = (0.15, 0.25)
+    p_bridge_interior: Tuple[float, float] = (0.05, 0.10)
+    noise_1q_prob: float = 0.05
+    noise_2q_prob: float = 0.02
     measure_frac: float = 0.0
 
     min_block_w: int = 2
-    max_block_w: int = 18
+    max_block_w: int = 15
     min_block_h: int = 2
-    max_block_h: int = 16
+    max_block_h: int = 8
 
     n_long: Tuple[int, int] = (2, 5)
     long_w_min: int = 12
-    long_w_max: int = 40
+    long_w_max: int = 18
 
     n_tall: Tuple[int, int] = (1, 3)
     tall_h_min: int = 6

@@ -256,8 +256,9 @@ def _segments_to_bounds(sizes: List[int]) -> List[Tuple[int, int]]:
 # ROI library (non-idle). A circuit samples a subset of these (n_rois).
 ROI_LIBRARY: Tuple[str, ...] = (
     # 1Q-dominant / temporal-profile ROIs
-    "1q_heavy",
+    "1q_dense",
     "streaming",
+    "mixed_sparse"
 
     # 2Q ROIs (distinct corners of density/range/topology space)
     # NOTE: "2q_dense_short" has been redefined to mean *short-range but not dense*
@@ -307,28 +308,63 @@ def _fill_roi_layer(
     # ----------------------------
     # 1Q-heavy ROI
     # ----------------------------
-    if roi == "1q_heavy":
+    if roi == "1q_dense":
         for q in qubits:
-            if rng.rand() < 0.75:
+            if rng.rand() < 0.80:
                 apply_random_1q_gate(qc, q, rng)
         # Occasional 2Q (biased by default p2) just to avoid being perfectly 1Q-only.
-        if n >= 2 and rng.rand() < 0.35 * p2_default:
+        if n >= 2 and rng.rand() < 0.10:
             q1, q2 = rng.choice(qubits, size=2, replace=False)
             apply_random_2q_gate(qc, int(q1), int(q2), rng)
         return
 
     # ----------------------------
-    # Short-range (NOT dense) 2Q
+    # Mixed sparse (random 1Q or 2Q with no strong bias)
+    # ----------------------------
+    if roi == "mixed_sparse":
+        if n == 1:
+            if rng.rand() < 0.5:
+                apply_random_1q_gate(qc, qubits[0], rng)
+            return
+
+        frac = float(rng.uniform(0.25, 0.45))
+        m = max(1, min(n, int(np.ceil(frac * n))))
+        active = sorted(int(x) for x in rng.choice(qubits, size=m, replace=False))
+
+        i = 0
+        while i < len(active):
+            if i + 1 < len(active) and rng.rand() < 0.5:
+                apply_random_2q_gate(qc, active[i], active[i + 1], rng)
+                i += 2
+            else:
+                apply_random_1q_gate(qc, active[i], rng)
+                i += 1
+        return
+
+    # ----------------------------
+    # Short-range (1q or 2q apart) 2Q
     # (dense+short is covered by brickwork_entangler and swap_network)
     # ----------------------------
     if roi in {"2q_dense_short", "2q_short_range"}:
-        if n >= 2 and rng.rand() < (0.55 + 0.35 * p2_default):
-            i = int((rect_key + t_local) % (n - 1))
-            apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+        if n >= 2 and rng.rand() < 0.90:
+            if n == 2:
+                # only adjacent is possible
+                i = int((rect_key + t_local) % (n - 1))
+                apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+            else:
+                # choose span 1 or 2 with equal probability
+                span = 1 if rng.rand() < 0.5 else 2
+
+                # if span=2 is not possible for this block, fall back to span=1
+                if span == 2 and n < 3:
+                    span = 1
+
+                i = int((rect_key + t_local) % (n - span))
+                apply_random_2q_gate(qc, qubits[i], qubits[i + span], rng)
         # Light 1Q sprinkle
-        for q in qubits:
-            if rng.rand() < 0.15:
-                apply_random_1q_gate(qc, q, rng)
+        # for q in qubits:
+        #     if rng.rand() < 0.04:
+        #         apply_random_1q_gate(qc, q, rng)
         return
 
     # ----------------------------
@@ -356,9 +392,9 @@ def _fill_roi_layer(
                 apply_random_2q_gate(qc, int(q1), int(q2), rng)
                 pairs_added += 1
 
-        for q in qubits:
-            if rng.rand() < 0.20:
-                apply_random_1q_gate(qc, q, rng)
+        # for q in qubits:
+        #     if rng.rand() < 0.04:
+        #         apply_random_1q_gate(qc, q, rng)
         return
 
     # ----------------------------
@@ -390,10 +426,10 @@ def _fill_roi_layer(
             if abs(a - b) >= dist_thr or rng.rand() < 0.15:
                 apply_random_2q_gate(qc, a, b, rng)
 
-        # Small 1Q sprinkle
-        for q in qubits:
-            if rng.rand() < 0.10:
-                apply_random_1q_gate(qc, q, rng)
+        # # Small 1Q sprinkle
+        # for q in qubits:
+        #     if rng.rand() < 0.05:
+        #         apply_random_1q_gate(qc, q, rng)
         return
 
     # ----------------------------
@@ -403,9 +439,9 @@ def _fill_roi_layer(
         offset = 0 if (t_local % 2 == 0) else 1
         for i in range(offset, n - 1, 2):
             apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
-        for q in qubits:
-            if rng.rand() < 0.20:
-                apply_random_1q_gate(qc, q, rng)
+        # for q in qubits:
+        #     if rng.rand() < 0.05:
+        #         apply_random_1q_gate(qc, q, rng)
         return
 
     # ----------------------------
@@ -415,9 +451,9 @@ def _fill_roi_layer(
         offset = 0 if (t_local % 2 == 0) else 1
         for i in range(offset, n - 1, 2):
             qc.swap(qubits[i], qubits[i + 1])
-        for i in range(offset, n - 1, 2):
-            if rng.rand() < 0.35:
-                apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
+        # for i in range(offset, n - 1, 2):
+        #     if rng.rand() < 0.35:
+        #         apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
         return
 
     # ----------------------------
@@ -453,8 +489,8 @@ def _fill_roi_layer(
             p2 = others[(t_local + (rect_key // 13) + 1) % len(others)]
             if p2 != p1:
                 apply_random_2q_gate(qc, int(hub), int(p2), rng)
-        if rng.rand() < 0.25:
-            apply_random_1q_gate(qc, int(hub), rng)
+        # if rng.rand() < 0.25:
+        #     apply_random_1q_gate(qc, int(hub), rng)
         return
 
     # ----------------------------
@@ -465,10 +501,10 @@ def _fill_roi_layer(
             return
         i = int((rect_key + t_local) % (n - 1))
         apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
-        if rng.rand() < 0.25:
-            apply_random_1q_gate(qc, qubits[i], rng)
-        if rng.rand() < 0.25:
-            apply_random_1q_gate(qc, qubits[i + 1], rng)
+        # if rng.rand() < 0.25:
+        #     apply_random_1q_gate(qc, qubits[i], rng)
+        # if rng.rand() < 0.25:
+        #     apply_random_1q_gate(qc, qubits[i + 1], rng)
         return
 
     # ----------------------------
@@ -483,8 +519,8 @@ def _fill_roi_layer(
             return
         i = int((t_local + (rect_key // 5)) % (n - 1))
         apply_random_2q_gate(qc, qubits[i], qubits[i + 1], rng)
-        if (t_local % 3 == 2) and (i + 2 < n):
-            apply_random_2q_gate(qc, qubits[i + 1], qubits[i + 2], rng)
+        # if (t_local % 3 == 2) and (i + 2 < n):
+        #     apply_random_2q_gate(qc, qubits[i + 1], qubits[i + 2], rng)
         return
 
     # ----------------------------
@@ -537,8 +573,8 @@ def _fill_roi_layer(
                 targets.append(qubits[tidx])
         for tgt in targets:
             qc.cz(int(ctrl), int(tgt))
-        if rng.rand() < 0.35:
-            qc.h(int(ctrl))
+        # if rng.rand() < 0.35:
+        #     qc.h(int(ctrl))
         return
 
     # ----------------------------
@@ -547,9 +583,9 @@ def _fill_roi_layer(
     # ----------------------------
     if roi == "bridge_burst":
         for q in qubits:
-            if rng.rand() < 0.25:
+            if rng.rand() < 0.10:
                 apply_random_1q_gate(qc, q, rng)
-        if n >= 2 and rng.rand() < 0.25:
+        if n >= 2 and rng.rand() < 0.10:
             q1, q2 = rng.choice(qubits, size=2, replace=False)
             apply_random_2q_gate(qc, int(q1), int(q2), rng)
         return
@@ -579,7 +615,7 @@ def _sprinkle_block_noise(
     if len(qubits) >= 2:
         attempts = max(1, len(qubits) // 4)
         for _ in range(attempts):
-            if len(qubits) >= 2 and rng.rand() < noise_2q_prob:
+            if rng.rand() < noise_2q_prob:
                 q1, q2 = rng.choice(qubits, size=2, replace=False)
                 apply_random_2q_gate(qc, int(q1), int(q2), rng)
 
@@ -635,8 +671,13 @@ def generate_roi_composed_circuit(
     use_barriers: bool = True,
     seed: Optional[int] = None,
     debug: bool = False,
+    roi_debug_prints: Optional[bool] = None,
 ) -> QuantumCircuit:
     """Generate an ROI-composed circuit by tiling the (layer × qubit) canvas.
+
+    Args:
+        roi_debug_prints: Controls ROI metadata/debug printing independently of
+            other debug behavior. If None, inherits from ``debug``.
 
     Four tiling options over an (atomic_layer × qubit) canvas:
       - OP1 : fixed spatial bands + fixed time slices
@@ -660,12 +701,13 @@ def generate_roi_composed_circuit(
         Qiskit QuantumCircuit.
     """
     # TODO: make this apercentage based instead a count
-    dist_thr_long = min(12, int(0.5 * num_qubits))
+    dist_thr_long = 5
 
     if num_qubits <= 0 or num_layers <= 0:
         raise ValueError("num_qubits and num_layers must be positive")
 
     opt = option.lower()
+    roi_debug_prints = debug if roi_debug_prints is None else bool(roi_debug_prints)
     if opt not in {"op1", "op2a", "op2b", "op3"}:
         raise ValueError(f"Unknown option={option!r}. Expected op1/op2a/op2b/op3")
 
@@ -679,12 +721,24 @@ def generate_roi_composed_circuit(
     # Choose per-circuit ROI subset (excluding idle).
     n_rois = int(max(1, min(len(ROI_LIBRARY), n_rois)))
     chosen_rois = list(rng.choice(list(ROI_LIBRARY), size=n_rois, replace=False))
+    oneq_pool = ["1q_dense", "streaming", "mixed_sparse"]
+    oneq_pool = [r for r in oneq_pool if r in ROI_LIBRARY]
+
+    if n_rois > 1 and oneq_pool and not any(r in oneq_pool for r in chosen_rois):
+        # choose a 1Q ROI not already present
+        available_oneq = [r for r in oneq_pool if r not in chosen_rois]
+        if available_oneq:
+            new_oneq = str(rng.choice(available_oneq))
+            replace_idx = int(rng.randint(len(chosen_rois)))
+            chosen_rois[replace_idx] = new_oneq
+    if debug:
+        print(f"\n[ROI-GEN DEBUG] chosen_rois={chosen_rois} (p2_default={p2_default:.3f})")
 
     # Long/tall modularity knobs per circuit.
     n_long_i = _as_int(n_long, rng)
     n_tall_i = _as_int(n_tall, rng)
 
-    if debug:
+    if roi_debug_prints:
         print("\n[ROI-GEN DEBUG] ===== per-circuit sampled knobs =====")
         print(f"num_qubits={num_qubits} num_layers={num_layers} option={opt}")
         print(f"seed={seed}")
@@ -774,7 +828,7 @@ def generate_roi_composed_circuit(
     if not rects:
         raise RuntimeError("Failed to tile canvas into rectangles")
     
-    if debug:
+    if roi_debug_prints:
         print("\n[ROI-GEN DEBUG] ===== tiling summary =====")
         print(f"#rects={len(rects)}  coverage={sum(r.area for r in rects)} "
             f"(expected {num_qubits*num_layers})")
@@ -825,9 +879,9 @@ def generate_roi_composed_circuit(
             forced_sparse = set(eligible[: min(n_force, len(eligible))])
 
     # Long-rectangle eligibility thresholds (relative to whole circuit length).
-    ripple_min_w = int(np.ceil(0.30 * float(num_layers)))
-    encdec_min_w = int(np.ceil(0.30 * float(num_layers)))
-    qft_min_w = int(np.ceil(0.20 * float(num_layers)))
+    ripple_min_w = max(8, int(np.ceil(0.8 * max_block_w)))
+    encdec_min_w = max(8, int(np.ceil(0.8 * max_block_w)))
+    qft_min_w    = max(8, int(np.ceil(0.8 * max_block_w)))
 
     def _roi_eligible_for_rect(roi_name: str, r: Rect) -> bool:
         w = int(r.t1 - r.t0)
@@ -847,7 +901,7 @@ def generate_roi_composed_circuit(
                 return cand
 
         # Fallback preference order
-        for pref in ("brickwork_entangler", "swap_network", "2q_dense_short", "1q_heavy", "streaming"):
+        for pref in ("brickwork_entangler", "swap_network", "2q_dense_short", "1q_dense", "streaming"):
             if pref in chosen_rois:
                 return pref
         return str(chosen_rois[0])
@@ -881,7 +935,7 @@ def generate_roi_composed_circuit(
         rect_keys.append(int(key))
         rect_rngs.append(np.random.RandomState(int(key)))
 
-    if debug:
+    if roi_debug_prints:
         print("\n[ROI-GEN DEBUG] ===== ROI assignment =====")
         roi_counts = Counter(r.roi for r in rects)
         roi_area = Counter()
@@ -929,6 +983,7 @@ def generate_roi_composed_circuit(
     # Fill layers
     for t in range(num_layers):
         active_rects = rects_by_layer[t]
+        non_idle_active_rects = [ridx for ridx in active_rects if rects[ridx].roi != "idle"]
 
         for ridx in active_rects:
             r = rects[ridx]
@@ -938,32 +993,36 @@ def generate_roi_composed_circuit(
             _sprinkle_block_noise(qc, qs, rect_rngs[ridx], noise_1q_prob, noise_2q_prob)
 
         # Bridges
-        if len(active_rects) >= 2:
+        if len(non_idle_active_rects) >= 2:
             p_bridge = p_bdry if boundary_layer[t] else p_int
             if rng.rand() < p_bridge:
                 # Add 1–2 bridges (fixed behavior; not a config parameter).
                 for _ in range(2):
-                    ra, rb = rng.choice(active_rects, size=2, replace=False)
+                    ra, rb = rng.choice(non_idle_active_rects, size=2, replace=False)
                     qa = int(rng.choice(rects[ra].qubits()))
                     qb = int(rng.choice(rects[rb].qubits()))
                     apply_random_2q_gate(qc, qa, qb, rng)
                     if rng.rand() < 0.5:
                         break
-        # Bridge-burst ROI: for a few layers, inject multiple inter-ROI edges (controlled comm spikes).
-        if len(active_rects) >= 2:
-            burst_edges = 0
-            for rr_idx in active_rects:
-                rr = rects[rr_idx]
-                if rr.roi != "bridge_burst":
-                    continue
+        # Bridge-burst ROI: burst edges must involve a burst rectangle, and never idle
+        burst_rects = []
+        other_non_idle_rects = []
+
+        for rr_idx in non_idle_active_rects:
+            rr = rects[rr_idx]
+            if rr.roi == "bridge_burst":
                 tl = t - rr.t0
                 w = rr.t1 - rr.t0
-                # burst near start/end of the burst-ROI rectangle
                 if tl < 3 or tl >= (w - 3):
-                    burst_edges += 3  # per active burst ROI
-            burst_edges = int(min(burst_edges, 10))
+                    burst_rects.append(rr_idx)
+            else:
+                other_non_idle_rects.append(rr_idx)
+
+        if burst_rects and other_non_idle_rects:
+            burst_edges = min(3 * len(burst_rects), 10)
             for _ in range(burst_edges):
-                ra, rb = rng.choice(active_rects, size=2, replace=False)
+                ra = int(rng.choice(burst_rects))
+                rb = int(rng.choice(other_non_idle_rects))
                 qa = int(rng.choice(rects[ra].qubits()))
                 qb = int(rng.choice(rects[rb].qubits()))
                 apply_random_2q_gate(qc, qa, qb, rng)

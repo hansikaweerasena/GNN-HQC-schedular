@@ -55,30 +55,30 @@ if __name__ == "__main__":
         # New ROI-based generator (see src/circuit_generation.py)
         qc = generate_roi_composed_circuit(
             num_qubits=20,
-            num_layers=60,
-            option="op2a",          # op1 | op2a | op2b | op3
+            num_layers=80,
+            option="op2b",          # op1 | op2a | op2b | op3
             n_rois=5,                # excluding idle
             twoq_to_oneq_ratio=0.1,   # default bias for non-2Q-dense ROIs
             idle_density=0.20,
-            p_bridge_boundary=(0.10, 0.20),
-            p_bridge_interior=(0.01, 0.05),
-            noise_1q_prob=0.02,
-            noise_2q_prob=0.004,
+            p_bridge_boundary=(0.15, 0.25),
+            p_bridge_interior=(0.05, 0.10),
+            noise_1q_prob=0.05,
+            noise_2q_prob=0.02,
             measure_frac=0.0,
             # rectangle bounds
             min_block_w=2,
-            max_block_w=18,
+            max_block_w=15,
             min_block_h=2,
-            max_block_h=16,
+            max_block_h=10,
             # long/tall block allocation
-            n_long=(2, 5),
-            long_w_min=12,
-            long_w_max=40,
+            n_long=(2, 3),
+            long_w_min=15,
+            long_w_max=30,
             n_tall=(1, 3),
-            tall_h_min=6,
-            tall_h_max=10,
+            tall_h_min=10,
+            tall_h_max=20,
             use_barriers=False,
-            seed=7,
+            seed=643,
             debug=True
         )
         title = "ROI"
