@@ -35,12 +35,37 @@ class SegmentStatsExtractor(nn.Module):
         hyb = gamma_cfg.get("hyb_weights", {}) or {}
         self.gamma_hyb = [float(hyb.get(f"a{i}", 0.0)) for i in range(4)]
 
-        # --- NEW: history-based effective multigraph (used only when segments are layer-wise) ---
-        hist_cfg = gamma_cfg.get("history", {}) or {}
+        # Connectivity graph construction for Gamma:
+        # - "current": use only the current segment/layer interaction multigraph
+        # - "history": use the existing EWMA graph of past segments (backward compatible)
+        # - "window": use a small bidirectional window centered at the current segment
+        temporal_cfg = gamma_cfg.get("temporal_graph", {}) or {}
+        self.gamma_temporal_mode = str(
+            temporal_cfg.get(
+                "mode",
+                "history" if bool((gamma_cfg.get("history", {}) or {}).get("enabled", False)) else "current",
+            )
+        ).strip().lower()
+
+        # --- History / EWMA settings (kept backward-compatible with the old config path) ---
+        hist_cfg_legacy = gamma_cfg.get("history", {}) or {}
+        hist_cfg = temporal_cfg.get("history", hist_cfg_legacy) or {}
         self.gamma_hist_enabled = bool(hist_cfg.get("enabled", False))
         self.gamma_hist_alpha = float(hist_cfg.get("alpha", 0.85))
         # prune edges whose EWMA weight falls below this threshold (0 disables pruning)
         self.gamma_hist_cutoff = float(hist_cfg.get("cutoff", 0.0))
+
+        # --- Bidirectional window settings (new) ---
+        window_cfg_legacy = gamma_cfg.get("window", {}) or {}
+        window_cfg = temporal_cfg.get("window", window_cfg_legacy) or {}
+        self.gamma_window_enabled = bool(window_cfg.get("enabled", False))
+        self.gamma_window_radius = max(0, int(window_cfg.get("radius", 2)))
+        self.gamma_window_decay = float(window_cfg.get("decay", 0.6))
+        self.gamma_window_normalize = bool(window_cfg.get("normalize", False))
+        raw_window_weights = window_cfg.get("weights", None)
+        self.gamma_window_weights = (
+            [float(x) for x in raw_window_weights] if isinstance(raw_window_weights, (list, tuple)) else None
+        )
 
         self._cached_key = None
         self._cached_val = None
@@ -260,6 +285,81 @@ class SegmentStatsExtractor(nn.Module):
                 if float(hist[e]) < cutoff:
                     del hist[e]
 
+
+    def _resolve_temporal_graph_mode(self, seg_mode: str) -> str:
+        """
+        Choose which interaction multigraph should be used to compute Gamma.
+
+        Backward compatibility:
+        - If the new temporal_graph.mode is absent, the legacy history.enabled path still works.
+        - History / window modes are only activated for layer-wise segmentation.
+        """
+        seg_mode = str(seg_mode).strip().lower()
+        mode = str(self.gamma_temporal_mode or "current").strip().lower()
+
+        # Only use temporal graph builders when segments are individual layers.
+        if seg_mode != "layer":
+            return "current"
+
+        if mode in {"history", "ewma"}:
+            return "history" if self.gamma_hist_enabled else "current"
+        if mode in {"window", "bidirectional_window", "bidir_window"}:
+            return "window" if self.gamma_window_enabled and self.gamma_window_radius > 0 else "current"
+        return "current"
+
+    def _window_weight(self, delta: int) -> float:
+        """
+        Weight for a segment offset delta in the bidirectional window.
+
+        Priority:
+        1) explicit weights list of length (2*radius + 1)
+        2) geometric decay: decay ** |delta|
+        """
+        d = abs(int(delta))
+        if self.gamma_window_weights is not None:
+            radius = int(self.gamma_window_radius)
+            expected = 2 * radius + 1
+            if len(self.gamma_window_weights) == expected:
+                idx = int(delta) + radius
+                if 0 <= idx < expected:
+                    return float(self.gamma_window_weights[idx])
+        return float(self.gamma_window_decay) ** d
+
+    def _build_window_edge_counts(
+        self,
+        edge_counts_per_seg: List[Dict[Tuple[int, int], float]],
+        center_idx: int,
+    ) -> Dict[Tuple[int, int], float]:
+        """
+        Build a weighted bidirectional windowed multigraph around center_idx.
+
+        The current layer/segment gets the largest weight; nearby past/future layers get
+        smaller weights, either from an explicit weights list or geometric decay.
+        """
+        radius = int(self.gamma_window_radius)
+        out: Dict[Tuple[int, int], float] = defaultdict(float)
+        if radius <= 0 or len(edge_counts_per_seg) == 0:
+            return dict(out)
+
+        total_weight = 0.0
+        start = max(0, int(center_idx) - radius)
+        end = min(len(edge_counts_per_seg) - 1, int(center_idx) + radius)
+
+        for j in range(start, end + 1):
+            delta = j - int(center_idx)
+            w_layer = float(self._window_weight(delta))
+            if w_layer <= 0.0:
+                continue
+            total_weight += w_layer
+            for e, n in edge_counts_per_seg[j].items():
+                out[e] += w_layer * float(n)
+
+        if self.gamma_window_normalize and total_weight > 0.0:
+            for e in list(out.keys()):
+                out[e] = float(out[e]) / total_weight
+
+        return dict(out)
+
     def _resolve_gates(self, layer_ref, circuit):
         """
         layer_ref can be:
@@ -293,17 +393,21 @@ class SegmentStatsExtractor(nn.Module):
         edges: List[Dict[str, torch.Tensor]] = []
         layer_ops: List[List[Dict[str, torch.Tensor]]] = []
 
-        # --- NEW: when segments are layer-wise, compute Γ from a history-based EWMA multigraph ---
+        # First pass: collect raw per-segment/layer interaction multigraphs and op lists.
         seg_mode = str(DATASET_CFG.get("segmentation_mode", "")).strip().lower()
-        use_gamma_history = bool(self.gamma_hist_enabled) and seg_mode == "layer"
-        ewma_edge_counts: Dict[Tuple[int, int], float] = {} if use_gamma_history else {}
+        temporal_graph_mode = self._resolve_temporal_graph_mode(seg_mode)
+
+        edge_counts_per_seg: List[Dict[Tuple[int, int], float]] = []
+        layer_ops_raw_per_seg: List[List[Dict[str, Any]]] = []
+        L_s_list: List[int] = []
 
         for s, seg in enumerate(segments):
             layers = getattr(seg, "layers", seg)
             L_s = len(layers)
             L[s] = float(L_s)
+            L_s_list.append(int(L_s))
 
-            edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+            edge_counts: Dict[Tuple[int, int], float] = defaultdict(float)
 
             # Collect per-layer operation lists for differentiable timing + idle-only decoherence
             layer_ops_s_raw: List[Dict[str, Any]] = []
@@ -338,7 +442,7 @@ class SegmentStatsExtractor(nn.Module):
                         if not (0 <= u < N and 0 <= v < N):
                             continue
                         a, b = (u, v) if u < v else (v, u)
-                        edge_counts[(a, b)] += 1
+                        edge_counts[(a, b)] += 1.0
                         ops2_u.append(u)
                         ops2_v.append(v)
                         ops2_pairs.append((a, b))
@@ -356,20 +460,36 @@ class SegmentStatsExtractor(nn.Module):
                     "ops2_pairs": ops2_pairs,
                 })
 
-            # Compute Γ from either the segment multigraph (default) or an EWMA history multigraph (layer-wise mode)
-            if use_gamma_history:
-                # Update the rolling multigraph with the current layer/segment
-                self._ewma_update_and_prune(ewma_edge_counts, edge_counts)
-                gamma_s_raw, gamma_map = self._compute_gamma_value(N=N, L_s=L_s, edge_counts=ewma_edge_counts)
+            edge_counts_per_seg.append(dict(edge_counts))
+            layer_ops_raw_per_seg.append(layer_ops_s_raw)
 
-                # For pair-wise modes (gamma_map != None), summarize Γ(s) as the weighted mean
-                # over *current* edges so dashboards reflect the current layer in its temporal context.
-                if gamma_map is not None and len(edge_counts) > 0:
-                    gamma_s = self._weighted_mean_over_edges(edge_counts, gamma_map)
-                else:
-                    gamma_s = float(gamma_s_raw)
+        # Second pass: compute Gamma from the selected connectivity graph source.
+        ewma_edge_counts: Dict[Tuple[int, int], float] = {}
+        for s in range(S):
+            edge_counts = edge_counts_per_seg[s]
+            L_s = L_s_list[s]
+            layer_ops_s_raw = layer_ops_raw_per_seg[s]
+
+            if temporal_graph_mode == "history":
+                self._ewma_update_and_prune(ewma_edge_counts, edge_counts)
+                gamma_input_edge_counts = dict(ewma_edge_counts)
+            elif temporal_graph_mode == "window":
+                gamma_input_edge_counts = self._build_window_edge_counts(edge_counts_per_seg, s)
             else:
-                gamma_s, gamma_map = self._compute_gamma_value(N=N, L_s=L_s, edge_counts=edge_counts)
+                gamma_input_edge_counts = edge_counts
+
+            gamma_s_raw, gamma_map = self._compute_gamma_value(
+                N=N,
+                L_s=L_s,
+                edge_counts=gamma_input_edge_counts,
+            )
+
+            # For pair-wise modes, summarize Gamma(s) using current edges so dashboards/debugging
+            # reflect the present layer in its temporal context, not the entire support graph.
+            if gamma_map is not None and len(edge_counts) > 0:
+                gamma_s = self._weighted_mean_over_edges(edge_counts, gamma_map)
+            else:
+                gamma_s = float(gamma_s_raw)
 
             gamma[s] = float(gamma_s)
 
