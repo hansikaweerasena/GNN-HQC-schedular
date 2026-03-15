@@ -113,14 +113,15 @@ def _ensure_dir(path: Path) -> None:
 
 def _symmetric_window_weights(radius: int) -> List[float]:
     # Default requested by user for radius=3: [0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25]
-    base = {0: 1.0, 1: 0.75, 2: 0.50, 3: 0.25}
-    weights: List[float] = []
-    for d in range(radius, 0, -1):
-        weights.append(base.get(d, max(0.0, 1.0 - 0.25 * d)))
-    weights.append(base.get(0, 1.0))
-    for d in range(1, radius + 1):
-        weights.append(base.get(d, max(0.0, 1.0 - 0.25 * d)))
-    return weights
+    # base = {0: 1.0, 1: 0.75, 2: 0.50, 3: 0.25}
+    # weights: List[float] = []
+    # for d in range(radius, 0, -1):
+    #     weights.append(base.get(d, max(0.0, 1.0 - 0.25 * d)))
+    # weights.append(base.get(0, 1.0))
+    # for d in range(1, radius + 1):
+    #     weights.append(base.get(d, max(0.0, 1.0 - 0.25 * d)))
+    return [1.0]* (2 * int(radius) + 1)
+    # return weights
 
 
 def _default_profile_weights(radius: int) -> List[float]:
