@@ -1,6 +1,7 @@
 quantum-gnn/*
 roi_gen_diagnostics*
 roi_gen_trend*
+calibration/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
