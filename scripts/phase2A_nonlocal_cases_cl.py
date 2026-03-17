@@ -18,7 +18,7 @@ What this script does
 4. Produces case-wise logs, CSV tables, and visualizations to support threshold
    selection and false-positive inspection.
 
-Non-local classification used here (3-stage pipeline)
+Non-local classification used here (4-stage pipeline)
 ------------------------------------------------------
 Let G_nl(l) be the longer-horizon effective graph around layer l.
 For target edge (u,v):
@@ -33,12 +33,19 @@ For target edge (u,v):
            pass if |C_u| >= delta_community AND |C_v| >= delta_community
            (kills false positives from small/pendant neighborhoods)
 
-  Stage 3  detour threshold
+  Stage 3  pair-reuse guard
+           count how many times (u,v) appears in a small local window
+           (±pair_reuse_radius layers around current layer).
+           fail if count >= pair_reuse_threshold
+           (kills false positives from repeated nearest-neighbor edges
+            that happen to sit at community boundaries)
+
+  Stage 4  detour threshold
            L_detour = shortest path in G_nl without (u,v)
            pass if L_detour >= tau_detour
            (L_detour - 1 is a SWAP-count proxy for routing burden)
 
-  I_nl = 1[ stage1 AND stage2 AND stage3 ]
+  I_nl = 1[ stage1 AND stage2 AND stage3 AND stage4 ]
 
 This script is focused on the classifier metrics and their threshold behavior.
 The final non-local score magnitude (detour-based Gamma_nonlocal) is left for a
@@ -109,17 +116,28 @@ class NonlocalCaseConfig:
     # Stage 2 community size guard: both components after edge removal must be >= delta
     delta_community: int = 3
 
-    # Stage 3 detour threshold: L_detour >= tau_detour to classify as non-local
+    # Stage 3 pair-reuse guard: if edge appears >= pair_reuse_threshold times
+    # in a small local window (±pair_reuse_radius layers), it is a temporally
+    # stable local interaction, not a long-range bridge.
+    pair_reuse_radius: int = 2
+    pair_reuse_threshold: int = 2
+
+    # Stage 4 detour threshold: L_detour >= tau_detour to classify as non-local
     tau_detour: int = 3
 
-    # Detour cap for bridges (inf replacement in scoring)
-    detour_cap: int = 12
+    # Technology connectivity capacity (e.g. 3 for heavy-hex).
+    # detour_cap is derived as kappa + 1.
+    kappa: int = 3
 
     eps: float = 1e-12
 
     outdir: str = "calibration/phase2A_nonlocal_cases"
     annotate_heatmaps: bool = True
     save_qiskit_text: bool = True
+
+    @property
+    def detour_cap(self) -> int:
+        return self.kappa + 1
 
 
 class NonlocalMotifFactory:
@@ -337,6 +355,30 @@ def detour_metrics(
     return l_detour, cu, cv
 
 
+def pair_reuse_count(
+    edge_counts_per_layer: Sequence[Dict[Tuple[int, int], float]],
+    layer_idx: int,
+    pair: Tuple[int, int],
+    radius: int,
+) -> int:
+    """
+    Stage 3 pair-reuse guard helper.
+
+    Count how many layers within ±radius of layer_idx contain pair (u,v).
+    A count >= threshold means the edge is a temporally stable local
+    interaction, not a one-shot long-range bridge.
+    """
+    n_layers = len(edge_counts_per_layer)
+    count = 0
+    for off in range(-radius, radius + 1):
+        j = layer_idx + off
+        if j < 0 or j >= n_layers:
+            continue
+        if pair in edge_counts_per_layer[j]:
+            count += 1
+    return count
+
+
 def compute_nonlocal_gate_rows(
     motif: MotifSpec,
     edge_counts_per_layer: Sequence[Dict[Tuple[int, int], float]],
@@ -344,18 +386,22 @@ def compute_nonlocal_gate_rows(
     cfg: NonlocalCaseConfig,
 ) -> pd.DataFrame:
     """
-    Three-stage non-local classifier per gate:
+    Four-stage non-local classifier per gate:
 
     Stage 1  betweenness pre-filter   B_btw >= tau_btw
              (cheap O(VE); kills trivially local edges fast)
     Stage 2  community size guard     min(|C_u|, |C_v|) >= delta_community
              (kills false positives from small/pendant neighborhoods)
-    Stage 3  detour threshold         L_detour >= tau_detour
+    Stage 3  pair-reuse guard         reuse_count < pair_reuse_threshold
+             (kills false positives from repeated nearest-neighbor edges)
+    Stage 4  detour threshold         L_detour >= tau_detour
              (hop count = SWAP proxy; provides both classification and score)
 
-    A gate is non-local only if ALL THREE stages pass.
+    A gate is non-local only if ALL FOUR stages pass.
     The stage at which it fails is recorded for inspection.
     """
+    detour_cap = cfg.detour_cap  # kappa + 1
+
     rows: List[Dict[str, Any]] = []
     for s, layer in enumerate(motif.layers):
         eff = effective_graphs[s]
@@ -370,25 +416,37 @@ def compute_nonlocal_gate_rows(
         for gate_idx, pair in enumerate(ordered_pairs, start=1):
             u, v = pair
 
-            # --- Stage 1 ---
+            # --- Stage 1: betweenness pre-filter ---
             btw = float(btw_map.get(pair, 0.0))
             pass_btw = btw >= cfg.tau_btw
 
-            # --- Stage 2 + 3 (only if stage 1 passes — saves BFS cost) ---
+            # --- Stages 2-4 (only if previous stages pass — saves cost) ---
             l_detour: float = float("nan")
             cu: int = 0
             cv: int = 0
+            reuse: int = 0
             pass_community = False
+            pass_pair_reuse = False
             pass_detour = False
 
             if pass_btw:
+                # Stage 2: community size guard
                 l_raw, cu, cv = detour_metrics(eff, motif.num_qubits, pair)
-                l_detour = float(cfg.detour_cap) if math.isinf(l_raw) else float(l_raw)
+                l_detour = float(detour_cap) if math.isinf(l_raw) else float(l_raw)
                 pass_community = (cu >= cfg.delta_community) and (cv >= cfg.delta_community)
-                if pass_community:
-                    pass_detour = l_raw >= cfg.tau_detour  # use raw (inf counts as pass)
 
-            is_nonlocal = pass_btw and pass_community and pass_detour
+                if pass_community:
+                    # Stage 3: pair-reuse guard
+                    reuse = pair_reuse_count(
+                        edge_counts_per_layer, s, pair, cfg.pair_reuse_radius,
+                    )
+                    pass_pair_reuse = reuse < cfg.pair_reuse_threshold
+
+                    if pass_pair_reuse:
+                        # Stage 4: detour threshold
+                        pass_detour = l_raw >= cfg.tau_detour  # raw inf counts as pass
+
+            is_nonlocal = pass_btw and pass_community and pass_pair_reuse and pass_detour
 
             # Which stage killed it (for diagnosis)
             if is_nonlocal:
@@ -397,6 +455,8 @@ def compute_nonlocal_gate_rows(
                 fail_stage = "btw"
             elif not pass_community:
                 fail_stage = "community"
+            elif not pass_pair_reuse:
+                fail_stage = "pair_reuse"
             else:
                 fail_stage = "detour"
 
@@ -418,14 +478,18 @@ def compute_nonlocal_gate_rows(
                 "B_btw":          float(btw),
                 "C_u":            int(cu),
                 "C_v":            int(cv),
+                "reuse_count":    int(reuse),
                 "L_detour":       float(l_detour),
                 # thresholds used
                 "tau_btw":        float(cfg.tau_btw),
                 "delta_community":int(cfg.delta_community),
+                "pair_reuse_threshold": int(cfg.pair_reuse_threshold),
                 "tau_detour":     int(cfg.tau_detour),
+                "kappa":          int(cfg.kappa),
                 # outcome
                 "pass_btw":       bool(pass_btw),
                 "pass_community": bool(pass_community),
+                "pass_pair_reuse":bool(pass_pair_reuse),
                 "pass_detour":    bool(pass_detour),
                 "fail_stage":     str(fail_stage),
                 "I_nonlocal":     int(is_nonlocal),
@@ -446,7 +510,9 @@ def summarize_motif(df: pd.DataFrame, motif: MotifSpec, cfg: NonlocalCaseConfig)
         "window_radius_nl":       int(cfg.window_radius_nl),
         "tau_btw":                float(cfg.tau_btw),
         "delta_community":        int(cfg.delta_community),
+        "pair_reuse_threshold":   int(cfg.pair_reuse_threshold),
         "tau_detour":             int(cfg.tau_detour),
+        "kappa":                  int(cfg.kappa),
         "num_layers":             int(len(motif.layers)),
         "num_gates":              int(len(df)),
         "num_classified_nonlocal":int(df["I_nonlocal"].sum()),
@@ -454,23 +520,26 @@ def summarize_motif(df: pd.DataFrame, motif: MotifSpec, cfg: NonlocalCaseConfig)
         "target_B_btw":           float(_tgt("B_btw", float("nan"))),
         "target_C_u":             int(_tgt("C_u", -1)),
         "target_C_v":             int(_tgt("C_v", -1)),
+        "target_reuse_count":     int(_tgt("reuse_count", 0)),
         "target_L_detour":        float(_tgt("L_detour", float("nan"))),
         "target_pass_btw":        bool(_tgt("pass_btw", False)),
         "target_pass_community":  bool(_tgt("pass_community", False)),
+        "target_pass_pair_reuse": bool(_tgt("pass_pair_reuse", False)),
         "target_pass_detour":     bool(_tgt("pass_detour", False)),
         "target_I_nonlocal":      int(_tgt("I_nonlocal", -1)),
         "target_fail_stage":      str(_tgt("fail_stage", "n/a")),
         # population stats
         "fail_btw":               int(fail_counts.get("btw", 0)),
         "fail_community":         int(fail_counts.get("community", 0)),
+        "fail_pair_reuse":        int(fail_counts.get("pair_reuse", 0)),
         "fail_detour":            int(fail_counts.get("detour", 0)),
         "notes":                  motif.notes,
     }
 
 
 def concise_gate_log(df: pd.DataFrame) -> str:
-    cols = ["layer", "gate_label", "B_btw", "C_u", "C_v", "L_detour",
-            "pass_btw", "pass_community", "pass_detour", "fail_stage",
+    cols = ["layer", "gate_label", "B_btw", "C_u", "C_v", "reuse_count", "L_detour",
+            "pass_btw", "pass_community", "pass_pair_reuse", "pass_detour", "fail_stage",
             "I_nonlocal", "is_target"]
     out = df.loc[:, cols].copy()
     out["B_btw"]    = out["B_btw"].map(lambda x: f"{float(x):.4f}")
@@ -481,12 +550,14 @@ def concise_gate_log(df: pd.DataFrame) -> str:
 def concise_summary_log(summary: Dict[str, Any]) -> str:
     keys = [
         "motif", "window_radius_nl",
-        "tau_btw", "delta_community", "tau_detour",
+        "tau_btw", "delta_community", "pair_reuse_threshold", "tau_detour", "kappa",
         "num_layers", "num_gates", "num_classified_nonlocal",
         "target_B_btw", "target_C_u", "target_C_v",
-        "target_L_detour", "target_pass_btw", "target_pass_community",
-        "target_pass_detour", "target_I_nonlocal", "target_fail_stage",
-        "fail_btw", "fail_community", "fail_detour",
+        "target_reuse_count", "target_L_detour",
+        "target_pass_btw", "target_pass_community",
+        "target_pass_pair_reuse", "target_pass_detour",
+        "target_I_nonlocal", "target_fail_stage",
+        "fail_btw", "fail_community", "fail_pair_reuse", "fail_detour",
     ]
     lines = []
     for k in keys:
@@ -504,7 +575,7 @@ def concise_summary_log(summary: Dict[str, Any]) -> str:
 def plot_metrics_heatmap(df: pd.DataFrame, outpath: Path, annotate: bool = True) -> None:
     if df.empty:
         return
-    pivot_cols = ["B_btw", "C_u", "C_v", "L_detour", "I_nonlocal"]
+    pivot_cols = ["B_btw", "C_u", "C_v", "reuse_count", "L_detour", "I_nonlocal"]
     plot_df = df[["gate_label"] + pivot_cols].copy().set_index("gate_label")
     arr = plot_df.to_numpy(dtype=float)
     fig_h = max(2.8, 0.42 * len(plot_df.index))
@@ -514,14 +585,16 @@ def plot_metrics_heatmap(df: pd.DataFrame, outpath: Path, annotate: bool = True)
     ax.set_xticklabels(pivot_cols, rotation=20, ha="right")
     ax.set_yticks(range(len(plot_df.index)))
     ax.set_yticklabels(plot_df.index)
-    ax.set_title("Non-local classification metrics by gate (3-stage pipeline)")
+    ax.set_title("Non-local classification metrics by gate (4-stage pipeline)")
     cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
     cbar.ax.set_ylabel("value", rotation=90)
+    # Integer columns: C_u(1), C_v(2), reuse_count(3), I_nonlocal(5)
+    int_cols = {1, 2, 3, 5}
     if annotate:
         for i in range(arr.shape[0]):
             for j in range(arr.shape[1]):
                 v = arr[i, j]
-                txt = "—" if math.isnan(v) else (f"{v:.0f}" if j in (1, 2, 4) else f"{v:.2f}")
+                txt = "—" if math.isnan(v) else (f"{v:.0f}" if j in int_cols else f"{v:.2f}")
                 ax.text(j, i, txt, ha="center", va="center", fontsize=8)
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
@@ -537,16 +610,17 @@ def plot_gate_metric_bars(df: pd.DataFrame, motif: MotifSpec, outpath: Path) -> 
     l_det       = df["L_detour"].to_numpy(dtype=float)
     cu          = df["C_u"].to_numpy(dtype=float)
     cv          = df["C_v"].to_numpy(dtype=float)
+    reuse       = df["reuse_count"].to_numpy(dtype=float)
     target_mask = df["is_target"].to_numpy(dtype=bool)
     fail_stage  = df["fail_stage"].tolist()
 
-    fig, axes = plt.subplots(3, 1, figsize=(max(9.0, 0.55 * len(labels)), 9.0), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(max(9.0, 0.55 * len(labels)), 12.0), sharex=True)
 
     # Stage 1: betweenness
     ax = axes[0]
-    bars = ax.bar(x, btw, color=["tab:orange" if f == "none" else
-                                  "tab:blue"   if f == "btw" else "tab:gray"
-                                  for f in fail_stage])
+    ax.bar(x, btw, color=["tab:orange" if f == "none" else
+                           "tab:blue"   if f == "btw" else "tab:gray"
+                           for f in fail_stage])
     ax.axhline(df["tau_btw"].iloc[0], linestyle="--", linewidth=1, label=f"tau_btw={df['tau_btw'].iloc[0]:.3f}")
     ax.set_ylabel("B_btw (max-norm.)")
     ax.set_title(f"Stage 1 — betweenness pre-filter: {motif.name}")
@@ -563,22 +637,33 @@ def plot_gate_metric_bars(df: pd.DataFrame, motif: MotifSpec, outpath: Path) -> 
     ax.set_title("Stage 2 — community size guard")
     ax.legend(loc="upper right", fontsize=8)
 
-    # Stage 3: detour
+    # Stage 3: pair-reuse guard
     ax = axes[2]
+    reuse_thresh = df["pair_reuse_threshold"].iloc[0]
+    ax.bar(x, reuse, color=["tab:purple" if f == "pair_reuse" else
+                             "tab:orange" if f == "none" else "tab:gray"
+                             for f in fail_stage])
+    ax.axhline(reuse_thresh, linestyle="--", linewidth=1, label=f"pair_reuse_threshold={reuse_thresh}")
+    ax.set_ylabel("reuse count")
+    ax.set_title("Stage 3 — pair-reuse guard (fail if ≥ threshold)")
+    ax.legend(loc="upper right", fontsize=8)
+
+    # Stage 4: detour
+    ax = axes[3]
     tau_d = df["tau_detour"].iloc[0]
     colors = ["tab:red" if f == "none" else "tab:gray" for f in fail_stage]
     ax.bar(x, l_det, color=colors)
     ax.axhline(tau_d, linestyle="--", linewidth=1, label=f"tau_detour={tau_d}")
     ax.set_ylabel("L_detour (hops)")
-    ax.set_title("Stage 3 — detour hop count")
+    ax.set_title("Stage 4 — detour hop count")
     ax.legend(loc="upper right", fontsize=8)
 
     for ax in axes:
         for i, is_t in enumerate(target_mask):
             if is_t:
                 ax.axvspan(i - 0.55, i + 0.55, color="gold", alpha=0.18)
-    axes[2].set_xticks(x)
-    axes[2].set_xticklabels(labels, rotation=60, ha="right")
+    axes[3].set_xticks(x)
+    axes[3].set_xticklabels(labels, rotation=60, ha="right")
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
@@ -639,7 +724,7 @@ def plot_fail_stage_breakdown(summary_df: pd.DataFrame, outpath: Path) -> None:
     """Stacked bar: how many gates fell out at each stage, per motif."""
     if summary_df.empty:
         return
-    cols = ["fail_btw", "fail_community", "fail_detour", "num_classified_nonlocal"]
+    cols = ["fail_btw", "fail_community", "fail_pair_reuse", "fail_detour", "num_classified_nonlocal"]
     present = [c for c in cols if c in summary_df.columns]
     if not present:
         return
@@ -731,13 +816,15 @@ def run_one_case(motif: MotifSpec, cfg: NonlocalCaseConfig, base_outdir: Path) -
 def parse_args() -> argparse.Namespace:
     # All numeric defaults are pulled from the dataclass — single source of truth.
     _defaults = NonlocalCaseConfig()
-    p = argparse.ArgumentParser(description="Phase 2A non-local classification harness (3-stage pipeline)")
+    p = argparse.ArgumentParser(description="Phase 2A non-local classification harness (4-stage pipeline)")
     p.add_argument("--motif", type=str, default="all", help="Motif name or 'all'")
     p.add_argument("--window-radius-nl", type=int, default=_defaults.window_radius_nl, help="Non-local flat window radius")
     p.add_argument("--tau-btw", type=float, default=_defaults.tau_btw, help="Stage 1: max-normalized betweenness pre-filter threshold")
     p.add_argument("--delta-community", type=int, default=_defaults.delta_community, help="Stage 2: minimum component size after edge removal")
-    p.add_argument("--tau-detour", type=int, default=_defaults.tau_detour, help="Stage 3: minimum L_detour hop count")
-    p.add_argument("--detour-cap", type=int, default=_defaults.detour_cap, help="Cap value for bridge (inf) detours")
+    p.add_argument("--pair-reuse-radius", type=int, default=_defaults.pair_reuse_radius, help="Stage 3: local window radius for pair-reuse count")
+    p.add_argument("--pair-reuse-threshold", type=int, default=_defaults.pair_reuse_threshold, help="Stage 3: fail if pair appears >= this many times in local window")
+    p.add_argument("--tau-detour", type=int, default=_defaults.tau_detour, help="Stage 4: minimum L_detour hop count")
+    p.add_argument("--kappa", type=int, default=_defaults.kappa, help="Technology connectivity capacity (detour_cap = kappa + 1)")
     p.add_argument("--outdir", type=str, default=_defaults.outdir, help="Output directory")
     p.add_argument("--no-annotate", action="store_true", help="Disable heatmap annotations")
     p.add_argument("--no-qiskit-text", action="store_true", help="Skip circuit text dump")
@@ -750,8 +837,10 @@ def main() -> None:
         window_radius_nl=int(args.window_radius_nl),
         tau_btw=float(args.tau_btw),
         delta_community=int(args.delta_community),
+        pair_reuse_radius=int(args.pair_reuse_radius),
+        pair_reuse_threshold=int(args.pair_reuse_threshold),
         tau_detour=int(args.tau_detour),
-        detour_cap=int(args.detour_cap),
+        kappa=int(args.kappa),
         annotate_heatmaps=not bool(args.no_annotate),
         save_qiskit_text=not bool(args.no_qiskit_text),
         outdir=str(args.outdir),
@@ -782,12 +871,22 @@ def main() -> None:
     plot_fail_stage_breakdown(summary_df, base_outdir / "fail_stage_breakdown.png")
 
     manifest = {
-        "config": asdict(cfg),
+        "config": {
+            "window_radius_nl": cfg.window_radius_nl,
+            "tau_btw": cfg.tau_btw,
+            "delta_community": cfg.delta_community,
+            "pair_reuse_radius": cfg.pair_reuse_radius,
+            "pair_reuse_threshold": cfg.pair_reuse_threshold,
+            "tau_detour": cfg.tau_detour,
+            "kappa": cfg.kappa,
+            "detour_cap": cfg.detour_cap,
+        },
         "motifs": motif_names,
         "pipeline": {
             "stage1": f"max-norm betweenness >= {cfg.tau_btw}",
             "stage2": f"min(|C_u|, |C_v|) >= {cfg.delta_community}",
-            "stage3": f"L_detour >= {cfg.tau_detour}",
+            "stage3": f"pair_reuse_count < {cfg.pair_reuse_threshold} (radius={cfg.pair_reuse_radius})",
+            "stage4": f"L_detour >= {cfg.tau_detour} (cap={cfg.detour_cap}, kappa={cfg.kappa})",
         },
         "outputs": {
             "all_gate_metrics_csv": str(base_outdir / "all_gate_metrics.csv"),
@@ -803,6 +902,7 @@ def main() -> None:
         "target_B_btw",
         "target_C_u",
         "target_C_v",
+        "target_reuse_count",
         "target_L_detour",
         "target_I_nonlocal",
         "target_fail_stage",
