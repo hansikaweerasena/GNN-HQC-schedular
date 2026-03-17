@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 """
+This is without kappa, the old proposed technique with p_k (its hard to explain and calibrate so we moved away from this.)
+
 Phase 1A dense-proxy calibration harness.
 
 What this script does
