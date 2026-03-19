@@ -1,6 +1,8 @@
 # utils/circuit_sources.py
 from typing import Callable, Dict, Any, Optional
 import numpy as np
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.circuit_generation import (
     generate_random_circuit_custom,
