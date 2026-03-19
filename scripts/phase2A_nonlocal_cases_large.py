@@ -159,6 +159,14 @@ class NonlocalMotifFactory:
             "qft_like",
             "scattered_bridges",
             "random_overlay",
+            # --- burst / alternating long-range motifs ---
+            "burst_related_lr",
+            "burst_unrelated_lr",
+            "alternating_lr_local",
+            # --- real algorithm circuits (not engineered) ---
+            "real_qft_10",
+            "real_qaoa_maxcut",
+            "real_qft_16",
         ]
 
     def build(self, name: str) -> MotifSpec:
@@ -183,6 +191,12 @@ class NonlocalMotifFactory:
             "qft_like":                  self.qft_like,
             "scattered_bridges":         self.scattered_bridges,
             "random_overlay":            self.random_overlay,
+            "burst_related_lr":          self.burst_related_lr,
+            "burst_unrelated_lr":        self.burst_unrelated_lr,
+            "alternating_lr_local":      self.alternating_lr_local,
+            "real_qft_10":               self.real_qft_10,
+            "real_qaoa_maxcut":          self.real_qaoa_maxcut,
+            "real_qft_16":               self.real_qft_16,
         }
         if name_l not in builder:
             raise ValueError(f"Unknown motif: {name}")
@@ -769,6 +783,284 @@ class NonlocalMotifFactory:
             target_pair=(0, 14),
             notes="Positive scaled motif: 20-qubit local chain + 8 random long-range "
                   "edges (span ≥5). Tests messy real-circuit regime. Expect 8 non-local.",
+        )
+
+    # ----- burst / alternating long-range motifs -----
+
+    def burst_related_lr(self) -> MotifSpec:
+        """
+        20-qubit chain with skip-one triangles.
+        QFT-like fan pattern: qubit 0 interacts with qubits 12,13,14,15
+        in layers 8,9,10,11 (consecutive). Then qubit 1 interacts with
+        qubits 16,17,18,19 in layers 12,13,14,15.
+
+        Key insight: edges (0,12) and (0,13) share endpoint 0. Qubits 12
+        and 13 are chain neighbors (common neighbor via skip-one).
+        So in the window graph, (0,12) has common neighbor 13 via chain
+        edge (12,13) and LR edge (0,13). Triangle {0,12,13} forms.
+        Similarly (0,13) gets common neighbor 12 or 14.
+
+        This means SOME fan edges will be locally embedded (correctly —
+        the fan creates a local interaction cluster around qubit 0).
+        Not all fan edges will have common neighbors though — the first
+        and last in each fan may not.
+
+        Expect: fewer than 8 non-local, because fan structure creates
+        triangles. Exact count depends on which triangles form in G_nl.
+        """
+        ltypes = self._dense_cluster_layer_types(0, 20)
+        layers = self._cycle_layers(ltypes, 20, "brl")
+
+        # Fan 1: qubit 0 → {12, 13, 14, 15} in consecutive layers
+        fan1 = [
+            (8,  (0, 12)),
+            (9,  (0, 13)),
+            (10, (0, 14)),
+            (11, (0, 15)),
+        ]
+        # Fan 2: qubit 1 → {16, 17, 18, 19} in consecutive layers
+        fan2 = [
+            (12, (1, 16)),
+            (13, (1, 17)),
+            (14, (1, 18)),
+            (15, (1, 19)),
+        ]
+        for lyr, edge in fan1 + fan2:
+            layers[lyr] = LayerSpec(
+                twoq=layers[lyr].twoq + [edge],
+                label=f"brl_fan_{lyr}",
+            )
+        return MotifSpec(
+            name="burst_related_lr",
+            num_qubits=20,
+            layers=layers,
+            target_layer=8,
+            target_pair=(0, 12),
+            notes="Negative scaled motif: QFT-like fan — qubit 0→{12-15}, "
+                  "qubit 1→{16-19} in consecutive layers. Fan structure creates "
+                  "triangles via shared hub + chain neighbors, making ALL fan "
+                  "edges locally embedded. Expect 0 non-local.",
+        )
+
+    def burst_unrelated_lr(self) -> MotifSpec:
+        """
+        20-qubit chain with skip-one triangles.
+        Three bursts of 3 consecutive long-range gates, with NO shared
+        endpoints between gates in the same burst:
+
+          Burst 1 (layers 2,3,4):  (0,15), (4,18), (7,12)
+          Burst 2 (layers 9,10,11): (1,16), (5,19), (8,13)
+          Burst 3 (layers 15,16,17): (2,14), (6,17), (9,11)
+
+        Each burst has gates hitting completely different qubits so no
+        triangles form between them. The local layers between bursts
+        ensure the backbone stays triangle-rich.
+        Expect 9 non-local (all 9 long-range edges).
+        """
+        ltypes = self._dense_cluster_layer_types(0, 20)
+        layers = self._cycle_layers(ltypes, 20, "bul")
+
+        bursts = [
+            # Burst 1: layers 2,3,4
+            (2,  (0, 15)),
+            (3,  (4, 18)),
+            (4,  (7, 12)),
+            # Burst 2: layers 9,10,11
+            (9,  (1, 16)),
+            (10, (5, 19)),
+            (11, (8, 13)),
+            # Burst 3: layers 15,16,17
+            (15, (2, 14)),
+            (16, (6, 17)),
+            (17, (3, 10)),
+        ]
+        for lyr, edge in bursts:
+            layers[lyr] = LayerSpec(
+                twoq=layers[lyr].twoq + [edge],
+                label=f"bul_burst_{lyr}",
+            )
+        return MotifSpec(
+            name="burst_unrelated_lr",
+            num_qubits=20,
+            layers=layers,
+            target_layer=2,
+            target_pair=(0, 15),
+            notes="Positive scaled motif: 3 bursts of 3 consecutive unrelated "
+                  "long-range gates (no shared endpoints within a burst). "
+                  "Expect 9 non-local.",
+        )
+
+    def alternating_lr_local(self) -> MotifSpec:
+        """
+        20-qubit chain with skip-one triangles.
+        Alternating blocks: 3 layers with long-range gates, then 3 pure
+        local layers, repeating.
+
+          Layers 0-2:   local + LR  (0,14), (3,17), (6,19)
+          Layers 3-5:   pure local
+          Layers 6-8:   local + LR  (1,15), (4,18), (7,12)
+          Layers 9-11:  pure local
+          Layers 12-14: local + LR  (2,16), (5,13), (8,11)
+          Layers 15-19: pure local
+
+        Tests: alternating rhythm of non-local/local blocks.
+        No shared endpoints between LR gates in the same block.
+        Expect 9 non-local (all long-range overlay edges).
+        """
+        ltypes = self._dense_cluster_layer_types(0, 20)
+        layers = self._cycle_layers(ltypes, 20, "alt")
+
+        # Block 1: layers 0-2
+        block1 = [
+            (0, (0, 14)),
+            (1, (3, 17)),
+            (2, (6, 19)),
+        ]
+        # Block 2: layers 6-8
+        block2 = [
+            (6, (1, 15)),
+            (7, (4, 18)),
+            (8, (7, 12)),
+        ]
+        # Block 3: layers 12-14
+        block3 = [
+            (12, (2, 16)),
+            (13, (5, 13)),
+            (14, (9, 19)),
+        ]
+        for lyr, edge in block1 + block2 + block3:
+            layers[lyr] = LayerSpec(
+                twoq=layers[lyr].twoq + [edge],
+                label=f"alt_lr_{lyr}",
+            )
+        return MotifSpec(
+            name="alternating_lr_local",
+            num_qubits=20,
+            layers=layers,
+            target_layer=0,
+            target_pair=(0, 14),
+            notes="Positive scaled motif: alternating 3-LR / 3-local blocks. "
+                  "No shared endpoints within blocks. Expect 9 non-local.",
+        )
+
+    # ----- real algorithm circuits (NOT engineered for the classifier) -----
+
+    @staticmethod
+    def _greedy_parallelize(gates: List[Tuple[int, int]], prefix: str) -> List[LayerSpec]:
+        """
+        Greedily pack 2Q gates into parallel layers.
+        Each layer contains non-overlapping gates (no shared qubits).
+        Gate order is preserved — first-come, first-served.
+        """
+        layers: List[List[Tuple[int, int]]] = []
+        for g in gates:
+            placed = False
+            for lyr in layers:
+                used = set()
+                for u, v in lyr:
+                    used.add(u)
+                    used.add(v)
+                if g[0] not in used and g[1] not in used:
+                    lyr.append(g)
+                    placed = True
+                    break
+            if not placed:
+                layers.append([g])
+        return [
+            LayerSpec(twoq=lyr, label=f"{prefix}_{i}")
+            for i, lyr in enumerate(layers)
+        ]
+
+    def real_qft_10(self) -> MotifSpec:
+        """
+        Textbook QFT on 10 qubits. Gate pattern:
+          For i = 0 to 9:
+            For j = i+1 to 9:
+              Controlled-phase gate on (i, j)
+        Total: 45 two-qubit gates. Greedily parallelized into ~15 layers.
+        No engineering — this is the exact QFT gate schedule.
+        """
+        gates: List[Tuple[int, int]] = []
+        for i in range(10):
+            for j in range(i + 1, 10):
+                gates.append((i, j))
+        layers = self._greedy_parallelize(gates, "qft10")
+        return MotifSpec(
+            name="real_qft_10",
+            num_qubits=10,
+            layers=layers,
+            target_layer=0,
+            target_pair=(0, 9),
+            notes="Real algorithm: textbook 10-qubit QFT. All-to-all 2Q gate "
+                  "pattern, greedily parallelized. NOT engineered.",
+        )
+
+    def real_qaoa_maxcut(self) -> MotifSpec:
+        """
+        QAOA for MaxCut on a fixed 3-regular graph with 12 nodes, 3 rounds.
+
+        Graph (3-regular, 18 edges):
+          0-1, 0-4, 0-8,  1-2, 1-5,  2-3, 2-6,  3-7, 3-11,
+          4-5, 4-9,  5-10,  6-7, 6-10,  7-11,  8-9, 8-11,  9-10
+
+        Each QAOA round: ZZ on all 18 graph edges (parallelized).
+        3 rounds = 3 repetitions of the problem-layer block (~15 layers).
+        No engineering — this is the standard QAOA circuit for this graph.
+        """
+        graph_edges: List[Tuple[int, int]] = [
+            (0, 1), (0, 4), (0, 8),
+            (1, 2), (1, 5),
+            (2, 3), (2, 6),
+            (3, 7), (3, 11),
+            (4, 5), (4, 9),
+            (5, 10),
+            (6, 7), (6, 10),
+            (7, 11),
+            (8, 9), (8, 11),
+            (9, 10),
+        ]
+        all_layers: List[LayerSpec] = []
+        for r in range(3):
+            round_layers = self._greedy_parallelize(
+                list(graph_edges), f"qaoa_r{r}",
+            )
+            for i, lyr in enumerate(round_layers):
+                all_layers.append(
+                    LayerSpec(twoq=lyr.twoq, label=f"qaoa_r{r}_L{i}")
+                )
+        return MotifSpec(
+            name="real_qaoa_maxcut",
+            num_qubits=12,
+            layers=all_layers,
+            target_layer=0,
+            target_pair=(0, 8),
+            notes="Real algorithm: 3-round QAOA MaxCut on 12-node 3-regular graph. "
+                  "18 edges per round, greedily parallelized. NOT engineered.",
+        )
+
+    def real_qft_16(self) -> MotifSpec:
+        """
+        Textbook QFT on 16 qubits. Gate pattern:
+          For i = 0 to 15:
+            For j = i+1 to 15:
+              Controlled-phase gate on (i, j)
+        Total: 120 two-qubit gates. Greedily parallelized into ~15 layers.
+        Larger scale with all-to-all connectivity.
+        No engineering — this is the exact QFT gate schedule.
+        """
+        gates: List[Tuple[int, int]] = []
+        for i in range(16):
+            for j in range(i + 1, 16):
+                gates.append((i, j))
+        layers = self._greedy_parallelize(gates, "qft16")
+        return MotifSpec(
+            name="real_qft_16",
+            num_qubits=16,
+            layers=layers,
+            target_layer=0,
+            target_pair=(0, 15),
+            notes="Real algorithm: textbook 16-qubit QFT. 120 two-qubit gates, "
+                  "all-to-all pattern, greedily parallelized. NOT engineered.",
         )
 
 
