@@ -54,8 +54,9 @@ CIRCUIT_SOURCE_CFG = {
     # These kwargs are passed directly into generate_roi_composed_circuit(...)
     "kwargs": {
         # Core size
+        # "num_qubits": 30,
         "num_qubits": 20,
-        "num_layers": 60,
+        "num_layers": 80,
 
         # Fallback option if no mix is enabled
         # One of: "op1", "op2a", "op2b", "op3"
@@ -80,13 +81,28 @@ CIRCUIT_SOURCE_CFG = {
         # End-only measurements (set 0.0 to omit measure ops)
         "measure_frac": 0.0,
 
-        # Rectangle bounds
+        # Rectangle bounds - 30
+        # "min_block_w": 2,
+        # "max_block_w": 15,
+        # "min_block_h": 2,
+        # "max_block_h": 10,
+
+        # Rectangle bounds - 20
         "min_block_w": 2,
         "max_block_w": 15,
         "min_block_h": 2,
-        "max_block_h": 10,
+        "max_block_h": 8,
 
-        # Long/tall blocks (spatial/temporal modularity proxies)
+        # Long/tall blocks (spatial/temporal modularity proxies)- 30
+        # "n_long": (2, 5),
+        # "long_w_min": 12,
+        # "long_w_max": 18,
+        # "n_tall": (1, 3),
+        # "tall_h_min": 6,
+        # "tall_h_max": 10,
+
+
+        # Long/tall blocks (spatial/temporal modularity proxies)- 20
         "n_long": (2, 5),
         "long_w_min": 12,
         "long_w_max": 18,
