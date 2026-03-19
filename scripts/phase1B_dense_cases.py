@@ -581,7 +581,7 @@ def compute_dense_gate_rows(
             K_extra = max(0.0, k_actual - 1.0)   # per-endpoint extra connectivity
             K_pair = 2.0 * K_extra               # summed pair spare capacity threshold
 
-            B_dense = max(0.0, C_raw - K_pair) / (K_extra + cfg.eps) if K_extra > 0.0 else 0.0
+            B_dense = max(0.0, C_raw - K_pair) / (K_pair + cfg.eps) if K_extra > 0.0 else 0.0
             Gamma_dense = B_dense * (1.0 - D_dense)
 
             is_target = bool(motif.target_layer == s and motif.target_pair is not None and _sorted_pair(*motif.target_pair) == pair)
