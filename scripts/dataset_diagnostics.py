@@ -18,26 +18,6 @@ from src.circuit_segmentation import segment_circuit
 from src.cost_function import TotalCost
 from src.qubit_interaction_graph import build_segment_graph_arrays
 
-def gamma_mode_compare(modes, dataset, total_cost_module, device, n_eval=200):
-    tech_names = getattr(total_cost_module, "tech_names", [f"tech{k}" for k in range(total_cost_module.K)])
-    print("\n[5] Gamma mode comparison (winner-tech hist on subset)")
-    orig = getattr(total_cost_module, "gamma_mode", None)
-
-    for mode in modes:
-        total_cost_module.stats_extractor.gamma_mode = mode
-        winners = np.zeros((total_cost_module.K,), dtype=np.int64)
-
-        n = min(n_eval, len(dataset))
-        for i in range(n):
-            segments, rep = dataset[i]
-            if len(segments) == 0:
-                continue
-            totals, *_ = compute_alltech_mats(total_cost_module, segments, rep, device=device)
-            winners[int(np.argmin(totals))] += 1
-
-        print(f"  mode={mode}: " + ", ".join([f"{tech_names[k]}={int(winners[k])}" for k in range(total_cost_module.K)]))
-
-    total_cost_module.gamma_mode = orig
 
 def softmax_np(x, axis=-1):
     x = np.asarray(x, dtype=np.float64)
@@ -281,6 +261,9 @@ def compute_debug_segment_features(total_cost_module, segments, rep, device):
     Uses uniform P just to trigger debug collection.
     Returns dict of arrays length T:
       n1q_sum, nm_sum, num_edges, twoq_ops
+
+    Note: gamma is now edge-wise (gamma_e [E_s, K]) and lives in stats["edges"],
+    not as a per-segment scalar, so it is not included here.
     """
     K = total_cost_module.K
     T = len(segments)
@@ -299,7 +282,6 @@ def compute_debug_segment_features(total_cost_module, segments, rep, device):
         "nm_sum": dbg["nm_sum"].detach().cpu().numpy(),
         "num_edges": dbg["num_edges"].detach().cpu().numpy(),
         "twoq_ops": dbg["twoq_ops"].detach().cpu().numpy(),
-        "gamma": dbg["gamma"].detach().cpu().numpy(),
     }
 
 @torch.no_grad()
@@ -440,10 +422,6 @@ def analyze_dataset( name, dataset, total_cost_module, device, alpha_entropy=1.0
     mix_best_commmove = []   # best sample per circuit
     mix_best_cutavg = []
 
-    gamma_all = []
-    twoq_all = []
-    edges_all = []
-    
     for idx in range(len(dataset)):
         segments, rep = dataset[idx]
         if len(segments) == 0:
@@ -562,10 +540,6 @@ def analyze_dataset( name, dataset, total_cost_module, device, alpha_entropy=1.0
             seg_feature_rows.append(X)
             seg_besttech_rows.append(seg_best.astype(np.int64))
             seg_oracletech_rows.append(np.array(tech_seq, dtype=np.int64))
-
-            gamma_all.extend(dbg["gamma"].astype(np.float64).tolist())
-            twoq_all.extend(dbg["twoq_ops"].astype(np.float64).tolist())
-            edges_all.extend(dbg["num_edges"].astype(np.float64).tolist())
 
         # ---- b.4 sensitivity: scale idle / comm and see winner flips (single-tech) ----
         # Compute per-tech component sums under all-tech schedules
@@ -737,20 +711,6 @@ def analyze_dataset( name, dataset, total_cost_module, device, alpha_entropy=1.0
     plot_hist(f"[4] Per-circuit BEST sampled (comm+move) ({name})", mix_best_commmove, bins=30, xlabel="best comm+move")
     plot_hist(f"[4] Per-circuit BEST sampled avg cut prob ({name})", mix_best_cutavg, bins=30, xlabel="cut prob")
 
-    plot_hist(f"[5] Gamma distribution across segments ({name})", gamma_all, bins=30, xlabel="gamma")
-
-    if len(gamma_all) > 10:
-        g = np.asarray(gamma_all)
-        t2 = np.asarray(twoq_all)
-        ne = np.asarray(edges_all)
-
-        corr_twoq = np.corrcoef(g, t2)[0, 1]
-        corr_edges = np.corrcoef(g, ne)[0, 1]
-        print(f"[5] Corr(gamma, twoq_ops) = {corr_twoq:+.3f}")
-        print(f"[5] Corr(gamma, num_edges) = {corr_edges:+.3f}")
-
-    gamma_mode_compare(["none", "edge_density", "twoq_per_layer"], dataset, total_cost_module, device, n_eval=200)
-
     return {
         "winners": winners,
         "gaps": gaps,
@@ -793,7 +753,6 @@ def print_means_table(split_name, tech_names, stats: dict):
         ("mixed_move", stats.get("mix_move", [])),
         ("mixed_comm_plus_move", stats.get("mix_commmove", [])),
         ("mixed_cut_avg", stats.get("mix_cutavg", [])),
-        ("gamma", stats.get("gamma_all", [])),
     ]
 
     for name, arr in keys:
@@ -923,6 +882,11 @@ def main():
                         help="(markov only) probability a qubit stays on same tech between segments.")
     parser.add_argument("--k_segtypes", type=int, default=4,
                         help="Number of segment-type clusters for composition analysis.")
+    parser.add_argument("--option_mix", type=str, default=None,
+                        help="Comma-separated op:weight pairs for ROI option mix, e.g. "
+                             "'op1:0.25,op2a:0.25,op2b:0.25,op3:0.25'. "
+                             "Overrides the scheduler config option field. "
+                             "Default: equal weights across all four options.")
     args = parser.parse_args()
 
     # 1) read args and get configs (like line ~78-83)
@@ -955,9 +919,42 @@ def main():
     segment_threshold = float(DATASET_CFG["segment_threshold"])
     segment_mode = str(DATASET_CFG["segmentation_mode"])
 
+    # --- Option mix for ROI circuits ---
+    # For diagnostics we always want to see all tiling options, not just the one
+    # hardcoded in the scheduler config.  Build an option_mix dict and inject it
+    # into the circuit source config's sampled_kwargs so the provider will sample
+    # per-circuit.  The CLI --option_mix flag lets you override this.
+    _DEFAULT_OPTION_MIX = {"op1": 0.25, "op2a": 0.25, "op2b": 0.25, "op3": 0.25}
+
+    if CIRCUIT_SOURCE_CFG.get("name") == "roi_composed":
+        if args.option_mix is not None:
+            # parse "op1:0.25,op2a:0.25,..." from CLI
+            try:
+                parsed_mix = {}
+                for token in args.option_mix.split(","):
+                    k, v = token.strip().split(":")
+                    parsed_mix[k.strip()] = float(v.strip())
+                inject_mix = parsed_mix
+            except Exception as e:
+                print(f"[WARNING] Could not parse --option_mix ({e}), using default equal mix.")
+                inject_mix = _DEFAULT_OPTION_MIX
+        else:
+            inject_mix = _DEFAULT_OPTION_MIX
+
+        # Inject into a copy of the config so we don't mutate the original
+        CIRCUIT_SOURCE_CFG = dict(CIRCUIT_SOURCE_CFG)
+        sampled_kwargs = dict(CIRCUIT_SOURCE_CFG.get("sampled_kwargs", {}))
+        sampled_kwargs["option_mix"] = inject_mix
+        CIRCUIT_SOURCE_CFG["sampled_kwargs"] = sampled_kwargs
+        # Remove the hardcoded 'option' key from kwargs if present so the
+        # per-sample option_mix takes effect instead
+        if "kwargs" in CIRCUIT_SOURCE_CFG and "option" in CIRCUIT_SOURCE_CFG["kwargs"]:
+            CIRCUIT_SOURCE_CFG["kwargs"] = dict(CIRCUIT_SOURCE_CFG["kwargs"])
+            del CIRCUIT_SOURCE_CFG["kwargs"]["option"]
+        print(f"[diagnostics] option_mix injected: {inject_mix}")
+
     train_provider = build_provider(CIRCUIT_SOURCE_CFG, seed_base=int(TRAIN_CFG["seed_base_train"]))
     test_provider  = build_provider(CIRCUIT_SOURCE_CFG, seed_base=int(TRAIN_CFG["seed_base_test"]))
-
     train_dataset = CircuitDataset(train_provider, n_samples=n_train, segment_mode=segment_mode, segment_threshold=segment_threshold)
     test_dataset  = CircuitDataset(test_provider,  n_samples=n_test,  segment_mode=segment_mode, segment_threshold=segment_threshold)
 
