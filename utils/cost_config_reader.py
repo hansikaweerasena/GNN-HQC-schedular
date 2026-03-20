@@ -29,7 +29,10 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["gate_names"].setdefault("measure", ["measure", "meas", "m"])
 
     cfg.setdefault("connectivity_proxy", {})
-    cfg["connectivity_proxy"].setdefault("mode", "none")
+    cfg["connectivity_proxy"].setdefault("gamma_max", 2.5)
+    cfg["connectivity_proxy"].setdefault("delta_community", 3)
+    cfg["connectivity_proxy"].setdefault("pair_reuse_threshold", 2)
+    cfg["connectivity_proxy"].setdefault("dense_lambda_decay", 0.85)
 
     return cfg
 
@@ -68,12 +71,14 @@ def _validate(cfg: Dict[str, Any]) -> None:
         if T2 <= 0.0:
             raise ValueError(f"techs[{i}].coherence.T2 must be > 0. Got {T2}.")
 
-        # Required: routing.rho
-        if "rho" not in routing:
-            raise ValueError(f"techs[{i}] missing required key routing.rho.")
-        rho = float(routing["rho"])
-        if rho < 0.0:
-            raise ValueError(f"techs[{i}].routing.rho must be >= 0. Got {rho}.")
+        # Required: routing.kappa (average connectivity; 0 or negative = all-to-all)
+        is_all_to_all = bool(routing.get("all_to_all", False))
+        if not is_all_to_all:
+            if "kappa" not in routing:
+                raise ValueError(f"techs[{i}] missing required key routing.kappa (or set routing.all_to_all=true).")
+            kappa = float(routing["kappa"])
+            if kappa < 0.0:
+                raise ValueError(f"techs[{i}].routing.kappa must be >= 0. Got {kappa}.")
 
         # Optional: gate_time.* if present must be nonnegative
         for tk in ["t1q", "t2q", "tm"]:
