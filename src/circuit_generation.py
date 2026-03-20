@@ -1048,10 +1048,40 @@ def generate_roi_composed_circuit(
             return w >= qft_min_w
         return True
 
+    # Precompute per-rect temporal phase biasing pools (closure over chosen_rois).
+    # 1Q and 2Q subsets of whatever this circuit's chosen_rois are.
+    _oneq_set = set(ROI_1Q_BUCKET)
+    _twoq_set = set(ROI_2Q_BUCKET) | set(ROI_SPECIAL)
+    _chosen_1q = [roi for roi in chosen_rois if roi in _oneq_set]
+    _chosen_2q = [roi for roi in chosen_rois if roi in _twoq_set]
+
     def _sample_roi_for_rect(r: Rect) -> str:
-        # Try a few times to respect eligibility; otherwise fall back to a safe ROI.
+        # Temporal phase bias: 2Q ROIs are preferred in the middle of the circuit,
+        # 1Q ROIs at the edges — modelling the realistic pattern of state-prep /
+        # rotation layers at circuit boundaries and entangling layers in the middle.
+        #
+        # twoq_bias = sin(π * t_phase)^0.5
+        #   t_phase=0.0 or 1.0 → twoq_bias=0.0  (edges → prefer 1Q)
+        #   t_phase=0.5        → twoq_bias=1.0  (midpoint → prefer 2Q)
+        #
+        # The bias only steers the bucket choice; eligibility filtering and the
+        # global twoq_frac ratio (set at circuit level by _sample_roi_subset) are
+        # still respected — this is purely a temporal placement preference.
+        t_phase = (r.t0 + r.t1) * 0.5 / float(num_layers)
+        twoq_bias = float(np.sin(np.pi * t_phase) ** 0.5)
+
         for _ in range(12):
-            cand = str(rng.choice(chosen_rois))
+            # Choose which bucket to sample from this attempt
+            if _chosen_1q and _chosen_2q:
+                pool = _chosen_2q if rng.rand() < twoq_bias else _chosen_1q
+            elif _chosen_2q:
+                pool = _chosen_2q
+            elif _chosen_1q:
+                pool = _chosen_1q
+            else:
+                pool = chosen_rois
+
+            cand = str(rng.choice(pool))
             if _roi_eligible_for_rect(cand, r):
                 return cand
 
@@ -1148,7 +1178,13 @@ def generate_roi_composed_circuit(
             qs = r.qubits()
             t_local = t - r.t0
             _fill_roi_layer(qc, r.roi, qs, t_local, (r.t1 - r.t0), rect_rngs[ridx], p2_default, dist_thr_long, rect_keys[ridx])
-            _sprinkle_block_noise(qc, qs, rect_rngs[ridx], noise_1q_prob, noise_2q_prob)
+            if r.roi != "idle":
+                # Always sprinkle noise on active ROIs
+                _sprinkle_block_noise(qc, qs, rect_rngs[ridx], noise_1q_prob, noise_2q_prob)
+            elif rng.rand() < 0.20:
+                # 20% chance of noise on idle rects — gives dataset both pure-idle
+                # and noisy-idle examples, which is realistic (T1/T2 decay, leakage)
+                _sprinkle_block_noise(qc, qs, rect_rngs[ridx], noise_1q_prob, noise_2q_prob)
 
         # Bridges
         if len(non_idle_active_rects) >= 2:
