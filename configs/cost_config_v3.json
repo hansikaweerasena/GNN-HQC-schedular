@@ -51,5 +51,10 @@
     "delta_community": 3,
     "pair_reuse_threshold": 2,
     "dense_lambda_decay": 0.85
+  },
+
+  "capacity_penalty": {
+    "beta": 4,
+    "safety_factor": 5.0
   }
 }

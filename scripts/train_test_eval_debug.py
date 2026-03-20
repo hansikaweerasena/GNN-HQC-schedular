@@ -15,7 +15,7 @@ from src.circuit_segmentation import segment_circuit
 from src.qubit_interaction_graph import build_segment_graph_arrays
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
-from src.cost_function import TotalCost
+from src.cost_function import TotalCost, CapacityPenalty
 from utils.train_utils import train_step
 from utils.cost_config_reader import load_cost_config
 from utils.print_utils import print_run_config
@@ -55,24 +55,28 @@ def collate_fn(batch):
     # Variable length segments, return as-is
     return batch
 
-def evaluate_model(model, cluster_module, cost_module, test_loader, device):
+def evaluate_model(model, cluster_module, cost_module, test_loader, device, capacity_penalty=None):
     model.eval()
     cluster_module.eval()
     total_loss = 0
+    total_cap_penalty = 0
     all_per_seg = []
     
     with torch.no_grad():
         for batch in test_loader:
             for segment_data_list, segments, rep in batch:
-                loss, per_seg = train_step(
+                loss, per_seg, cap_val = train_step(
                     model, cluster_module, cost_module, 
                     segment_data_list, segments, rep, 
-                    optimizer=None  # No optimization in eval
+                    optimizer=None,  # No optimization in eval
+                    capacity_penalty=capacity_penalty,
                 )
                 total_loss += loss
+                total_cap_penalty += cap_val
                 all_per_seg.append(per_seg.cpu().numpy())
     
-    return total_loss / len(test_loader.dataset), np.concatenate(all_per_seg)
+    n = len(test_loader.dataset)
+    return total_loss / n, total_cap_penalty / n, np.concatenate(all_per_seg)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -153,6 +157,10 @@ def main():
     ).to(device)
 
     total_cost_module = TotalCost(config).to(device)
+
+    cap_penalty_module = CapacityPenalty(total_cost_module, config).to(device)
+    print(f"Capacity penalty: lambda_cap={cap_penalty_module.lambda_cap.item():.6f}, "
+          f"caps={cap_penalty_module.cap.tolist()}, beta={cap_penalty_module.beta}")
     
     # Optimizer
     optimizer = torch.optim.Adam(
@@ -182,24 +190,30 @@ def main():
         cluster_module.train()
         
         epoch_train_loss = 0
+        epoch_cap_penalty = 0
         num_circuits = 0
         
         for batch in train_loader:
             batch_loss = 0
+            batch_cap = 0
             batch_count = 0
             
             for segment_data_list, segments, rep in batch:
-                loss, per_seg = train_step(
+                loss, per_seg, cap_val = train_step(
                     evol_model, cluster_module, total_cost_module,
-                    segment_data_list, segments, rep, optimizer
+                    segment_data_list, segments, rep, optimizer,
+                    capacity_penalty=cap_penalty_module,
                 )
                 batch_loss += loss
+                batch_cap += cap_val
                 batch_count += 1
             
             epoch_train_loss += batch_loss / batch_count
+            epoch_cap_penalty += batch_cap / batch_count
             num_circuits += batch_count
         
         avg_train_loss = epoch_train_loss / len(train_loader)
+        avg_cap_penalty = epoch_cap_penalty / len(train_loader)
         train_losses.append(avg_train_loss)
 
          # ---- Fixed-circuit debug ----
@@ -215,12 +229,19 @@ def main():
             cost_out = total_cost_module(P_seq, fixed_segments, fixed_rep)
             fixed_loss = cost_out["total_cost"].item()
 
+            # Capacity penalty on fixed circuit
+            cap_out = cap_penalty_module(P_seq)
+            fixed_cap = cap_out["penalty"].item()
+            fixed_excess = cap_out["per_layer_excess"]
+
             # pick qubit 0, first/middle/last segment
             P_start = P_seq[0][0]                  # [K]
             P_mid   = P_seq[len(P_seq)//2][0]      # [K]
             P_end   = P_seq[-1][0]                 # [K]
 
-        print(f"Epoch {epoch}: fixed_train_circuit_loss={fixed_loss:.4f}")
+        print(f"Epoch {epoch}: C_total={fixed_loss:.4f}, R_cap={fixed_cap:.6f}, "
+              f"L_train={fixed_loss + fixed_cap:.4f}, avg_cap_penalty={avg_cap_penalty:.6f}")
+        print(f"  layers_with_excess={int((fixed_excess > 0).sum())}/{len(fixed_excess)}")
         print("  P_start(q0, seg0) =", P_start.detach().cpu().numpy())
         print("  P_mid  (q0, segM) =", P_mid.detach().cpu().numpy())
         print("  P_end  (q0, segT) =", P_end.detach().cpu().numpy())
@@ -228,12 +249,14 @@ def main():
         
         # Test every 10 epochs
         if epoch % 10 == 0:
-            test_loss, test_per_seg = evaluate_model(
-                evol_model, cluster_module, total_cost_module, test_loader, device
+            test_loss, test_cap, test_per_seg = evaluate_model(
+                evol_model, cluster_module, total_cost_module, test_loader, device,
+                capacity_penalty=cap_penalty_module,
             )
             test_losses.append(test_loss)
             
-            print(f"Epoch {epoch:3d}: train={avg_train_loss:.4f}, test={test_loss:.4f}")
+            print(f"Epoch {epoch:3d}: train={avg_train_loss:.4f}, test={test_loss:.4f}, "
+                  f"test_R_cap={test_cap:.6f}")
             print(f"Test per_segment mean: {test_per_seg.mean():.4f}")
     
     torch.save(evol_model.state_dict(), "evol_model_final.pt")

@@ -655,6 +655,146 @@ class SegmentTimeV3(nn.Module):
         return out
 
 
+class CapacityPenalty(nn.Module):
+    """Structural feasibility regularizer for technology capacity constraints.
+
+    Not part of the physics-informed cost C_total; this is a training-loss
+    add-on that steers the optimizer toward capacity-feasible assignments.
+
+    R_cap(P_seq) = lambda_cap * sum_ell sum_k [ReLU(n_tilde_k(ell) - C_k)]^2
+
+    where n_tilde_k uses sharpened probabilities (power beta, renormalize)
+    to approximate the hard count from soft assignments.
+
+    lambda_cap is auto-derived from cost-model units at init:
+      lambda_cap = safety_factor * Delta_max
+    where Delta_max is the worst-case per-qubit benefit of staying on
+    the best technology (1Q + 2Q-vs-comm + idle + move gaps).
+    """
+
+    def __init__(self, cost_module: "TotalCost", config: Dict[str, Any], dtype=torch.float32):
+        """
+        Args:
+            cost_module: an initialized TotalCost instance whose registered
+                         buffers (c1q, c2q, ccomm, cmove, T2, delta) are used
+                         to derive lambda_cap. Single source of truth.
+            config:      the same config dict used to build TotalCost,
+                         from which we read per-tech capacity.max_qubits
+                         and capacity_penalty.{beta, safety_factor}.
+        """
+        super().__init__()
+
+        # --- Read capacity penalty config ---
+        cap_pen_cfg = config.get("capacity_penalty", {})
+        self.beta = float(cap_pen_cfg.get("beta", 4.0))
+        safety_factor = float(cap_pen_cfg.get("safety_factor", 5.0))
+
+        # --- Parse per-tech capacities from config ---
+        techs = config["techs"]
+        caps = []
+        for t in techs:
+            cap_cfg = t.get("capacity", {})
+            mq = cap_cfg.get("max_qubits", None)
+            if mq is None:
+                raise KeyError(
+                    f"Tech '{t.get('name', '?')}' missing capacity.max_qubits in config"
+                )
+            caps.append(float(mq))
+        self.register_buffer("cap", torch.tensor(caps, dtype=dtype))  # [K]
+
+        # --- Derive lambda_cap from cost-model units ---
+        gamma_max = float(config.get("connectivity_proxy", {}).get("gamma_max", 2.5))
+
+        lambda_cap = self._derive_lambda_cap(cost_module, gamma_max, safety_factor)
+        self.register_buffer("lambda_cap", torch.tensor(lambda_cap, dtype=dtype))
+
+    @staticmethod
+    def _derive_lambda_cap(
+        cost_module: "TotalCost",
+        gamma_max: float,
+        safety_factor: float,
+    ) -> float:
+        """Compute lambda_cap = safety_factor * Delta_max from cost buffers.
+
+        Delta_max = Delta_1q + Delta_2q + Delta_idle + Delta_move
+        where each component is the worst-case per-qubit per-layer benefit
+        of being on the best technology versus any alternative.
+        """
+        c1q = cost_module.c1q   # [K]
+        c2q = cost_module.c2q   # [K]
+        T2 = cost_module.T2     # [K]
+        delta = cost_module.delta  # scalar
+        ccomm = cost_module.ccomm  # scalar
+        cmove = cost_module.cmove  # scalar
+
+        # 1Q fidelity gap
+        delta_1q = (c1q.max() - c1q.min()).item()
+
+        # 2Q: benefit of local (worst-case inflated) vs remote
+        worst_local = (1.0 + gamma_max) * c2q.min().item()
+        delta_2q = max(0.0, ccomm.item() - worst_local)
+
+        # Idle: decoherence gap across techs for one layer
+        inv_T2 = 1.0 / T2  # [K]
+        delta_idle = (delta * (inv_T2.max() - inv_T2.min())).item()
+
+        # Move: avoided technology change
+        delta_move = cmove.item()
+
+        delta_max = delta_1q + delta_2q + delta_idle + delta_move
+        lam = safety_factor * delta_max
+
+        return lam
+
+    def forward(
+        self,
+        P_seq: List[torch.Tensor],   # list of [N, K]
+    ) -> Dict[str, torch.Tensor]:
+        """Compute capacity penalty over all layers.
+
+        Returns:
+            dict with:
+              "penalty":          scalar, the total R_cap to add to training loss
+              "per_layer_excess": [L] tensor, sum of excess across techs per layer
+              "lambda_cap":       scalar, for logging
+        """
+        device = P_seq[0].device
+        dtype = P_seq[0].dtype
+        L = len(P_seq)
+        beta = self.beta
+
+        cap = self.cap.to(device=device, dtype=dtype)         # [K]
+        lam = self.lambda_cap.to(device=device, dtype=dtype)  # scalar
+
+        penalty = torch.tensor(0.0, device=device, dtype=dtype)
+        per_layer_excess = torch.zeros((L,), device=device, dtype=dtype)
+
+        for ell in range(L):
+            P_ell = P_seq[ell]  # [N, K]
+
+            # Sharpen: w^beta / sum_k'(w^beta)
+            P_sharp = P_ell.pow(beta)
+            P_sharp = P_sharp / P_sharp.sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+            # Sharpened occupancy count per tech
+            n_tilde = P_sharp.sum(dim=0)  # [K]
+
+            # Squared ReLU penalty
+            excess = torch.relu(n_tilde - cap)  # [K]
+            layer_penalty = (excess ** 2).sum()
+
+            penalty = penalty + layer_penalty
+            per_layer_excess[ell] = excess.sum().detach()
+
+        penalty = lam * penalty
+
+        return {
+            "penalty": penalty,
+            "per_layer_excess": per_layer_excess,
+            "lambda_cap": lam.detach(),
+        }
+
+
 def _require(d: Dict[str, Any], path: str):
     """Fetch nested key path like 'gate_fidelity.f1q' and throw a clear error if missing."""
     cur = d
