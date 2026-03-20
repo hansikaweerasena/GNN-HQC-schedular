@@ -37,7 +37,7 @@ class EvalConfig:
     circuit_sources_path: str = "utils/circuit_sources.py"
     scheduler_config_path: str = "configs/scheduler_config.py"
     outdir: str = "phase2C_generated_vs_routing_out"
-    kappa: float = 3.3
+    kappa: float = 2.3
     dense_lambda_decay: float = 0.3
     dense_eps: float = 1e-12
     @property
@@ -49,14 +49,14 @@ class EvalConfig:
     def nl_window_radius(self): return 2 * int(math.ceil(self.kappa))
     @property
     def pair_reuse_radius(self): return self.nl_window_radius
-    gamma_max: float = 2.5
+    gamma_max: float = 4
     num_circuits: int = 1000
     seed_base: int = 42
     num_qubits_override: Optional[int] = None
     num_layers_override: Optional[int] = None
     sabre_seed: int = 7
     sabre_trials: int = 5
-    topology: str = "grid"
+    topology: str = "heavy_hex"
 
 def build_heavy_hex(min_qubits: int = 27):
     """
@@ -256,7 +256,7 @@ def route_sabre(qc, topo_g, cfg):
     od, oo = qiskit_twoq_depth(qc), count_twoq_ops(qc)
     sc, dc, oc = [], [], []
     for t in range(cfg.sabre_trials):
-        tqc = qk["transpile"](qc, coupling_map=cmap, basis_gates=["cx","cz","swap","h","x","y","z","s","t","cp","measure"], routing_method="sabre", layout_method="sabre", optimization_level=0, seed_transpiler=cfg.sabre_seed+t)
+        tqc = qk["transpile"](qc, coupling_map=cmap, basis_gates=["cx","cz","swap","h","x","y","z","s","t","cp","measure","rx","ry","rz"], routing_method="sabre", layout_method="sabre", optimization_level=0, seed_transpiler=cfg.sabre_seed+t)
         sc.append(int(tqc.count_ops().get("swap",0))); dc.append(qiskit_twoq_depth(tqc)); oc.append(count_twoq_ops(tqc))
     return {"swap_count":int(np.median(sc)),"added_twoq_depth":int(np.median(dc))-od,"added_twoq_ops":int(np.median(oc))-oo}
 
