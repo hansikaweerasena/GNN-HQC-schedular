@@ -54,8 +54,8 @@ CIRCUIT_SOURCE_CFG = {
     # These kwargs are passed directly into generate_roi_composed_circuit(...)
     "kwargs": {
         # Core size
-        # "num_qubits": 30,
-        "num_qubits": 20,
+        # "num_qubits": 20,
+        "num_qubits": 30,
         "num_layers": 80,
 
         # Fallback option if no mix is enabled
@@ -67,12 +67,12 @@ CIRCUIT_SOURCE_CFG = {
 
         # Defaults / targets
         "twoq_to_oneq_ratio": 0.4,
-        "idle_density": 0.20,  # fraction of total (num_qubits * num_layers) canvas
+        "idle_density": [0.15, 0.40],  # fraction of total (num_qubits * num_layers) canvas (VQE, QFT have 10- 15 and general its 35 -50%)
 
         # Bridge probabilities are sampled INSIDE the generator per circuit
         # from these ranges
-        "p_bridge_boundary": (0.15, 0.25),
-        "p_bridge_interior": (0.05, 0.10),
+        "p_bridge_boundary": [0.10, 0.25],
+        "p_bridge_interior": [0.01, 0.05],
 
         # Block-local noise (softly breaks layer guarantees)
         "noise_1q_prob": 0.05,
@@ -82,33 +82,33 @@ CIRCUIT_SOURCE_CFG = {
         "measure_frac": 0.0,
 
         # Rectangle bounds - 30
-        # "min_block_w": 2,
-        # "max_block_w": 15,
-        # "min_block_h": 2,
-        # "max_block_h": 10,
-
-        # Rectangle bounds - 20
         "min_block_w": 2,
         "max_block_w": 15,
         "min_block_h": 2,
-        "max_block_h": 8,
+        "max_block_h": 10,
+
+        # Rectangle bounds - 20
+        # "min_block_w": 2,
+        # "max_block_w": 15,
+        # "min_block_h": 2,
+        # "max_block_h": 8,
 
         # Long/tall blocks (spatial/temporal modularity proxies)- 30
-        # "n_long": (2, 5),
-        # "long_w_min": 12,
-        # "long_w_max": 18,
-        # "n_tall": (1, 3),
-        # "tall_h_min": 6,
-        # "tall_h_max": 10,
-
-
-        # Long/tall blocks (spatial/temporal modularity proxies)- 20
         "n_long": (2, 5),
         "long_w_min": 12,
         "long_w_max": 18,
         "n_tall": (1, 3),
         "tall_h_min": 6,
         "tall_h_max": 10,
+
+
+        # Long/tall blocks (spatial/temporal modularity proxies)- 20
+        # "n_long": (2, 5),
+        # "long_w_min": 12,
+        # "long_w_max": 18,
+        # "n_tall": (1, 3),
+        # "tall_h_min": 6,
+        # "tall_h_max": 10,
 
         "use_barriers": False,
     },
