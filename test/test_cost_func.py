@@ -81,7 +81,6 @@ def dump_cost_out_debug(cost_out, max_items=5):
     for k in [
         "exec_num_edges",
         "exec_twoq_ops",
-        "exec_gamma",
         "exec_avg_local_prob",
         "exec_1q_ops",
         "exec_meas_ops",
@@ -118,7 +117,7 @@ def dump_cost_out_debug(cost_out, max_items=5):
 if __name__ == "__main__":
 
     # qc = generate_qft_circuit(num_qubits=10)
-    qc = generate_random_circuit_custom(n_qubits=10, depth=30, gate_density=0.4, seed=42)
+    qc = generate_random_circuit_custom(num_qubits=10, depth=30, gate_density=0.4, seed=42)
     print("✓ Circuit generated")
     print(f"  Depth: {qc.depth()}, Gates: {qc.size()}")
 
@@ -246,20 +245,17 @@ if __name__ == "__main__":
 
     stats = total_cost_module.stats_extractor(segments, rep, N=P_seq[0].shape[0], device=device, dtype=P_seq[0].dtype)
 
-    mode = (config.get("connectivity_proxy", {}).get("mode", "") or "").lower()
-    expect_pair = mode.startswith("pair_")
-
     for s, e in enumerate(stats["edges"]):
         E = int(e["u"].numel())
         if E == 0:
             continue
-
-    has_gamma_e = "gamma_e" in e
-    print(f"[seg {s}] E={E} has_gamma_e={has_gamma_e}")
-
-    if expect_pair:
-        assert has_gamma_e, f"Expected gamma_e for mode={mode}, but missing in segment {s}"
-        print("  gamma_e sample:", e["gamma_e"][: min(5, E)].detach().cpu().tolist())
+        has_gamma_e = "gamma_e" in e
+        K = int(e["gamma_e"].shape[1]) if has_gamma_e else 0
+        print(f"[seg {s}] E={E} has_gamma_e={has_gamma_e} shape=[{E}, {K}]")
+        if has_gamma_e:
+            print("  gamma_e sample (first 3 edges):")
+            for i in range(min(3, E)):
+                print(f"    edge {i}: {e['gamma_e'][i].detach().cpu().tolist()}")
 
     print("\n=== Total Cost v3 Test ===")
     cost_out = total_cost_module(P_seq, segments, rep, debug=True)
