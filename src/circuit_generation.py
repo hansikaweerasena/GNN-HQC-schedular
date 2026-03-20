@@ -253,32 +253,117 @@ def _segments_to_bounds(sizes: List[int]) -> List[Tuple[int, int]]:
     return out
 
 
-# ROI library (non-idle). A circuit samples a subset of these (n_rois).
-ROI_LIBRARY: Tuple[str, ...] = (
-    # 1Q-dominant / temporal-profile ROIs
-    "1q_dense",
-    "streaming",
-    "mixed_sparse"
-
-    # 2Q ROIs (distinct corners of density/range/topology space)
-    # NOTE: "2q_dense_short" has been redefined to mean *short-range but not dense*
-    # (dense+short patterns are covered by brickwork_entangler and swap_network).
-    "2q_dense_short",
-    "2q_sparse_long",
-    "2q_dense_long",
-
-    # Structured dense/local patterns
-    "brickwork_entangler",
-    "swap_network",
-
-    # New structured motifs
-    "star_entangler",     # GHZ / hub-and-spoke
-    "nn_ladder",          # nearest-neighbor ladder (moving rung)
-    "ripple_carry",       # ripple-like chain propagation (long rectangles)
-    "enc_dec",            # encode/decode motif (long rectangles)
-    "qft_like",           # QFT-like long-range structured interactions (long rectangles)
-    "bridge_burst",       # triggers extra cross-ROI bridges for a few layers
+# ROI library split into buckets for balanced sampling.
+#
+# Bucket structure:
+#   ROI_1Q_BUCKET   : 1Q-dominant motifs (single-qubit heavy)
+#   ROI_2Q_BUCKET   : 2Q-dominant motifs (two-qubit heavy, local or long-range)
+#   ROI_SPECIAL     : rare / structural motifs sampled with a separate low probability
+#
+# The full library is the union of all three, preserved for legacy reference.
+ROI_1Q_BUCKET: Tuple[str, ...] = (
+    "1q_dense",             # 80% per-qubit 1Q gate density, rare 2Q sprinkle
+    "1q_sparse",            # 30-40% per-qubit 1Q density, zero 2Q — low-activity phase
+    "streaming",            # gradual qubit activation, 1Q-only (state prep model)
+    "mixed_sparse",         # sparse, balanced 1Q/2Q — sits at the 1Q/2Q boundary
+    "parametric_rotation",  # every qubit gets an Rx/Ry/Rz each layer, zero 2Q
+                            # models VQE/QAOA rotation layers
 )
+
+ROI_2Q_BUCKET: Tuple[str, ...] = (
+    # Density/range corners
+    "2q_dense_short",       # short-range, moderate density
+    "2q_sparse_long",       # long-range, sparse
+    "2q_dense_long",        # long-range, dense (cross-half matching)
+    # Structured local patterns
+    "brickwork_entangler",  # alternating-offset nearest-neighbour pairs
+    "swap_network",         # dense SWAP chain
+    # Structured motifs
+    "star_entangler",       # GHZ / hub-and-spoke (parallel fan)
+    "nn_ladder",            # moving nearest-neighbour rung
+    "ripple_carry",         # chain propagation (long rectangles)
+    "enc_dec",              # encode/decode bookend (long rectangles)
+    "qft_like",             # QFT-like long-range structured interactions
+    "ghz_chain",            # sequential GHZ: CNOT(0,1), CNOT(1,2), ... one step/layer
+    "trotter_zz",           # Trotterized ZZ Hamiltonian: fixed qubit pairs repeat each layer
+)
+
+ROI_SPECIAL: Tuple[str, ...] = (
+    "bridge_burst",   # burst of extra cross-ROI bridges; kept rare
+)
+
+# Full library union (for legacy / debug use)
+ROI_LIBRARY: Tuple[str, ...] = ROI_1Q_BUCKET + ROI_2Q_BUCKET + ROI_SPECIAL
+
+
+def _sample_roi_subset(
+    n_rois: int,
+    rng: np.random.RandomState,
+    p_special: float = 0.05,
+    twoq_frac_lo: float = 0.30,
+    twoq_frac_hi: float = 0.80,
+) -> List[str]:
+    """Sample a balanced subset of ROI types for one circuit.
+
+    Algorithm
+    ---------
+    1. Special slot: with probability ``p_special`` reserve one slot for a
+       randomly chosen ROI from ROI_SPECIAL (e.g. bridge_burst).  This keeps
+       burst-communication motifs rare but present in the dataset.
+    2. Remaining slots are split between 2Q-heavy and 1Q-heavy buckets using a
+       ratio r ~ Uniform[twoq_frac_lo, twoq_frac_hi].  This guarantees a floor
+       on 1Q representation regardless of total n_rois, unlike the old uniform
+       draw which could easily produce all-2Q subsets.
+    3. Within each bucket, sampling is without replacement (clamped to bucket
+       size if necessary).
+
+    The result is a list of ``n_rois`` unique ROI names.
+    """
+    n_rois = int(max(1, n_rois))
+    chosen: List[str] = []
+
+    # Step 1: optional special slot
+    remaining = n_rois
+    if remaining > 0 and len(ROI_SPECIAL) > 0 and rng.rand() < p_special:
+        special_roi = str(rng.choice(list(ROI_SPECIAL)))
+        chosen.append(special_roi)
+        remaining -= 1
+
+    if remaining == 0:
+        return chosen
+
+    # Step 2: split remaining between 2Q and 1Q buckets
+    r1 = float(rng.uniform(twoq_frac_lo, twoq_frac_hi))
+    n_2q = int(round(remaining * r1))
+    n_1q = remaining - n_2q
+
+    # Clamp to bucket sizes and redistribute overflow
+    n_2q = min(n_2q, len(ROI_2Q_BUCKET))
+    n_1q = min(n_1q, len(ROI_1Q_BUCKET))
+
+    # If clamping created a shortfall, fill from the other bucket
+    shortfall = remaining - (n_2q + n_1q)
+    if shortfall > 0:
+        extra_2q = min(shortfall, len(ROI_2Q_BUCKET) - n_2q)
+        n_2q += extra_2q
+        shortfall -= extra_2q
+    if shortfall > 0:
+        extra_1q = min(shortfall, len(ROI_1Q_BUCKET) - n_1q)
+        n_1q += extra_1q
+
+    # Step 3: sample without replacement from each bucket
+    if n_2q > 0:
+        pool_2q = [r for r in ROI_2Q_BUCKET if r not in chosen]
+        drawn = list(rng.choice(pool_2q, size=min(n_2q, len(pool_2q)), replace=False))
+        chosen.extend(drawn)
+
+    if n_1q > 0:
+        pool_1q = [r for r in ROI_1Q_BUCKET if r not in chosen]
+        drawn = list(rng.choice(pool_1q, size=min(n_1q, len(pool_1q)), replace=False))
+        chosen.extend(drawn)
+
+    rng.shuffle(chosen)
+    return chosen
 
 
 def _fill_roi_layer(
@@ -457,7 +542,8 @@ def _fill_roi_layer(
         return
 
     # ----------------------------
-    # Streaming (gradually activates more qubits over time)
+    # Streaming (gradually activates more qubits over time — state prep model)
+    # 1Q-dominant: 2Q gates are intentionally rare (5% fixed, independent of p2_default)
     # ----------------------------
     if roi == "streaming":
         max_active = min(n, 1 + t_local // 2)
@@ -468,7 +554,8 @@ def _fill_roi_layer(
         for q in active:
             if rng.rand() < 0.85:
                 apply_random_1q_gate(qc, q, rng)
-        if len(active) >= 2 and rng.rand() < 0.6 * p2_default:
+        # Very occasional 2Q — fixed low probability, NOT scaled by p2_default
+        if len(active) >= 2 and rng.rand() < 0.05:
             q1, q2 = rng.choice(active, size=2, replace=False)
             apply_random_2q_gate(qc, int(q1), int(q2), rng)
         return
@@ -578,6 +665,80 @@ def _fill_roi_layer(
         return
 
     # ----------------------------
+    # Parametric rotation layer (VQE / QAOA ansatz rotation step)
+    # Every qubit gets exactly one Rx/Ry/Rz per layer. No 2Q gates.
+    # Models the single-qubit rotation layers that dominate VQE circuits.
+    # ----------------------------
+    if roi == "parametric_rotation":
+        ROTATION_GATES = ("rx", "ry", "rz")
+        for q in qubits:
+            gate = ROTATION_GATES[int(rng.randint(len(ROTATION_GATES)))]
+            angle = float(rng.uniform(0, 2 * np.pi))
+            if gate == "rx":
+                qc.rx(angle, q)
+            elif gate == "ry":
+                qc.ry(angle, q)
+            else:
+                qc.rz(angle, q)
+        return
+
+    # ----------------------------
+    # Sparse 1Q (low-activity idle-like phase)
+    # 30-40% per-qubit probability, no 2Q gates.
+    # Models ancilla layers, reset windows, or low-activity classical feedback phases.
+    # ----------------------------
+    if roi == "1q_sparse":
+        for q in qubits:
+            if rng.rand() < float(rng.uniform(0.30, 0.40)):
+                apply_random_1q_gate(qc, q, rng)
+        return
+
+    # ----------------------------
+    # GHZ chain (sequential entanglement propagation)
+    # Each layer applies one CNOT step along the chain: CNOT(i, i+1) where i
+    # advances with t_local. Models sequential GHZ state preparation or
+    # linear entanglement propagation (distinct from star_entangler fan-out).
+    # ----------------------------
+    if roi == "ghz_chain":
+        if n < 2:
+            return
+        # Step through the chain: layer 0 applies CNOT(0,1), layer 1 CNOT(1,2), etc.
+        # After reaching the end, restart from 0 (allows long rectangles to cycle).
+        i = int(t_local % (n - 1))
+        qc.cx(qubits[i], qubits[i + 1])
+        # Hadamard on the control at the first step to seed superposition
+        if t_local == 0:
+            qc.h(qubits[0])
+        return
+
+    # ----------------------------
+    # Trotter ZZ (Trotterized Hamiltonian simulation)
+    # Fixed qubit pairs determined by rect_key interact with ZZ (Rzz) gates each layer.
+    # The same pairs repeat across layers, matching the structure of Trotterized
+    # simulation where the Hamiltonian graph is fixed. Even layers apply one set of
+    # pairs, odd layers apply the complementary set (checkerboard Trotter step).
+    # ----------------------------
+    if roi == "trotter_zz":
+        if n < 2:
+            return
+        # Build a fixed pairing from rect_key: even/odd offset alternates each layer
+        # to approximate a 2-coloring Trotter decomposition.
+        offset = (t_local + int(rect_key % 2)) % 2
+        pairs_applied = 0
+        for i in range(offset, n - 1, 2):
+            a, b = qubits[i], qubits[i + 1]
+            angle = float(np.pi / 4)  # canonical Trotter step angle
+            # Rzz(θ) = exp(-i θ/2 ZZ): decomposed as CNOT - Rz - CNOT
+            qc.cx(int(a), int(b))
+            qc.rz(angle, int(b))
+            qc.cx(int(a), int(b))
+            pairs_applied += 1
+            if pairs_applied >= max(1, n // 4):
+                # Keep density moderate — not every pair every layer
+                break
+        return
+
+    # ----------------------------
     # Bridge-burst ROI: handled at generator-level (adds extra inter-ROI bridges)
     # Still add a bit of local structure here so it's not empty.
     # ----------------------------
@@ -650,7 +811,7 @@ def generate_roi_composed_circuit(
     option: str = "op2a",
     n_rois: int = 3,
     twoq_to_oneq_ratio: float = 0.6,
-    idle_density: float = 0.2,
+    idle_density: Union[float, Range] = (0.20, 0.35),
     p_bridge_boundary: Union[float, Range] = (0.10, 0.20),
     p_bridge_interior: Union[float, Range] = (0.01, 0.05),
     noise_1q_prob: float = 0.02,
@@ -715,22 +876,15 @@ def generate_roi_composed_circuit(
 
     p_bdry = _as_float(p_bridge_boundary, rng)
     p_int = _as_float(p_bridge_interior, rng)
+    idle_density_f = _as_float(idle_density, rng)
 
     p2_default = _ratio_to_p2(twoq_to_oneq_ratio)
 
-    # Choose per-circuit ROI subset (excluding idle).
+    # Choose per-circuit ROI subset using bucketed balanced sampling.
+    # bridge_burst is kept rare (p_special=0.10); 1Q ROIs always get a
+    # proportional floor (30–60% of slots) via the twoq_frac split.
     n_rois = int(max(1, min(len(ROI_LIBRARY), n_rois)))
-    chosen_rois = list(rng.choice(list(ROI_LIBRARY), size=n_rois, replace=False))
-    oneq_pool = ["1q_dense", "streaming", "mixed_sparse"]
-    oneq_pool = [r for r in oneq_pool if r in ROI_LIBRARY]
-
-    if n_rois > 1 and oneq_pool and not any(r in oneq_pool for r in chosen_rois):
-        # choose a 1Q ROI not already present
-        available_oneq = [r for r in oneq_pool if r not in chosen_rois]
-        if available_oneq:
-            new_oneq = str(rng.choice(available_oneq))
-            replace_idx = int(rng.randint(len(chosen_rois)))
-            chosen_rois[replace_idx] = new_oneq
+    chosen_rois = _sample_roi_subset(n_rois, rng)
     if debug:
         print(f"\n[ROI-GEN DEBUG] chosen_rois={chosen_rois} (p2_default={p2_default:.3f})")
 
@@ -744,7 +898,7 @@ def generate_roi_composed_circuit(
         print(f"seed={seed}")
         print(f"n_rois={n_rois} chosen_rois={chosen_rois}")
         print(f"twoq_to_oneq_ratio={twoq_to_oneq_ratio} -> p2_default={p2_default:.3f}")
-        print(f"idle_density={idle_density} idle_target={idle_density*num_qubits*num_layers:.1f}")
+        print(f"idle_density={idle_density} -> resolved={idle_density_f:.3f} idle_target={idle_density_f*num_qubits*num_layers:.1f}")
         print(f"p_bridge_boundary={p_bdry:.4f} p_bridge_interior={p_int:.4f}")
         print(f"noise_1q_prob={noise_1q_prob} noise_2q_prob={noise_2q_prob}")
         print(f"n_long_i={n_long_i} (long_w_min={long_w_min}, long_w_max={long_w_max})")
@@ -848,7 +1002,7 @@ def generate_roi_composed_circuit(
 
     # Step 3: idle-first assignment until budget reached (overshoot allowed).
     total_volume = float(num_qubits * num_layers)
-    idle_target = float(idle_density) * total_volume
+    idle_target = float(idle_density_f) * total_volume
     idle_target = max(0.0, idle_target)
 
     order = list(range(len(rects)))
@@ -865,15 +1019,16 @@ def generate_roi_composed_circuit(
     non_idle_idxs = [i for i in range(len(rects)) if not is_idle[i]]
 
     # --- Force-assign some eligible rectangles to 2q_sparse_long (if present in chosen_rois) ---
+    # Only fires 50% of the time so the dataset has variety in how tall rects are used.
     forced_sparse = set()
-    if "2q_sparse_long" in chosen_rois and len(non_idle_idxs) > 0:
+    if "2q_sparse_long" in chosen_rois and len(non_idle_idxs) > 0 and rng.rand() < 0.5:
         eligible = [
             i for i in non_idle_idxs
             if (rects[i].q1 - rects[i].q0) >= int(dist_thr_long) + 1
         ]
         rng.shuffle(eligible)
 
-        # As requested: assign to floor(blocks/rois), where blocks ≈ non-idle rectangles.
+        # Assign to floor(blocks/rois), where blocks ≈ non-idle rectangles.
         n_force = int(len(non_idle_idxs) // max(1, len(chosen_rois)))
         if n_force > 0 and len(eligible) > 0:
             forced_sparse = set(eligible[: min(n_force, len(eligible))])
@@ -900,8 +1055,11 @@ def generate_roi_composed_circuit(
             if _roi_eligible_for_rect(cand, r):
                 return cand
 
-        # Fallback preference order
-        for pref in ("brickwork_entangler", "swap_network", "2q_dense_short", "1q_dense", "streaming"):
+        # Fallback preference: 1Q-safe ROIs first, then 2Q structured ones.
+        # This matters when many chosen_rois are long-rect-only (ripple_carry etc.)
+        # and the current rect is too short/narrow to host them.
+        for pref in ("1q_dense", "1q_sparse", "parametric_rotation", "streaming",
+                     "mixed_sparse", "brickwork_entangler", "swap_network", "2q_dense_short"):
             if pref in chosen_rois:
                 return pref
         return str(chosen_rois[0])
@@ -945,7 +1103,7 @@ def generate_roi_composed_circuit(
         print("ROI counts:", dict(roi_counts))
         print("ROI area (volume):", dict(roi_area))
         print(f"idle_volume={roi_area.get('idle', 0)}  "
-            f"target={idle_density*num_qubits*num_layers:.1f}")
+            f"target={idle_density_f*num_qubits*num_layers:.1f}")
 
         # Flag the problematic case explicitly
         non_idle_area = sum(v for k, v in roi_area.items() if k != "idle")
