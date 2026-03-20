@@ -1055,20 +1055,23 @@ def generate_roi_composed_circuit(
     _chosen_1q = [roi for roi in chosen_rois if roi in _oneq_set]
     _chosen_2q = [roi for roi in chosen_rois if roi in _twoq_set]
 
+    # Decide once per circuit whether temporal phase bias is active.
+    # 70% of circuits get phase structure (1Q edges, 2Q middle, 1Q edges);
+    # 30% get flat uniform bucket sampling — no assumed phase structure.
+    _use_temporal_bias = (rng.rand() < 0.70)
+
     def _sample_roi_for_rect(r: Rect) -> str:
-        # Temporal phase bias: 2Q ROIs are preferred in the middle of the circuit,
-        # 1Q ROIs at the edges — modelling the realistic pattern of state-prep /
-        # rotation layers at circuit boundaries and entangling layers in the middle.
-        #
+        # Temporal phase bias: when active, 2Q ROIs are preferred in the middle
+        # of the circuit and 1Q ROIs at the edges.
         # twoq_bias = sin(π * t_phase)^0.5
         #   t_phase=0.0 or 1.0 → twoq_bias=0.0  (edges → prefer 1Q)
         #   t_phase=0.5        → twoq_bias=1.0  (midpoint → prefer 2Q)
-        #
-        # The bias only steers the bucket choice; eligibility filtering and the
-        # global twoq_frac ratio (set at circuit level by _sample_roi_subset) are
-        # still respected — this is purely a temporal placement preference.
-        t_phase = (r.t0 + r.t1) * 0.5 / float(num_layers)
-        twoq_bias = float(np.sin(np.pi * t_phase) ** 0.5)
+        # When inactive: twoq_bias=0.5 (equal chance of either bucket)
+        if _use_temporal_bias:
+            t_phase = (r.t0 + r.t1) * 0.5 / float(num_layers)
+            twoq_bias = float(np.sin(np.pi * t_phase) ** 0.5)
+        else:
+            twoq_bias = 0.5
 
         for _ in range(12):
             # Choose which bucket to sample from this attempt
