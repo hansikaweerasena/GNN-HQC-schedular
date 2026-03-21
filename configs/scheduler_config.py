@@ -15,7 +15,7 @@ MODEL_CFG = {
 
     # MLP node encoder
     "mlp_hidden_dim": 32,
-    "mlp_out_dim":    32,
+    "mlp_out_dim":    64,
 
     # GATv2 spatial encoder
     "gnn_out_dim":    64,

@@ -87,7 +87,7 @@ class EvolvingGNN(nn.Module):
     Args:
         node_feat_dim:  raw node feature dimension (default 16)
         mlp_hidden_dim: hidden width of the MLP node encoder (default 32)
-        mlp_out_dim:    output dim of MLP = input dim to GATv2 (default 32)
+        mlp_out_dim:    output dim of MLP = input dim to GATv2 (default 64, must equal gnn_out_dim)
         gnn_out_dim:    GATv2 output dim = GRU input dim (default 64)
         gru_hidden_dim: GRU hidden state dim = clustering head input dim (default 64)
         edge_feat_dim:  edge feature dimension (default 5)
@@ -129,6 +129,11 @@ class EvolvingGNN(nn.Module):
         self.rnn_hidden_dim = gru_hidden_dim  # public alias for ClusteringHead
         self.bptt_steps    = bptt_steps
 
+        assert mlp_out_dim == gnn_out_dim, (
+            f"mlp_out_dim ({mlp_out_dim}) must equal gnn_out_dim ({gnn_out_dim}) "
+            f"for the residual connection (GAT output + MLP output) to work."
+        )
+
         # Stage 1: MLP node encoder
         self.mlp = MLPNodeEncoder(
             in_dim=node_feat_dim,
@@ -138,22 +143,19 @@ class EvolvingGNN(nn.Module):
         )
 
         # Stage 2: GATv2 spatial encoder
-        # add_self_loops=False because edge features are circuit-derived;
-        # self-loop edge features would be undefined.
+        # add_self_loops=False: self-loops are not meaningful here because
+        # self-loop edge features would be zero (no circuit-derived meaning).
+        # Isolated nodes are handled cleanly by the residual connection in forward().
         self.gat = GATv2Conv(
             in_channels=mlp_out_dim,
             out_channels=gnn_out_dim,
             heads=heads,
-            concat=False,        # average heads -> output stays at gnn_out_dim
+            concat=False,
             edge_dim=edge_feat_dim,
             add_self_loops=False,
         )
         self.gat_norm    = nn.LayerNorm(gnn_out_dim)
         self.gat_dropout = nn.Dropout(p=dropout)
-
-        # Fallback linear projection used when a layer has no backbone edges.
-        # Keeps node embeddings informative rather than zero-filling.
-        self.gnn_fallback = nn.Linear(mlp_out_dim, gnn_out_dim)
 
         # Stage 3: GRU temporal encoder
         self.gru_cell = nn.GRUCell(
@@ -216,17 +218,14 @@ class EvolvingGNN(nn.Module):
             # Stage 1: MLP
             e = self.mlp(x)  # [N, mlp_out_dim]
 
-            # Stage 2: GATv2 (or linear fallback for empty graphs)
-            if edge_index.size(1) == 0:
-                # No backbone edges for this layer — use linear fallback so
-                # the embedding is still a function of the node's own features.
-                z = self.gnn_fallback(e)              # [N, gnn_out_dim]
-                z = self.gat_norm(z)
-                # No dropout on fallback path (no aggregation occurred)
-            else:
-                z = self.gat(e, edge_index, edge_attr)  # [N, gnn_out_dim]
-                z = self.gat_norm(z)
-                z = self.gat_dropout(z)
+            # Stage 2: GATv2 with residual connection
+            # Residual: z = GAT(e) + e
+            #   - Connected nodes: z = neighborhood_context + own_features
+            #   - Isolated nodes:  GAT output = 0, so z = 0 + e = e (own features preserved)
+            # Requires mlp_out_dim == gnn_out_dim (both 64).
+            z = self.gat(e, edge_index, edge_attr) + e  # [N, gnn_out_dim]
+            z = self.gat_norm(z)
+            z = self.gat_dropout(z)
 
             z_seq.append(z)
 
