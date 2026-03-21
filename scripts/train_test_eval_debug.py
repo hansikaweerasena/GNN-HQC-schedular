@@ -102,11 +102,15 @@ class CircuitDataset(Dataset):
         self.w_short            = w_short
         self.w_long             = w_long
         self.device             = device or torch.device("cpu")
+        self._cache             = {}  # idx -> (layer_data_list, segments, rep)
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
+        if idx in self._cache:
+            return self._cache[idx]
+
         qc  = self.provider.get(idx)
         rep = CircuitRepresentation(qc)
 
@@ -120,7 +124,9 @@ class CircuitDataset(Dataset):
         # one graph per layer, tensors placed on device here — once, not per step
         layer_data_list = build_layer_data_list(rep, self.w_short, self.w_long, self.device)
 
-        return layer_data_list, segments, rep
+        result = (layer_data_list, segments, rep)
+        self._cache[idx] = result
+        return result
 
 
 def collate_fn(batch):
