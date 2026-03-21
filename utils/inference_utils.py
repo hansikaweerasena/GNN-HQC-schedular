@@ -21,11 +21,9 @@ def enforce_capacity(
       1. Argmax to get initial hard assignments.
       2. For each over-capacity technology k:
          - Sort its assigned qubits by P_ell[u, k] ascending (least confident first).
-         - Reassign the lowest-confidence qubits to their runner-up technology
-           (argmax over remaining techs) until capacity is met.
+         - Reassign the lowest-confidence qubits to the best technology that
+           still has remaining capacity, updating counts after each move.
       3. Repeat until all capacities are satisfied.
-         (Reassigning a qubit to its runner-up may cause that tech to exceed
-          capacity, so we iterate until convergence.)
 
     Args:
         P_ell: [N, K] soft assignment probabilities for one layer.
@@ -51,14 +49,14 @@ def enforce_capacity(
     caps = capacities.detach().long().cpu()     # [K]
     assignments = probs.argmax(dim=1)           # [N]
 
+    # Running counts — kept in sync throughout the inner loop
+    counts = torch.zeros(K, dtype=torch.long)
+    for k in range(K):
+        counts[k] = (assignments == k).sum()
+
     # Iterative repair: keep fixing until feasible
     max_iters = K * N  # safety bound, should converge much faster
     for _ in range(max_iters):
-        # Count per-tech assignments
-        counts = torch.zeros(K, dtype=torch.long)
-        for k in range(K):
-            counts[k] = (assignments == k).sum()
-
         # Find a tech that exceeds capacity
         violations = (counts > caps).nonzero(as_tuple=True)[0]
         if len(violations) == 0:
@@ -74,14 +72,25 @@ def enforce_capacity(
         sorted_order = confidences.argsort()  # ascending
         to_reassign = qubit_indices[sorted_order[:excess]]
 
-        # Reassign each to its runner-up tech
+        # Reassign each to the best tech with remaining capacity
         for u_idx in to_reassign:
             u = int(u_idx.item())
-            # Mask out current tech, pick best among remainder
             p_u = probs[u].clone()
+
+            # Mask out the over-capacity tech
             p_u[k_over] = -float("inf")
+
+            # Also mask out any other tech already at capacity
+            for k in range(K):
+                if k != k_over and counts[k] >= caps[k]:
+                    p_u[k] = -float("inf")
+
             runner_up = int(p_u.argmax().item())
             assignments[u] = runner_up
+
+            # Update running counts immediately
+            counts[k_over] -= 1
+            counts[runner_up] += 1
 
     return assignments.to(device)
 
