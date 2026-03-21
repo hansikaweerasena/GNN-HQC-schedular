@@ -4,26 +4,28 @@ evolving_gnn.py
 MOSAIC Scheduler — per-layer GNN encoder.
 
 Architecture per layer t:
-  1. MLPNodeEncoder   [N, 16] -> [N, 32]   project raw features
-  2. GATv2Conv        [N, 32] -> [N, 64]   spatial message passing on backbone graph
+  1. MLPNodeEncoder   [N, 16] -> [N, 64]   project raw features
+  2. GATv2Conv        [N, 64] -> [N, 64]   spatial message passing on backbone graph
+                                            + residual connection from MLP output
   3. GRUCell          [N, 64] -> [N, 64]   temporal state update
 
 Full pipeline:
   Raw node features [N, 16]
-      -> MLP:   Linear(16->32) -> ReLU -> Linear(32->32) -> LayerNorm
-      -> GATv2: GATv2Conv(32->64, heads=4, edge_dim=5)   -> LayerNorm -> Dropout(0.1)
+      -> MLP:   Linear(16->32) -> ReLU -> Linear(32->64) -> LayerNorm
+      -> GATv2: GATv2Conv(64->64, heads=4, edge_dim=5) + residual -> LayerNorm -> Dropout(0.1)
       -> GRU:   GRUCell(input=64, hidden=64)             -> LayerNorm
       -> Output: h_t [N, 64]  (fed to ClusteringHead)
+
+Residual connection:
+  z = GAT(e, edges) + e
+  - Connected nodes: z = neighborhood_context + own_features
+  - Isolated nodes:  GAT output = 0, so z = e (own features fully preserved)
+  Requires mlp_out_dim == gnn_out_dim (both 64).
 
 Truncated BPTT:
   Hidden state is detached every `bptt_steps` layers during the forward pass.
   This prevents exploding/vanishing gradients over long layer sequences while
   still letting the GRU carry forward assignment context.
-
-Empty graph handling:
-  If a layer's backbone graph has no edges, we skip GATv2 message passing
-  and use a linear fallback projection (gnn_fallback) instead of zero-padding,
-  so the node embeddings remain informative.
 """
 
 from __future__ import annotations
@@ -101,7 +103,7 @@ class EvolvingGNN(nn.Module):
         self,
         node_feat_dim: int = 16,
         mlp_hidden_dim: int = 32,
-        mlp_out_dim: int = 32,
+        mlp_out_dim: int = 64,   # must equal gnn_out_dim for residual connection
         gnn_out_dim: int = 64,
         gru_hidden_dim: int = 64,
         edge_feat_dim: int = 5,
@@ -109,7 +111,7 @@ class EvolvingGNN(nn.Module):
         dropout: float = 0.1,
         bptt_steps: int = 3,
         activation: str = "relu",
-        # Legacy kwargs accepted but ignored (for old call sites)
+        # Legacy kwargs accepted but remapped (for old call sites)
         in_dim_node: int = None,
         in_dim_edge: int = None,
         gnn_hidden_dim: int = None,
@@ -125,9 +127,10 @@ class EvolvingGNN(nn.Module):
         if rnn_hidden_dim is not None:
             gru_hidden_dim = rnn_hidden_dim
 
-        self.gnn_out_dim   = gnn_out_dim
-        self.rnn_hidden_dim = gru_hidden_dim  # public alias for ClusteringHead
-        self.bptt_steps    = bptt_steps
+        self.gnn_out_dim    = gnn_out_dim
+        self.rnn_hidden_dim = gru_hidden_dim  # public alias used by ClusteringHead
+        self.bptt_steps     = bptt_steps
+        self.edge_feat_dim  = edge_feat_dim   # stored explicitly — avoids fragile PyG attr access
 
         assert mlp_out_dim == gnn_out_dim, (
             f"mlp_out_dim ({mlp_out_dim}) must equal gnn_out_dim ({gnn_out_dim}) "
@@ -206,12 +209,14 @@ class EvolvingGNN(nn.Module):
             x          = data.x           # [N, node_feat_dim]
             edge_index = data.edge_index  # [2, E]
 
-            # Edge attr: fall back to zeros if absent or empty
+            # Edge attr: fall back to zeros if absent or empty.
+            # Use self.edge_feat_dim (stored at init) — avoids fragile access
+            # to self.gat.edge_dim which is not stable across PyG versions.
             if data.edge_attr is not None and data.edge_attr.numel() > 0:
                 edge_attr = data.edge_attr
             else:
                 edge_attr = torch.zeros(
-                    edge_index.size(1), self.gat.edge_dim or 5,
+                    edge_index.size(1), self.edge_feat_dim,
                     device=device, dtype=x.dtype,
                 )
 
