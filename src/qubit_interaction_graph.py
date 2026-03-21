@@ -195,12 +195,30 @@ def build_layer_graph_arrays(
         prefix_idle[t + 1] = prefix_idle[t] + q_idle[t]
 
     def node_range_sum(prefix: np.ndarray, t_lo: int, t_hi: int) -> np.ndarray:
-        """Sum prefix[lo..hi] inclusive, clamped to valid range. Returns [N]."""
+        """
+        Windowed sum over prefix[lo..hi], clamped to [0, T-1].
+        Returns [N] — raw count (caller divides by actual window size).
+        """
         t_lo = max(0, t_lo)
         t_hi = min(T - 1, t_hi)
         if t_lo > t_hi:
             return np.zeros(N, dtype=np.float32)
         return prefix[t_hi + 1] - prefix[t_lo]
+
+    def node_rate(prefix: np.ndarray, t_lo: int, t_hi: int) -> np.ndarray:
+        """
+        Windowed rate: sum / actual_window_size, clamped to [0, T-1].
+        Divides by the number of layers actually in the clamped window,
+        not the nominal window size — avoids boundary deflation at the
+        start and end of the circuit.
+        Returns [N] in [0, 1].
+        """
+        t_lo_c = max(0, t_lo)
+        t_hi_c = min(T - 1, t_hi)
+        if t_lo_c > t_hi_c:
+            return np.zeros(N, dtype=np.float32)
+        actual_w = float(t_hi_c - t_lo_c + 1)
+        return (prefix[t_hi_c + 1] - prefix[t_lo_c]) / actual_w
 
     # ------------------------------------------------------------------
     # Prefix sums for O(1) windowed edge queries
@@ -228,10 +246,26 @@ def build_layer_graph_arrays(
             if t_lo > t_hi:
                 return np.zeros(P, dtype=np.float32)
             return pair_prefix[t_hi + 1] - pair_prefix[t_lo]
+
+        def edge_rate(t_lo: int, t_hi: int) -> np.ndarray:
+            """
+            Windowed edge rate: sum / actual_window_size, clamped to [0, T-1].
+            Divides by actual layers in window to avoid boundary deflation.
+            Returns [P] in [0, 1].
+            """
+            t_lo_c = max(0, t_lo)
+            t_hi_c = min(T - 1, t_hi)
+            if t_lo_c > t_hi_c:
+                return np.zeros(P, dtype=np.float32)
+            actual_w = float(t_hi_c - t_lo_c + 1)
+            return (pair_prefix[t_hi_c + 1] - pair_prefix[t_lo_c]) / actual_w
     else:
         pair_arr = np.zeros((T, 0), dtype=np.float32)
 
         def edge_range_sum(t_lo: int, t_hi: int) -> np.ndarray:
+            return np.zeros(0, dtype=np.float32)
+
+        def edge_rate(t_lo: int, t_hi: int) -> np.ndarray:
             return np.zeros(0, dtype=np.float32)
 
     # ------------------------------------------------------------------
@@ -247,23 +281,23 @@ def build_layer_graph_arrays(
         is_1q_now   = (q_1q[t] > 0.0).astype(np.float32)
         is_2q_now   = (q_2q[t] > 0.0).astype(np.float32)
 
-        # 1Q windowed rates (exclude current layer)
-        r_1q_ps = node_range_sum(prefix_1q, t - w_short, t - 1) / w_short
-        r_1q_fs = node_range_sum(prefix_1q, t + 1, t + w_short) / w_short
-        r_1q_pl = node_range_sum(prefix_1q, t - w_long,  t - 1) / w_long
-        r_1q_fl = node_range_sum(prefix_1q, t + 1, t + w_long)  / w_long
+        # 1Q windowed rates (exclude current layer t)
+        r_1q_ps = node_rate(prefix_1q, t - w_short, t - 1)
+        r_1q_fs = node_rate(prefix_1q, t + 1, t + w_short)
+        r_1q_pl = node_rate(prefix_1q, t - w_long,  t - 1)
+        r_1q_fl = node_rate(prefix_1q, t + 1, t + w_long)
 
         # Idle windowed rates
-        r_idle_ps = node_range_sum(prefix_idle, t - w_short, t - 1) / w_short
-        r_idle_fs = node_range_sum(prefix_idle, t + 1, t + w_short) / w_short
-        r_idle_pl = node_range_sum(prefix_idle, t - w_long,  t - 1) / w_long
-        r_idle_fl = node_range_sum(prefix_idle, t + 1, t + w_long)  / w_long
+        r_idle_ps = node_rate(prefix_idle, t - w_short, t - 1)
+        r_idle_fs = node_rate(prefix_idle, t + 1, t + w_short)
+        r_idle_pl = node_rate(prefix_idle, t - w_long,  t - 1)
+        r_idle_fl = node_rate(prefix_idle, t + 1, t + w_long)
 
         # 2Q windowed rates
-        r_2q_ps = node_range_sum(prefix_2q, t - w_short, t - 1) / w_short
-        r_2q_fs = node_range_sum(prefix_2q, t + 1, t + w_short) / w_short
-        r_2q_pl = node_range_sum(prefix_2q, t - w_long,  t - 1) / w_long
-        r_2q_fl = node_range_sum(prefix_2q, t + 1, t + w_long)  / w_long
+        r_2q_ps = node_rate(prefix_2q, t - w_short, t - 1)
+        r_2q_fs = node_rate(prefix_2q, t + 1, t + w_short)
+        r_2q_pl = node_rate(prefix_2q, t - w_long,  t - 1)
+        r_2q_fl = node_rate(prefix_2q, t + 1, t + w_long)
 
         layer_pos = np.full(N, t / T_norm, dtype=np.float32)
 
@@ -294,11 +328,11 @@ def build_layer_graph_arrays(
             continue
 
         # Edge features [E, 5]
-        active_now_vals = pair_arr[t, active_idx].astype(np.float32)  # 0 or 1
-        e_ps = edge_range_sum(t - w_short, t - 1)[active_idx] / w_short
-        e_fs = edge_range_sum(t + 1, t + w_short)[active_idx] / w_short
-        e_pl = edge_range_sum(t - w_long,  t - 1)[active_idx] / w_long
-        e_fl = edge_range_sum(t + 1, t + w_long) [active_idx] / w_long
+        active_now_vals = pair_arr[t, active_idx].astype(np.float32)
+        e_ps = edge_rate(t - w_short, t - 1)[active_idx]
+        e_fs = edge_rate(t + 1, t + w_short)[active_idx]
+        e_pl = edge_rate(t - w_long,  t - 1)[active_idx]
+        e_fl = edge_rate(t + 1, t + w_long) [active_idx]
 
         ea_half = np.stack([active_now_vals, e_ps, e_fs, e_pl, e_fl], axis=1)  # [E, 5]
 
