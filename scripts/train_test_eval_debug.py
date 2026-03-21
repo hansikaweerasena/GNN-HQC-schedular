@@ -51,28 +51,32 @@ from utils.cost_config_reader import load_scheduler_cfg
 # =============================================================================
 
 
-def build_layer_data_list(circuit, w_short: int, w_long: int):
+def build_layer_data_list(circuit, w_short: int, w_long: int, device: torch.device):
     """
     Build a list of PyG Data objects (one per circuit layer) from the new
     windowed backbone graph input pipeline.
+
+    Tensors are moved to `device` here — once per circuit — so the training
+    loop never needs to touch device placement.
 
     Args:
         circuit:  CircuitRepresentation
         w_short:  short window radius = ceil(max_kappa)
         w_long:   long  window radius = 2 * w_short
+        device:   torch.device to place all tensors on
 
     Returns:
         layer_data_list: List[Data], length = T (number of circuit layers)
     """
     arrays = build_layer_graph_arrays(circuit, w_short, w_long)
-    data_list = []
-    for x_np, ei_np, ea_np in arrays:
-        data_list.append(Data(
-            x          = torch.tensor(x_np,  dtype=torch.float32),
-            edge_index = torch.tensor(ei_np, dtype=torch.long),
-            edge_attr  = torch.tensor(ea_np, dtype=torch.float32),
-        ))
-    return data_list
+    return [
+        Data(
+            x          = torch.tensor(x_np,  dtype=torch.float32).to(device),
+            edge_index = torch.tensor(ei_np, dtype=torch.long).to(device),
+            edge_attr  = torch.tensor(ea_np, dtype=torch.float32).to(device),
+        )
+        for x_np, ei_np, ea_np in arrays
+    ]
 
 
 # =============================================================================
@@ -89,6 +93,7 @@ class CircuitDataset(Dataset):
         segment_threshold: float,
         w_short: int,
         w_long: int,
+        device: torch.device = None,
     ):
         self.provider           = provider
         self.n_samples          = int(n_samples)
@@ -96,6 +101,7 @@ class CircuitDataset(Dataset):
         self.segment_mode       = segment_mode
         self.w_short            = w_short
         self.w_long             = w_long
+        self.device             = device or torch.device("cpu")
 
     def __len__(self):
         return self.n_samples
@@ -104,15 +110,15 @@ class CircuitDataset(Dataset):
         qc  = self.provider.get(idx)
         rep = CircuitRepresentation(qc)
 
-        # segments are still needed by TotalCost for gate counting
+        # segments still needed by TotalCost for gate counting
         segments, seg_ids = segment_circuit(
             rep.layers,
             mode=self.segment_mode,
             threshold=self.segment_threshold,
         )
 
-        # new input: one graph per layer with windowed backbone features
-        layer_data_list = build_layer_data_list(rep, self.w_short, self.w_long)
+        # one graph per layer, tensors placed on device here — once, not per step
+        layer_data_list = build_layer_data_list(rep, self.w_short, self.w_long, self.device)
 
         return layer_data_list, segments, rep
 
@@ -141,15 +147,6 @@ def evaluate_model(
     with torch.no_grad():
         for batch in test_loader:
             for layer_data_list, segments, rep in batch:
-                # move tensors to device
-                layer_data_list = [
-                    Data(
-                        x          = d.x.to(device),
-                        edge_index = d.edge_index.to(device),
-                        edge_attr  = d.edge_attr.to(device),
-                    )
-                    for d in layer_data_list
-                ]
                 loss, per_seg, cap_val = train_step(
                     model, cluster_module, cost_module,
                     layer_data_list, segments, rep,
@@ -218,6 +215,7 @@ def main():
         segment_threshold=DATASET_CFG["segment_threshold"],
         w_short=w_short,
         w_long=w_long,
+        device=device,
     )
     test_dataset = CircuitDataset(
         test_provider,
@@ -226,6 +224,7 @@ def main():
         segment_threshold=DATASET_CFG["segment_threshold"],
         w_short=w_short,
         w_long=w_long,
+        device=device,
     )
 
     train_loader = DataLoader(
@@ -270,21 +269,14 @@ def main():
     )
 
     # ---- Fixed sample for per-epoch debugging ----
+    # Tensors are already on device (dataset handles placement)
     fixed_layer_data_list, fixed_segments, fixed_rep = train_dataset[0]
 
     # ---- Init debug ----
     with torch.no_grad():
         evol_model.eval()
         cluster_module.eval()
-        fixed_on_device = [
-            Data(
-                x          = d.x.to(device),
-                edge_index = d.edge_index.to(device),
-                edge_attr  = d.edge_attr.to(device),
-            )
-            for d in fixed_layer_data_list
-        ]
-        h_seq, _ = evol_model(fixed_on_device)
+        h_seq, _ = evol_model(fixed_layer_data_list)
         P_seq    = cluster_module(h_seq)
         print("INIT P_start(q0, layer0) =", P_seq[0][0].cpu().numpy())
 
@@ -308,15 +300,6 @@ def main():
             batch_count = 0
 
             for layer_data_list, segments, rep in batch:
-                # move to device
-                layer_data_list = [
-                    Data(
-                        x          = d.x.to(device),
-                        edge_index = d.edge_index.to(device),
-                        edge_attr  = d.edge_attr.to(device),
-                    )
-                    for d in layer_data_list
-                ]
                 loss, per_seg, cap_val = train_step(
                     evol_model, cluster_module, total_cost_module,
                     layer_data_list, segments, rep, optimizer,
@@ -338,7 +321,7 @@ def main():
             evol_model.eval()
             cluster_module.eval()
 
-            h_seq, z_seq = evol_model(fixed_on_device)
+            h_seq, z_seq = evol_model(fixed_layer_data_list)
             h0 = h_seq[0]
             print(f"h0 mean: {h0.mean().item():.4f}  std: {h0.std().item():.4f}")
 
