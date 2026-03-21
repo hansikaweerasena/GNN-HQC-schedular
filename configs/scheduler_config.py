@@ -3,11 +3,35 @@
 # ----------------------------
 # Model (GNN/RNN) parameters
 # ----------------------------
+# Dimensions follow the pipeline:
+#   raw node features [N, node_feat_dim]
+#   -> MLP out        [N, mlp_out_dim]      (mlp_hidden_dim is the hidden width)
+#   -> GATv2 out      [N, gnn_out_dim]
+#   -> GRU hidden     [N, gru_hidden_dim]   (= clustering head input dim)
 MODEL_CFG = {
-    "gnn_hidden_dim": 32,
-    "gnn_out_dim": 16,
-    "rnn_hidden_dim": 32,
-    "heads": 4,
+    # Input/feature dims — must match qubit_interaction_graph.NODE_FEAT_DIM / EDGE_FEAT_DIM
+    "node_feat_dim":  16,
+    "edge_feat_dim":  5,
+
+    # MLP node encoder
+    "mlp_hidden_dim": 32,
+    "mlp_out_dim":    32,
+
+    # GATv2 spatial encoder
+    "gnn_out_dim":    64,
+    "heads":          4,
+
+    # GRU temporal encoder
+    "gru_hidden_dim": 64,
+
+    # Regularisation
+    "dropout":        0.1,
+
+    # Truncated BPTT: detach hidden state every N layers (0 = no truncation)
+    "bptt_steps":     3,
+
+    # Activation in MLP: "relu" or "gelu"
+    "activation":     "relu",
 }
 
 # ----------------------------
@@ -33,10 +57,12 @@ TRAIN_CFG = {
 }
 
 # ----------------------------
-# Dataset/segmentation parameters
+# Dataset parameters
 # ----------------------------
+# segmentation_mode="layer" means one "segment" per circuit layer.
+# segment_threshold is kept for API compat but unused in layer mode.
 DATASET_CFG = {
-    "segmentation_mode": "layer",   # or "layer"
+    "segmentation_mode": "layer",
     "segment_threshold": 0.3,
 }
 

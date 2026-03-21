@@ -1,517 +1,317 @@
 """
 qubit_interaction_graph.py
 
-Purpose:
-    Build a qubit interaction multigraph from a segmented quantum circuit.
-    This graph is the input to the GNN spatial encoder.
+Builds per-layer qubit interaction graphs for the MOSAIC scheduler GNN input.
 
-Key concepts:
-    - Nodes = qubits (0..num_qubits-1)
-        Node features:
-          * first_layer: int, earliest layer where this qubit participates in any gate
-          * gate_count: int, total number of gates (1-qubit or 2-qubit) involving this qubit
+Design:
+  - One graph per circuit layer (no segmentation)
+  - Backbone graph at layer t: edge (u,v) exists iff pair has >= 1 interaction
+    within the symmetric window [t - W_long, t + W_long]
+  - Node features [N, NODE_FEAT_DIM=16]: local activity booleans + windowed
+    interaction rates + positional encoding
+  - Edge features [E_t, EDGE_FEAT_DIM=5]: current-layer activity flag +
+    short/long windowed interaction rates (past and future)
 
-    - Edges = 2-qubit gate interactions (one edge per gate instance)
-        Edge attributes:
-          * gate_type: str, e.g. "cx", "cz"
-          * layer: int, layer index where this gate occurs
-          * segment: int, segment id this gate belongs to
+Window sizes are derived from the maximum kappa across all non-all-to-all
+technologies — the same scales used by gamma_scoring.py:
+    W_short = ceil(max_kappa)
+    W_long  = 2 * ceil(max_kappa)
+This means window sizes are NOT hyperparameters; they follow from the
+cost model's topology parameters.
 
-    - MultiGraph: same qubit pair (q1, q2) can have multiple edges
-      if they interact in different layers/segments
+Node feature layout  (NODE_FEAT_DIM = 16):
+  [0]  is_idle_now           no gate of any kind in layer t
+  [1]  is_1q_now             has >= 1 one-qubit gate in layer t
+  [2]  is_2q_now             participates in >= 1 two-qubit gate in layer t
+  [3]  rate_1q_past_short    1Q gates in [t-W_short, t-1] / W_short
+  [4]  rate_1q_future_short  1Q gates in [t+1, t+W_short] / W_short
+  [5]  rate_1q_past_long     1Q gates in [t-W_long,  t-1] / W_long
+  [6]  rate_1q_future_long   1Q gates in [t+1, t+W_long]  / W_long
+  [7]  rate_idle_past_short  idle layers in [t-W_short, t-1] / W_short
+  [8]  rate_idle_future_short
+  [9]  rate_idle_past_long
+  [10] rate_idle_future_long
+  [11] rate_2q_past_short    2Q participations in [t-W_short, t-1] / W_short
+  [12] rate_2q_future_short
+  [13] rate_2q_past_long
+  [14] rate_2q_future_long
+  [15] layer_position        t / (T-1), in [0, 1]
 
-    - Aggregated stats per pair (stored on first edge for convenience):
-          * interaction_layers: List[int], all layers where this pair interacts
-          * interaction_count: int, total number of interactions
+Edge feature layout  (EDGE_FEAT_DIM = 5):
+  [0] active_now         1 if pair has a gate in layer t, else 0
+  [1] rate_past_short    interactions in [t-W_short, t-1] / W_short
+  [2] rate_future_short  interactions in [t+1, t+W_short] / W_short
+  [3] rate_past_long     interactions in [t-W_long,  t-1] / W_long
+  [4] rate_future_long   interactions in [t+1, t+W_long]  / W_long
 
-Main function:
-    build_qubit_interaction_multigraph(circuit, segment_ids)
-      Input:
-        * circuit: CircuitRepresentation object with num_qubits and layers
-        * segment_ids: List[int], segment id for each layer
-      Output:
-        * G: NetworkX MultiGraph with all node/edge features
-        * x: numpy array of node features [num_nodes, 2]
-        * edge_index: numpy array of edge connectivity [2, num_edges]
-        * edge_attr: numpy array of edge features [num_edges, feature_dim]
+Main API:
+    build_layer_graph_arrays(circuit, w_short, w_long)
+        -> List of T tuples: (x [N,16], edge_index [2,E], edge_attr [E,5])
 
-Helper functions:
-    extract_qubit_interactions(circuit, segment_ids)
-      Extract all 2-qubit gate interactions from the circuit
+    compute_window_sizes(tech_configs)
+        -> (w_short, w_long)  derived from GammaTechConfig list
 
-    build_qubit_graph(circuit, interactions)
-      Build NetworkX MultiGraph structure
-
-    add_node_features(G, circuit)
-      Compute and attach node features
-
-    add_aggregated_edge_features_v2(G, interactions)
-      Add aggregated per-pair statistics to edges
-
-    multigraph_to_arrays(G, known_gate_types)
-      Convert NetworkX graph to numpy arrays (torch-compatible)
-
-    get_segment_subgraph(G, segment_id)
-      Extract subgraph for a specific segment
-
-    print_segment_info(G, segment_ids)
-      Print per-segment analysis
-
-Usage:
-    from src.circuit_representation import CircuitRepresentation
-    from src.circuit_segmentation import segment_circuit
-    from src.qubit_interaction_graph import build_qubit_interaction_multigraph
-
-    # Load circuit and segment it
-    circuit_rep = CircuitRepresentation(qiskit_circuit)
-    segments, seg_ids = segment_circuit(circuit_rep.layers, threshold=0.3)
-
-    # Build the qubit interaction graph
-    G, x, edge_index, edge_attr = build_qubit_interaction_multigraph(circuit_rep, seg_ids)
-
-    # Now ready for GNN:
-    # x → node features for GNN input
-    # edge_index → graph connectivity for GNN
-    # edge_attr → edge features for GNN
+    compute_window_sizes_from_config(cost_config_dict)
+        -> (w_short, w_long)  derived from raw JSON config dict
 """
 
-from typing import List, Dict, Tuple
-import networkx as nx
+from __future__ import annotations
+
+import math
+from typing import Dict, List, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
-from typing import Optional
+
+# Public dimension constants — import these wherever you build models
+NODE_FEAT_DIM: int = 16
+EDGE_FEAT_DIM: int = 5
 
 
+# =============================================================================
+# Window size helpers
+# =============================================================================
 
-# ============================================================================
-# STEP 1: Extract qubit interactions
-# ============================================================================
 
-def extract_qubit_interactions(
-    circuit,  # CircuitRepresentation
-    segment_ids: List[int]
-) -> List[Dict]:
+def compute_window_sizes(tech_configs) -> Tuple[int, int]:
     """
-    Extract all 2-qubit gate interactions from the circuit.
+    Derive W_short and W_long from a list of GammaTechConfig objects.
+
+    Only non-all-to-all technologies contribute (all-to-all have kappa <= 0).
+    Falls back to kappa=3 if every technology is all-to-all.
 
     Returns:
-        List of dicts with keys: q1, q2, gate_type, layer, segment
+        (w_short, w_long) where w_short = ceil(max_kappa), w_long = 2*w_short
     """
-    interactions = []
-
-    for layer_idx, layer in enumerate(circuit.layers):
-        seg_id = segment_ids[layer_idx]
-
-        for gate_name, qubits in layer.gates:
-            if len(qubits) == 2:  # Only 2-qubit gates
-                q1, q2 = qubits
-                interactions.append({
-                    'q1': q1,
-                    'q2': q2,
-                    'gate_type': gate_name,
-                    'layer': layer_idx,
-                    'segment': seg_id
-                })
-
-    return interactions
-
-
-# ============================================================================
-# STEP 2: Build NetworkX MultiGraph
-# ============================================================================
-
-def build_qubit_graph(
-    circuit,  # CircuitRepresentation
-    interactions: List[Dict]
-) -> nx.MultiGraph:
-    """
-    Build a NetworkX MultiGraph with qubits as nodes and 2-qubit interactions as edges.
-    """
-    G = nx.MultiGraph()
-
-    # Add all qubit nodes
-    for q in range(circuit.num_qubits):
-        G.add_node(q)
-
-    # Add edges for each 2-qubit interaction
-    for inter in interactions:
-        q1, q2 = inter['q1'], inter['q2']
-        G.add_edge(
-            q1, q2,
-            gate_type=inter['gate_type'],
-            layer=inter['layer'],
-            segment=inter['segment']
-        )
-
-    return G
-
-
-# ============================================================================
-# STEP 3: Add node features
-# ============================================================================
-
-def add_node_features(G: nx.MultiGraph, circuit):
-    """
-    Compute and add node features:
-      - first_layer: earliest layer where this qubit participates in any gate
-      - gate_count: total number of gates (1-qubit or 2-qubit) involving this qubit
-    """
-    num_qubits = circuit.num_qubits
-
-    # Initialize
-    first_layer = [None] * num_qubits
-    gate_count = [0] * num_qubits
-
-    # Traverse all layers and gates
-    for layer_idx, layer in enumerate(circuit.layers):
-        for gate_name, qubits in layer.gates:
-            for q in qubits:
-                gate_count[q] += 1
-                if first_layer[q] is None or layer_idx < first_layer[q]:
-                    first_layer[q] = layer_idx
-
-    # Attach to graph nodes
-    for q in range(num_qubits):
-        G.nodes[q]['first_layer'] = (
-            first_layer[q] if first_layer[q] is not None else -1
-        )
-        G.nodes[q]['gate_count'] = gate_count[q]
-
-
-# ============================================================================
-# STEP 4: Add aggregated edge features
-# ============================================================================
-
-def add_aggregated_edge_features_v2(G: nx.MultiGraph, interactions: List[Dict]):
-    """
-    For each qubit pair, aggregate:
-      - interaction_layers: list of all layer indices where they interact
-      - interaction_count: total count of interactions
-    """
-    # Aggregate by pair
-    pair_stats = {}
-    for inter in interactions:
-        a, b = sorted((inter['q1'], inter['q2']))
-        if (a, b) not in pair_stats:
-            pair_stats[(a, b)] = {
-                'interaction_layers': [],
-                'interaction_count': 0
-            }
-        pair_stats[(a, b)]['interaction_layers'].append(inter['layer'])
-        pair_stats[(a, b)]['interaction_count'] += 1
-
-    # Store on each edge
-    for u, v, k, attr in G.edges(keys=True, data=True):
-        pair = tuple(sorted((u, v)))
-        if pair in pair_stats:
-            stats = pair_stats[pair]
-            G[u][v][k]['interaction_layers'] = stats['interaction_layers']
-            G[u][v][k]['interaction_count'] = stats['interaction_count']
-
-
-# ============================================================================
-# STEP 5: Convert to NumPy arrays (torch-compatible)
-# ============================================================================
-
-def multigraph_to_arrays(
-    G: nx.MultiGraph,
-    known_gate_types: List[str] = None
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    ...
-    if known_gate_types is None:
-        known_gate_types = ['cx', 'cz']
-
-    # Node features: iterate over actual node IDs in sorted order
-    node_ids = sorted(G.nodes())
-    first_layers = []
-    gate_counts = []
-    for n in node_ids:
-        data = G.nodes[n]
-        first_layers.append(float(data.get('first_layer', -1)))
-        gate_counts.append(float(data.get('gate_count', 0)))
-
-    x = np.stack([first_layers, gate_counts], axis=-1).astype(np.float32)
-
-    # map node id -> index in x
-    node_id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
-
-    # Edge features
-    edge_u = []
-    edge_v = []
-    edge_features = []
-
-    def one_hot_gate(gt: str, known_types: List[str]) -> np.ndarray:
-        vec = np.zeros(len(known_types) + 1, dtype=np.float32)
-        try:
-            idx = known_types.index(gt.lower())
-        except ValueError:
-            idx = len(known_types)
-        vec[idx] = 1.0
-        return vec
-
-    for u, v, k, attr in G.edges(keys=True, data=True):
-        edge_u.append(node_id_to_idx[u])
-        edge_v.append(node_id_to_idx[v])
-
-        gt_vec = one_hot_gate(attr.get('gate_type', 'other'), known_gate_types)
-        layer_val = float(attr.get('layer', -1))
-        seg_val = float(attr.get('segment', -1))
-
-        feat_vec = np.concatenate([gt_vec, [layer_val, seg_val]])
-        edge_features.append(feat_vec)
-
-    edge_index = np.array([edge_u, edge_v], dtype=np.int64)
-    edge_attr = (
-        np.stack(edge_features, axis=0).astype(np.float32)
-        if edge_features
-        else np.zeros((0, len(one_hot_gate('cx', known_gate_types)) + 2), dtype=np.float32)
+    max_kappa = max(
+        (cfg.kappa for cfg in tech_configs if not cfg.is_all_to_all),
+        default=3.0,
     )
+    w_short = max(1, int(math.ceil(max_kappa)))
+    w_long  = 2 * w_short
+    return w_short, w_long
 
-    return x, edge_index, edge_attr
 
-def build_segment_graph_arrays(
-    circuit,              # CircuitRepresentation
-    segments,             # List[Segment]
-    known_gate_types: List[str] = None
-) -> List[Tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+def compute_window_sizes_from_config(cost_config: dict) -> Tuple[int, int]:
     """
-    For each segment, build (x_s, edge_index_s, edge_attr_s) directly
-    from its own segment graph.
+    Derive W_short and W_long directly from a raw cost_config JSON dict
+    (as loaded by load_cost_config), without constructing GammaTechConfig objects.
 
     Returns:
-      List of (segment_idx, x_s, edge_index_s, edge_attr_s)
+        (w_short, w_long)
     """
-    segment_graphs = build_segment_qubit_graphs(circuit, segments, known_gate_types)
-    per_segment = []
-    for seg_id, G_s in segment_graphs:
-        x_s, edge_index_s, edge_attr_s = multigraph_to_arrays(G_s, known_gate_types)
-        per_segment.append((seg_id, x_s, edge_index_s, edge_attr_s))
-    return per_segment
+    techs = cost_config.get("techs", [])
+    max_kappa = 3.0  # fallback
+    found = False
+    for tech in techs:
+        routing = tech.get("routing", {})
+        a2a = bool(routing.get("all_to_all", False))
+        kappa = float(routing.get("kappa", 0.0))
+        if not a2a and kappa > 0:
+            if not found:
+                max_kappa = kappa
+                found = True
+            else:
+                max_kappa = max(max_kappa, kappa)
+    w_short = max(1, int(math.ceil(max_kappa)))
+    w_long  = 2 * w_short
+    return w_short, w_long
 
 
-# ============================================================================
-# MAIN FUNCTION: Complete pipeline
-# ============================================================================
+# =============================================================================
+# Main builder
+# =============================================================================
 
-def build_qubit_interaction_multigraph(
-    circuit,  # CircuitRepresentation
-    segment_ids: List[int],
-    known_gate_types: List[str] = None
-) -> Tuple[nx.MultiGraph, np.ndarray, np.ndarray, np.ndarray]:
+
+def build_layer_graph_arrays(
+    circuit,       # CircuitRepresentation
+    w_short: int,
+    w_long: int,
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
-    Complete pipeline: build qubit interaction graph from circuit.
+    Build per-layer graph arrays ready for conversion to PyG Data objects.
+
+    For each layer t (0 .. T-1):
+      - x          [N, NODE_FEAT_DIM]   node feature matrix
+      - edge_index [2, E_t]             backbone edge connectivity (undirected;
+                                        both directions included for GATv2)
+      - edge_attr  [E_t, EDGE_FEAT_DIM] edge features
+
+    Backbone rule: edge (u,v) is included in layer t iff the pair has at least
+    one 2Q interaction anywhere in [t - W_long, t + W_long].
+
+    Layers where no backbone edges are active return empty graphs:
+      edge_index shape [2, 0], edge_attr shape [0, 5].
 
     Args:
-        circuit: CircuitRepresentation object
-        segment_ids: List[int], segment id for each layer
-        known_gate_types: List[str], known gate types (default: ['cx', 'cz'])
+        circuit:  CircuitRepresentation with .layers (List[CircuitLayer])
+                  and .num_qubits (int)
+        w_short:  short window radius = ceil(max_kappa)
+        w_long:   long  window radius = 2 * w_short
 
     Returns:
-        G: NetworkX MultiGraph with node/edge features
-        x: Node feature array [num_nodes, 2]
-        edge_index: Edge connectivity [2, num_edges]
-        edge_attr: Edge feature array [num_edges, feature_dim]
+        List of T tuples [(x_0, ei_0, ea_0), ..., (x_{T-1}, ei_{T-1}, ea_{T-1})]
     """
-    if known_gate_types is None:
-        known_gate_types = ['cx', 'cz']
+    T = len(circuit.layers)
+    N = circuit.num_qubits
 
-    # Step 1: Extract interactions
-    interactions = extract_qubit_interactions(circuit, segment_ids)
+    if T == 0:
+        return []
 
-    # Step 2: Build graph
-    G = build_qubit_graph(circuit, interactions)
+    # ------------------------------------------------------------------
+    # Pass 1: collect per-layer per-qubit counts and per-pair interactions
+    # ------------------------------------------------------------------
+    q_1q  = np.zeros((T, N), dtype=np.float32)
+    q_2q  = np.zeros((T, N), dtype=np.float32)
+    pair_counts: List[Dict[Tuple[int, int], float]] = [{} for _ in range(T)]
 
-    # Step 3: Add node features
-    add_node_features(G, circuit)
-
-    # Step 4: Add aggregated edge features
-    add_aggregated_edge_features_v2(G, interactions)
-
-    # Step 5: Convert to arrays
-    x, edge_index, edge_attr = multigraph_to_arrays(G, known_gate_types)
-
-    return G, x, edge_index, edge_attr
-
-
-def build_segment_qubit_graphs(
-    circuit,              # CircuitRepresentation
-    segments,             # List[Segment]
-    known_gate_types: List[str] = None
-) -> List[Tuple[int, nx.MultiGraph]]:
-    """
-    Build a separate qubit-interaction MultiGraph for each segment.
-
-    For each segment s:
-      - Nodes: all qubits 0..num_qubits-1 with node features (first_layer, gate_count)
-      - Edges: only 2-qubit gates whose layer is in seg.layers
-
-    Returns:
-      List of (segment_idx, G_s), where G_s is a MultiGraph for that segment.
-    """
-    if known_gate_types is None:
-        known_gate_types = ['cx', 'cz']
-
-    num_qubits = circuit.num_qubits
-
-    # Precompute global node features once
-    # (same as add_node_features, but not mutating an existing graph)
-    first_layer = [None] * num_qubits
-    gate_count = [0] * num_qubits
-    for layer_idx, layer in enumerate(circuit.layers):
+    for t, layer in enumerate(circuit.layers):
         for gate_name, qubits in layer.gates:
-            for q in qubits:
-                gate_count[q] += 1
-                if first_layer[q] is None or layer_idx < first_layer[q]:
-                    first_layer[q] = layer_idx
-    first_layer = [fl if fl is not None else -1 for fl in first_layer]
+            n = len(qubits)
+            if n == 1:
+                q = int(qubits[0])
+                if 0 <= q < N:
+                    q_1q[t, q] += 1.0
+            elif n == 2:
+                u, v = int(qubits[0]), int(qubits[1])
+                if 0 <= u < N and 0 <= v < N and u != v:
+                    q_2q[t, u] += 1.0
+                    q_2q[t, v] += 1.0
+                    pair = (min(u, v), max(u, v))
+                    pair_counts[t][pair] = pair_counts[t].get(pair, 0.0) + 1.0
 
-    segment_graphs: List[Tuple[int, nx.MultiGraph]] = []
+    # Idle: qubit has no gate of any kind in layer t
+    q_idle = ((q_1q + q_2q) == 0.0).astype(np.float32)  # [T, N]
 
-    for seg in segments:
-        seg_id = seg.segment_idx
-        G_s = nx.MultiGraph()
+    # ------------------------------------------------------------------
+    # Prefix sums for O(1) windowed node queries
+    # prefix_X[t+1, :] = cumulative sum of X[0..t, :]
+    # ------------------------------------------------------------------
+    prefix_1q   = np.zeros((T + 1, N), dtype=np.float32)
+    prefix_2q   = np.zeros((T + 1, N), dtype=np.float32)
+    prefix_idle = np.zeros((T + 1, N), dtype=np.float32)
+    for t in range(T):
+        prefix_1q[t + 1]   = prefix_1q[t]   + q_1q[t]
+        prefix_2q[t + 1]   = prefix_2q[t]   + q_2q[t]
+        prefix_idle[t + 1] = prefix_idle[t] + q_idle[t]
 
-        # add all qubits as nodes with features
-        for q in range(num_qubits):
-            G_s.add_node(
-                q,
-                first_layer=first_layer[q],
-                gate_count=gate_count[q],
-            )
+    def node_range_sum(prefix: np.ndarray, t_lo: int, t_hi: int) -> np.ndarray:
+        """Sum prefix[lo..hi] inclusive, clamped to valid range. Returns [N]."""
+        t_lo = max(0, t_lo)
+        t_hi = min(T - 1, t_hi)
+        if t_lo > t_hi:
+            return np.zeros(N, dtype=np.float32)
+        return prefix[t_hi + 1] - prefix[t_lo]
 
-        # add edges for 2-qubit gates in this segment
-        for layer_idx in seg.layers:
-            layer = circuit.layers[layer_idx]
-            for gate_name, qubits in layer.gates:
-                if len(qubits) == 2:
-                    q1, q2 = qubits
-                    G_s.add_edge(
-                        q1,
-                        q2,
-                        gate_type=gate_name,
-                        layer=layer_idx,
-                        segment=seg_id,
-                    )
-
-        segment_graphs.append((seg_id, G_s))
-
-    return segment_graphs
-
-
-
-# ============================================================================
-# HELPER: Per-segment analysis
-# ============================================================================
-
-def get_segment_subgraph(G: nx.MultiGraph, segment_id: int) -> nx.MultiGraph:
-    """
-    Extract a subgraph containing only edges from a specific segment.
-    """
-    H = nx.MultiGraph()
-
-    for u, v, k, attr in G.edges(keys=True, data=True):
-        if attr.get('segment') == segment_id:
-            if u not in H:
-                H.add_node(u, **G.nodes[u])
-            if v not in H:
-                H.add_node(v, **G.nodes[v])
-            H.add_edge(u, v, key=k, **attr)
-
-    return H
-
-
-def print_segment_info(G: nx.MultiGraph, segment_ids: List[int]):
-    """
-    Print per-segment analysis.
-    """
-    num_segments = max(segment_ids) + 1
-
-    print(f"\n=== Per-Segment Qubit Interaction Analysis ===\n")
-    print(f"Total segments: {num_segments}\n")
-
-    for seg_id in range(num_segments):
-        H = get_segment_subgraph(G, seg_id)
-
-        print(f"Segment {seg_id}:")
-        print(f"  Active qubits: {sorted(H.nodes())}")
-        print(f"  Interactions: {list(H.edges())}")
-
-        gate_types_in_seg = [
-            attr['gate_type']
-            for u, v, k, attr in H.edges(keys=True, data=True)
-        ]
-        print(f"  Gate types: {gate_types_in_seg if gate_types_in_seg else '[]'}")
-        print()
-
-
-def print_graph_stats(G: nx.MultiGraph):
-    """Print overall graph statistics."""
-    print(f"\n=== Qubit Interaction Graph Statistics ===\n")
-    print(f"Number of qubits: {G.number_of_nodes()}")
-    print(f"Number of 2-qubit interactions: {G.number_of_edges()}")
-
-    gate_counts = [G.nodes[n].get('gate_count', 0) for n in G.nodes()]
-    print(f"Average gates per qubit: {np.mean(gate_counts):.2f}")
-    print(f"Max gates on one qubit: {np.max(gate_counts)}")
-
-    # Count gate types
-    gate_types = {}
-    for u, v, k, attr in G.edges(keys=True, data=True):
-        gt = attr.get('gate_type', 'unknown')
-        gate_types[gt] = gate_types.get(gt, 0) + 1
-
-    print(f"Gate type distribution: {gate_types}\n")
-
-
-def visualize_segment_graph(
-    G: nx.MultiGraph,
-    segment_id: int,
-    with_labels: bool = True,
-    title: Optional[str] = None,
-):
-    """
-    Visualize the interaction subgraph for a given segment_id.
-
-    - Nodes = qubits
-    - Edges = 2-qubit gates that occur in this segment
-    - Edge labels show gate_type and layer
-    """
-    H = get_segment_subgraph(G, segment_id)
-    if H.number_of_nodes() == 0:
-        print(f"No edges for segment {segment_id}")
-        return
-
-    pos = nx.spring_layout(H, seed=42)  # deterministic layout
-
-    plt.figure(figsize=(12, 8))
-    nx.draw(
-        H,
-        pos,
-        with_labels=with_labels,
-        node_color="lightblue",
-        node_size=800,
-        edge_color="gray",
+    # ------------------------------------------------------------------
+    # Prefix sums for O(1) windowed edge queries
+    # ------------------------------------------------------------------
+    all_pairs: List[Tuple[int, int]] = sorted(
+        {pair for pc in pair_counts for pair in pc}
     )
+    P = len(all_pairs)
+    pair_to_idx: Dict[Tuple[int, int], int] = {p: i for i, p in enumerate(all_pairs)}
 
-    # Edge labels: gate_type@layer
-    edge_labels = {}
-    for u, v, k, attr in H.edges(keys=True, data=True):
-        gt = attr.get("gate_type", "?")
-        layer = attr.get("layer", "?")
-        edge_labels[(u, v, k)] = f"{gt}@L{layer}"
+    if P > 0:
+        pair_arr = np.zeros((T, P), dtype=np.float32)
+        for t in range(T):
+            for pair, cnt in pair_counts[t].items():
+                pair_arr[t, pair_to_idx[pair]] = float(cnt)
 
-    # MultiGraph edge labeling: need keys=True
-    nx.draw_networkx_edge_labels(
-        H,
-        pos,
-        edge_labels={(u, v): lab for (u, v, k), lab in edge_labels.items()},
-        font_size=8,
-    )
+        pair_prefix = np.zeros((T + 1, P), dtype=np.float32)
+        for t in range(T):
+            pair_prefix[t + 1] = pair_prefix[t] + pair_arr[t]
 
-    if title is None:
-        title = f"Segment {segment_id} interaction graph"
-    plt.title(title)
-    plt.tight_layout()
-    plt.show()
+        def edge_range_sum(t_lo: int, t_hi: int) -> np.ndarray:
+            """Sum pair_prefix[lo..hi] inclusive, clamped. Returns [P]."""
+            t_lo = max(0, t_lo)
+            t_hi = min(T - 1, t_hi)
+            if t_lo > t_hi:
+                return np.zeros(P, dtype=np.float32)
+            return pair_prefix[t_hi + 1] - pair_prefix[t_lo]
+    else:
+        pair_arr = np.zeros((T, 0), dtype=np.float32)
 
+        def edge_range_sum(t_lo: int, t_hi: int) -> np.ndarray:
+            return np.zeros(0, dtype=np.float32)
 
+    # ------------------------------------------------------------------
+    # Pass 2: assemble (x, edge_index, edge_attr) for each layer
+    # ------------------------------------------------------------------
+    result: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    T_norm = float(max(T - 1, 1))  # normalizer for layer_position
+
+    for t in range(T):
+
+        # ---- Node features [N, 16] ----
+        is_idle_now = q_idle[t]
+        is_1q_now   = (q_1q[t] > 0.0).astype(np.float32)
+        is_2q_now   = (q_2q[t] > 0.0).astype(np.float32)
+
+        # 1Q windowed rates (exclude current layer)
+        r_1q_ps = node_range_sum(prefix_1q, t - w_short, t - 1) / w_short
+        r_1q_fs = node_range_sum(prefix_1q, t + 1, t + w_short) / w_short
+        r_1q_pl = node_range_sum(prefix_1q, t - w_long,  t - 1) / w_long
+        r_1q_fl = node_range_sum(prefix_1q, t + 1, t + w_long)  / w_long
+
+        # Idle windowed rates
+        r_idle_ps = node_range_sum(prefix_idle, t - w_short, t - 1) / w_short
+        r_idle_fs = node_range_sum(prefix_idle, t + 1, t + w_short) / w_short
+        r_idle_pl = node_range_sum(prefix_idle, t - w_long,  t - 1) / w_long
+        r_idle_fl = node_range_sum(prefix_idle, t + 1, t + w_long)  / w_long
+
+        # 2Q windowed rates
+        r_2q_ps = node_range_sum(prefix_2q, t - w_short, t - 1) / w_short
+        r_2q_fs = node_range_sum(prefix_2q, t + 1, t + w_short) / w_short
+        r_2q_pl = node_range_sum(prefix_2q, t - w_long,  t - 1) / w_long
+        r_2q_fl = node_range_sum(prefix_2q, t + 1, t + w_long)  / w_long
+
+        layer_pos = np.full(N, t / T_norm, dtype=np.float32)
+
+        x = np.stack([
+            is_idle_now, is_1q_now, is_2q_now,
+            r_1q_ps, r_1q_fs, r_1q_pl, r_1q_fl,
+            r_idle_ps, r_idle_fs, r_idle_pl, r_idle_fl,
+            r_2q_ps, r_2q_fs, r_2q_pl, r_2q_fl,
+            layer_pos,
+        ], axis=1)  # [N, 16]
+
+        # ---- Backbone edges ----
+        if P == 0:
+            edge_index = np.zeros((2, 0), dtype=np.int64)
+            edge_attr  = np.zeros((0, EDGE_FEAT_DIM), dtype=np.float32)
+            result.append((x, edge_index, edge_attr))
+            continue
+
+        # Pairs with any interaction in [t - W_long, t + W_long]
+        backbone_counts = edge_range_sum(t - w_long, t + w_long)  # [P]
+        active_mask     = backbone_counts > 0.0
+        active_idx      = np.where(active_mask)[0]
+
+        if len(active_idx) == 0:
+            edge_index = np.zeros((2, 0), dtype=np.int64)
+            edge_attr  = np.zeros((0, EDGE_FEAT_DIM), dtype=np.float32)
+            result.append((x, edge_index, edge_attr))
+            continue
+
+        # Edge features [E, 5]
+        active_now_vals = pair_arr[t, active_idx].astype(np.float32)  # 0 or 1
+        e_ps = edge_range_sum(t - w_short, t - 1)[active_idx] / w_short
+        e_fs = edge_range_sum(t + 1, t + w_short)[active_idx] / w_short
+        e_pl = edge_range_sum(t - w_long,  t - 1)[active_idx] / w_long
+        e_fl = edge_range_sum(t + 1, t + w_long) [active_idx] / w_long
+
+        ea_half = np.stack([active_now_vals, e_ps, e_fs, e_pl, e_fl], axis=1)  # [E, 5]
+
+        # Undirected: add both (u→v) and (v→u)
+        us = np.array([all_pairs[i][0] for i in active_idx], dtype=np.int64)
+        vs = np.array([all_pairs[i][1] for i in active_idx], dtype=np.int64)
+
+        edge_index = np.stack([
+            np.concatenate([us, vs]),
+            np.concatenate([vs, us]),
+        ], axis=0)                                          # [2, 2E]
+        edge_attr = np.concatenate([ea_half, ea_half], axis=0)  # [2E, 5]
+
+        result.append((x, edge_index, edge_attr))
+
+    return result
