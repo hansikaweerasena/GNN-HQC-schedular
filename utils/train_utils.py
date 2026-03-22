@@ -46,7 +46,8 @@ def train_step(
     h_seq, z_seq = evol_model(layer_data_list)   # lists of [N, gru_hidden_dim]
 
     # 2) Soft technology assignments
-    P_seq = cluster_module(h_seq)                # list of [N, K]
+    #    Pass layer graphs for neighbor-logit coordination in the clustering head.
+    P_seq = cluster_module(h_seq, graphs=layer_data_list)  # list of [N, K]
 
     # 3) Differentiable cost
     cost_out = total_cost_module(P_seq, segments, circuit)

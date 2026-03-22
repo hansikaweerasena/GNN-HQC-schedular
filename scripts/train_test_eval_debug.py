@@ -8,7 +8,7 @@ Pipeline per circuit:
   2. segment_circuit        — layer mode: one "segment" per layer (needed by TotalCost)
   3. build_layer_graph_arrays — build backbone graphs + windowed features (new input)
   4. EvolvingGNN            — MLP -> GATv2 -> GRU  =>  h_seq
-  5. SegmentClustering      — prototype clustering  =>  P_seq
+  5. SegmentClustering      — MLP proj -> cosine similarity -> neighbor coord -> softmax  =>  P_seq
   6. TotalCost              — differentiable cost   =>  scalar loss
   7. BPTT + Adam update
 
@@ -258,9 +258,13 @@ def main():
     ).to(device)
 
     cluster_module = SegmentClustering(
-        hidden_dim   = evol_model.rnn_hidden_dim,
-        num_clusters = K,
-        temperature  = CLUSTER_CFG["temperature"],
+        hidden_dim         = evol_model.rnn_hidden_dim,
+        num_clusters       = K,
+        proj_hidden_dim    = CLUSTER_CFG.get("proj_hidden_dim"),
+        temperature_init   = CLUSTER_CFG["temperature_init"],
+        temperature_min    = CLUSTER_CFG["temperature_min"],
+        temperature_gamma  = CLUSTER_CFG["temperature_gamma"],
+        neighbor_alpha_init = CLUSTER_CFG["neighbor_alpha_init"],
     ).to(device)
 
     total_cost_module = TotalCost(config).to(device)
@@ -283,17 +287,22 @@ def main():
         evol_model.eval()
         cluster_module.eval()
         h_seq, _ = evol_model(fixed_layer_data_list)
-        P_seq    = cluster_module(h_seq)
+        P_seq    = cluster_module(h_seq, graphs=fixed_layer_data_list)
         print("INIT P_start(q0, layer0) =", P_seq[0][0].cpu().numpy())
 
-    print("Pre-train prototypes mean:", cluster_module.head.cluster_prototypes.mean().item())
-    print("Pre-train prototypes std:",  cluster_module.head.cluster_prototypes.std().item())
+    print("Pre-train prototypes norm (should be ~1.0):",
+          cluster_module.head.cluster_prototypes.norm(dim=-1).mean().item())
+    print(f"Pre-train temperature: {cluster_module.head.temperature.item():.2f}")
+    print(f"Pre-train neighbor alpha: {cluster_module.head.alpha.item():.4f}")
 
     # ---- Training Loop ----
     train_losses, test_losses = [], []
 
     for epoch in tqdm(range(TRAIN_CFG["n_epochs"]), desc="Epochs"):
+        # Anneal both cost model and clustering head temperatures
         total_cost_module.set_epoch(epoch)
+        cluster_module.set_epoch(epoch)
+
         evol_model.train()
         cluster_module.train()
 
@@ -331,7 +340,7 @@ def main():
             h0 = h_seq[0]
             print(f"h0 mean: {h0.mean().item():.4f}  std: {h0.std().item():.4f}")
 
-            P_seq    = cluster_module(h_seq)
+            P_seq    = cluster_module(h_seq, graphs=fixed_layer_data_list)
             cost_out = total_cost_module(P_seq, fixed_segments, fixed_rep)
             fixed_loss = cost_out["total_cost"].item()
 
@@ -344,8 +353,13 @@ def main():
             P_mid   = P_seq[T // 2][0]
             P_end   = P_seq[-1][0]
 
+        # Log clustering head state alongside cost model state
+        head = cluster_module.head
         print(f"Epoch {epoch}: C_total={fixed_loss:.4f}, R_cap={fixed_cap:.6f}, "
               f"avg_cap_penalty={avg_cap_penalty:.6f}")
+        print(f"  cluster_T={head.temperature.item():.3f}, "
+              f"alpha={head.alpha.item():.4f}, "
+              f"cost_tau={total_cost_module.tau.item():.1f}")
         print(f"  layers_with_excess={int((fixed_excess > 0).sum())}/{len(fixed_excess)}")
         print("  P_start(q0, layer0) =", P_start.detach().cpu().numpy())
         print("  P_mid  (q0, layerM) =", P_mid.detach().cpu().numpy())
@@ -365,8 +379,9 @@ def main():
     torch.save(evol_model.state_dict(),    "evol_model_final.pt")
     torch.save(cluster_module.state_dict(), "cluster_head_final.pt")
 
-    print("Post-train prototypes mean:", cluster_module.head.cluster_prototypes.mean().item())
-    print("Post-train prototypes std:",  cluster_module.head.cluster_prototypes.std().item())
+    print(f"\nPost-train prototypes norm: {cluster_module.head.cluster_prototypes.norm(dim=-1).mean().item():.4f}")
+    print(f"Post-train temperature: {cluster_module.head.temperature.item():.3f}")
+    print(f"Post-train neighbor alpha: {cluster_module.head.alpha.item():.4f}")
 
     # ---- Plot ----
     plt.figure(figsize=(10, 4))

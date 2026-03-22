@@ -37,8 +37,26 @@ MODEL_CFG = {
 # ----------------------------
 # Clustering head parameters
 # ----------------------------
+# The clustering head converts GRU embeddings [N, H] into soft technology
+# assignments P_t [N, K] via:
+#   1. Per-qubit MLP projection (nonlinear feature space for assignment)
+#   2. Cosine similarity against L2-normalised prototypes
+#   3. Sparse neighbor-logit coordination (edge-restricted message passing)
+#   4. Temperature-scaled softmax with epoch annealing
 CLUSTER_CFG = {
-    "temperature": 5.0,
+    # Per-qubit MLP projection hidden dim (None = same as hidden_dim)
+    "proj_hidden_dim": None,
+
+    # Temperature annealing schedule: T(e) = max(T_min, T_init * gamma^e)
+    #   Early training: T_init=3.0 -> soft exploratory assignments
+    #   Late training:  T_min=0.5  -> sharp decisive assignments
+    "temperature_init":  3.0,
+    "temperature_min":   0.5,
+    "temperature_gamma": 0.95,
+
+    # Neighbor-logit coordination initial mixing weight (raw logit, sigmoid-bounded).
+    # 0.0 -> sigmoid(0)=0.5 initial mixing; learned during training.
+    "neighbor_alpha_init": 0.0,
 }
 
 # ----------------------------

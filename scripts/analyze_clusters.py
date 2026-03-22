@@ -1,6 +1,5 @@
 import os, sys
 from copy import deepcopy
-import inspect
 import json
 import numpy as np
 import torch
@@ -104,13 +103,16 @@ def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol
         heads=model_cfg["heads"],
     ).to(device)
 
-    # SegmentClustering: pass temperature only if your class supports it
-    cluster_kwargs = dict(hidden_dim=evol_model.rnn_hidden_dim, num_clusters=K)
-    sig = inspect.signature(SegmentClustering.__init__)
-    if "temperature" in sig.parameters:
-        cluster_kwargs["temperature"] = cluster_cfg["temperature"]
-
-    cluster_module = SegmentClustering(**cluster_kwargs).to(device)
+    # SegmentClustering: pass config-driven parameters
+    cluster_module = SegmentClustering(
+        hidden_dim          = evol_model.rnn_hidden_dim,
+        num_clusters        = K,
+        proj_hidden_dim     = cluster_cfg.get("proj_hidden_dim"),
+        temperature_init    = cluster_cfg.get("temperature_init", cluster_cfg.get("temperature", 3.0)),
+        temperature_min     = cluster_cfg.get("temperature_min", 0.5),
+        temperature_gamma   = cluster_cfg.get("temperature_gamma", 0.95),
+        neighbor_alpha_init = cluster_cfg.get("neighbor_alpha_init", 0.0),
+    ).to(device)
 
     evol_model.load_state_dict(torch.load(evol_ckpt, map_location=device))
     cluster_module.load_state_dict(torch.load(cluster_ckpt, map_location=device))
@@ -120,7 +122,7 @@ def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol
     # 6) Run model to get P_seq
     with torch.no_grad():
         h_seq, z_seq = evol_model(segment_data_list)   # list[T] of [N,H]
-        P_seq = cluster_module(h_seq)                  # list[T] of [N,K]
+        P_seq = cluster_module(h_seq, graphs=segment_data_list)  # list[T] of [N,K]
 
     # --- Cost + dashboard for SOFT schedule (keep your existing dashboard code) ---
     cost_soft = total_cost_module(P_seq, segments, rep, debug=False)
