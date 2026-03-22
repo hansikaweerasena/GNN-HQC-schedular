@@ -218,8 +218,15 @@ class SegmentStatsExtractor(nn.Module):
                 e_v = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
                 e_w = torch.tensor(weights, device=device, dtype=dtype)
 
-                # Average gamma across layers in this segment for each edge
-                # (use the last layer's gamma as representative — matches layer-wise segmentation)
+                # Use the last (and only) layer's gamma as representative.
+                # Invariant: segmentation=layer means exactly one layer per segment,
+                # so (end_idx - start_idx) == 1 always. If multi-layer segments are
+                # ever reintroduced, this must become a true average across all layers.
+                assert (end_idx - start_idx) == 1, (
+                    f"Segment {s} spans {end_idx - start_idx} layers but code assumes 1. "
+                    f"Multi-layer segments require averaging gamma across all layers in range "
+                    f"[{start_idx}, {end_idx})."
+                )
                 last_layer_idx = end_idx - 1
                 gamma_layer = gamma_tensor_data[last_layer_idx] if last_layer_idx >= 0 else {}
                 gamma_e = torch.tensor(
