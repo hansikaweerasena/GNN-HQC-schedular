@@ -328,7 +328,7 @@ def build_layer_graph_arrays(
             continue
 
         # Edge features [E, 5]
-        active_now_vals = pair_arr[t, active_idx].astype(np.float32)
+        active_now_vals = (pair_arr[t, active_idx] > 0.0).astype(np.float32)  # binary flag: 1 iff pair has any gate at layer t
         e_ps = edge_rate(t - w_short, t - 1)[active_idx]
         e_fs = edge_rate(t + 1, t + w_short)[active_idx]
         e_pl = edge_rate(t - w_long,  t - 1)[active_idx]
