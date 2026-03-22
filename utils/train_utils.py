@@ -14,13 +14,16 @@ def train_step(
     circuit,
     optimizer=None,
     capacity_penalty=None,
-) -> Tuple[float, torch.Tensor, float]:
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
-    One forward (+ optional backward) pass on a single circuit.
+    One forward pass on a single circuit. Does NOT call optimizer.step().
 
-    The model processes one PyG Data object per circuit layer. Truncated BPTT
-    is handled inside EvolvingGNN.forward() by periodically detaching the GRU
-    hidden state — no special chunking needed here.
+    The caller is responsible for accumulating loss tensors across circuits in
+    a batch and calling backward() + optimizer.step() once per batch. This
+    ensures a true batch gradient update rather than a per-circuit update.
+
+    For evaluation, pass optimizer=None and wrap in torch.no_grad(). The
+    returned loss will be a scalar tensor with no grad_fn in that case.
 
     Args:
         evol_model:        EvolvingGNN — produces h_seq from layer_data_list
@@ -29,11 +32,14 @@ def train_step(
         layer_data_list:   list of PyG Data objects, one per layer
         segments:          segment/layer objects expected by TotalCost
         circuit:           CircuitRepresentation
-        optimizer:         if None, forward-only (evaluation mode)
+        optimizer:         if None, sets eval mode; if provided, sets train mode.
+                           The actual zero_grad/backward/step are NOT performed
+                           here — the caller handles those after accumulation.
         capacity_penalty:  optional CapacityPenalty module
 
     Returns:
-        (loss_value, per_segment_total, cap_penalty_value)
+        (loss_tensor, per_segment_total, cap_penalty_value)
+        loss_tensor: differentiable scalar tensor (caller calls .backward())
     """
     if optimizer is not None:
         evol_model.train()
@@ -46,7 +52,6 @@ def train_step(
     h_seq, z_seq = evol_model(layer_data_list)   # lists of [N, gru_hidden_dim]
 
     # 2) Soft technology assignments
-    #    Pass layer graphs for neighbor-logit coordination in the clustering head.
     P_seq = cluster_module(h_seq, graphs=layer_data_list)  # list of [N, K]
 
     # 3) Differentiable cost
@@ -60,10 +65,4 @@ def train_step(
         loss = loss + cap_out["penalty"]
         cap_penalty_val = float(cap_out["penalty"].item())
 
-    # 5) Backward + update
-    if optimizer is not None:
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    return float(loss.item()), cost_out["per_segment_total"].detach(), cap_penalty_val
+    return loss, cost_out["per_segment_total"].detach(), cap_penalty_val
