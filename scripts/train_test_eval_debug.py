@@ -102,31 +102,55 @@ class CircuitDataset(Dataset):
         self.w_short            = w_short
         self.w_long             = w_long
         self.device             = device or torch.device("cpu")
-        self._cache             = {}  # idx -> (layer_data_list, segments, rep)
+        self._cache             = {}  # idx -> (layer_data_list_cpu, segments, rep)
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
         if idx in self._cache:
-            return self._cache[idx]
+            layer_data_list_cpu, segments, rep = self._cache[idx]
+            # Move to device on every access — tensors are stored on CPU to
+            # avoid pinning the entire dataset in VRAM for the training lifetime.
+            # On CPU-only runs this is a no-op.
+            if self.device.type == "cpu":
+                return layer_data_list_cpu, segments, rep
+            layer_data_list = [
+                Data(
+                    x          = d.x.to(self.device),
+                    edge_index = d.edge_index.to(self.device),
+                    edge_attr  = d.edge_attr.to(self.device),
+                )
+                for d in layer_data_list_cpu
+            ]
+            return layer_data_list, segments, rep
 
         qc  = self.provider.get(idx)
         rep = CircuitRepresentation(qc)
 
-        # segments still needed by TotalCost for gate counting
         segments, seg_ids = segment_circuit(
             rep.layers,
             mode=self.segment_mode,
             threshold=self.segment_threshold,
         )
 
-        # one graph per layer, tensors placed on device here — once, not per step
-        layer_data_list = build_layer_data_list(rep, self.w_short, self.w_long, self.device)
+        # Always build and cache on CPU — device placement happens at access time
+        layer_data_list_cpu = build_layer_data_list(rep, self.w_short, self.w_long,
+                                                    torch.device("cpu"))
 
-        result = (layer_data_list, segments, rep)
-        self._cache[idx] = result
-        return result
+        self._cache[idx] = (layer_data_list_cpu, segments, rep)
+
+        if self.device.type == "cpu":
+            return layer_data_list_cpu, segments, rep
+        layer_data_list = [
+            Data(
+                x          = d.x.to(self.device),
+                edge_index = d.edge_index.to(self.device),
+                edge_attr  = d.edge_attr.to(self.device),
+            )
+            for d in layer_data_list_cpu
+        ]
+        return layer_data_list, segments, rep
 
 
 def collate_fn(batch):
@@ -159,7 +183,7 @@ def evaluate_model(
                     optimizer=None,
                     capacity_penalty=capacity_penalty,
                 )
-                total_loss += loss
+                total_loss += loss.item()
                 total_cap  += cap_val
                 all_per_seg.append(per_seg.cpu().numpy())
 
@@ -310,22 +334,31 @@ def main():
         epoch_cap_penalty = 0.0
 
         for batch in train_loader:
-            batch_loss = 0.0
-            batch_cap  = 0.0
-            batch_count = 0
+            batch_loss_tensor = None   # accumulates differentiable tensors
+            batch_loss_float  = 0.0   # for logging only
+            batch_cap         = 0.0
+            batch_count       = 0
 
+            # Accumulate gradients across every circuit in the batch before
+            # stepping — this is a true batch update, not per-circuit updates.
+            optimizer.zero_grad()
             for layer_data_list, segments, rep in batch:
                 loss, per_seg, cap_val = train_step(
                     evol_model, cluster_module, total_cost_module,
                     layer_data_list, segments, rep, optimizer,
                     capacity_penalty=cap_penalty_module,
                 )
-                batch_loss  += loss
-                batch_cap   += cap_val
-                batch_count += 1
+                batch_loss_tensor = loss if batch_loss_tensor is None else batch_loss_tensor + loss
+                batch_loss_float += loss.item()
+                batch_cap        += cap_val
+                batch_count      += 1
 
-            epoch_train_loss  += batch_loss  / batch_count
-            epoch_cap_penalty += batch_cap   / batch_count
+            # Single optimizer step on the mean loss over the batch
+            (batch_loss_tensor / batch_count).backward()
+            optimizer.step()
+
+            epoch_train_loss  += batch_loss_float / batch_count
+            epoch_cap_penalty += batch_cap        / batch_count
 
         avg_train_loss  = epoch_train_loss  / len(train_loader)
         avg_cap_penalty = epoch_cap_penalty / len(train_loader)
