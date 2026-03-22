@@ -129,12 +129,11 @@ def test_neighbor_coordination():
     print("=" * 60)
 
     N, H, K = 6, 64, 2
-    head = ClusteringHead(hidden_dim=H, num_clusters=K, temperature_init=1.0)
+    head = ClusteringHead(hidden_dim=H, num_clusters=K, temperature_init=1.0,
+                          neighbor_alpha_init=0.8)
 
-    # Manually set alpha high to amplify the effect
-    with torch.no_grad():
-        head._alpha_logit.fill_(2.0)  # sigmoid(2) ≈ 0.88
-    print(f"  Alpha = {head.alpha.item():.4f}")
+    print(f"  Alpha = {head.alpha.item():.4f} (requested 0.8)")
+    assert abs(head.alpha.item() - 0.8) < 0.01, "Alpha init conversion broken"
 
     # Create embeddings where q0 strongly prefers tech 0, q1 prefers tech 1
     # q0 and q1 are connected — coordination should pull them closer
@@ -383,6 +382,72 @@ def test_set_epoch_forwarding():
 
 
 # =====================================================================
+# Test 11: Alpha init conversion (caller specifies alpha, stored as logit)
+# =====================================================================
+def test_alpha_init_conversion():
+    print("\n" + "=" * 60)
+    print("TEST 11: neighbor_alpha_init specifies actual alpha, not logit")
+    print("=" * 60)
+
+    test_cases = [0.1, 0.3, 0.5, 0.7, 0.9]
+    for desired_alpha in test_cases:
+        head = ClusteringHead(hidden_dim=64, num_clusters=2,
+                              neighbor_alpha_init=desired_alpha)
+        actual = head.alpha.item()
+        error = abs(actual - desired_alpha)
+        status = "✓" if error < 0.001 else "✗"
+        print(f"  {status} requested={desired_alpha:.1f}, got={actual:.4f}, error={error:.6f}")
+        assert error < 0.001, f"Alpha conversion failed: wanted {desired_alpha}, got {actual}"
+
+    print("  ✓ PASSED")
+
+
+# =====================================================================
+# Test 12: Convex blend preserves logit scale
+# =====================================================================
+def test_convex_blend_scale():
+    print("\n" + "=" * 60)
+    print("TEST 12: Convex blend preserves logit scale (no inflation)")
+    print("=" * 60)
+
+    N, H, K = 10, 64, 2
+    head = ClusteringHead(hidden_dim=H, num_clusters=K, temperature_init=1.0,
+                          neighbor_alpha_init=0.5)
+
+    h_t = torch.randn(N, H)
+
+    # Dense graph: all pairs connected
+    src = []
+    dst = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            src.append(i)
+            dst.append(j)
+    edge_index = torch.tensor([src, dst], dtype=torch.long)
+
+    # Get logits before softmax by hooking into internals
+    z = head.proj(h_t)
+    z_norm = F.normalize(z, dim=-1)
+    proto_norm = F.normalize(head.cluster_prototypes.detach(), dim=-1)
+    raw_logits = z_norm @ proto_norm.t()
+
+    # After neighbor coordination
+    refined = head._neighbor_coordinate(raw_logits, edge_index, N)
+
+    raw_range = (raw_logits.max() - raw_logits.min()).item()
+    refined_range = (refined.max() - refined.min()).item()
+
+    print(f"  Raw logit range:     {raw_range:.4f}")
+    print(f"  Refined logit range: {refined_range:.4f}")
+
+    # Convex blend should NOT inflate scale — refined range <= raw range
+    assert refined_range <= raw_range + 0.01, \
+        f"Convex blend inflated scale: {refined_range:.4f} > {raw_range:.4f}"
+
+    print("  ✓ PASSED — convex blend does not inflate logit scale")
+
+
+# =====================================================================
 # Main
 # =====================================================================
 if __name__ == "__main__":
@@ -400,6 +465,8 @@ if __name__ == "__main__":
     test_backward_compat()
     test_edge_cases()
     test_set_epoch_forwarding()
+    test_alpha_init_conversion()
+    test_convex_blend_scale()
 
     print("\n" + "=" * 60)
     print("  ALL TESTS PASSED")

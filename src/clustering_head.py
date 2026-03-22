@@ -17,10 +17,11 @@ Architecture per layer t:
 
   3. Sparse neighbor-logit coordination
      One round of edge-restricted message passing on the K-dimensional
-     logits. Each qubit's logits are refined by averaging its graph
-     neighbors' logits and adding a learned fraction (alpha). This gives
-     interacting qubits a direct short-circuit path to coordinate
-     co-assignment, complementing the longer GNN gradient path.
+     logits using a convex blend:
+         refined = (1 - alpha) * self_logits + alpha * neighbor_avg
+     Alpha is a learned parameter bounded in (0, 1) via sigmoid. The convex
+     form preserves logit scale (cosine values stay in [-1, 1]) so
+     temperature controls sharpness uniformly across the circuit.
 
   4. Temperature-scaled softmax with epoch annealing
      T_init (exploratory) -> T_min (sharp) via exponential decay.
@@ -33,7 +34,9 @@ Design choices:
     gradients are projected onto the tangent plane automatically.
   - Orthogonal prototype initialisation on the unit sphere ensures maximal
     initial separation and non-uniform starting logits.
-  - Neighbor mixing weight alpha is passed through sigmoid to stay in (0, 1).
+  - Neighbor mixing weight alpha stored as logit, sigmoid-bounded to (0, 1).
+    The caller specifies the desired initial alpha (e.g. 0.3 = 30% neighbor
+    influence); internally converted to logit = log(alpha / (1 - alpha)).
 """
 
 from __future__ import annotations
@@ -71,7 +74,7 @@ class ClusteringHead(nn.Module):
         temperature_init: float = 3.0,
         temperature_min: float = 0.5,
         temperature_gamma: float = 0.95,
-        neighbor_alpha_init: float = 0.0,
+        neighbor_alpha_init: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -104,9 +107,13 @@ class ClusteringHead(nn.Module):
         self.cluster_prototypes = nn.Parameter(proto)
 
         # --- Stage 3: Neighbor coordination ---
-        # Learned mixing weight, stored as raw logit; sigmoid applied in forward.
-        # Init at 0.0 -> sigmoid(0) = 0.5, giving moderate initial mixing.
-        self._alpha_logit = nn.Parameter(torch.tensor(float(neighbor_alpha_init)))
+        # Caller specifies initial alpha in (0, 1) — the fraction of a qubit's
+        # logits that comes from its neighbors.  Stored internally as a logit
+        # (inverse-sigmoid) so that sigmoid bounds the learned value to (0, 1).
+        # Clamp to avoid inf at boundaries.
+        alpha_clamped = max(1e-4, min(1.0 - 1e-4, float(neighbor_alpha_init)))
+        alpha_logit = torch.log(torch.tensor(alpha_clamped / (1.0 - alpha_clamped)))
+        self._alpha_logit = nn.Parameter(alpha_logit)
 
         # --- Stage 4: Temperature annealing ---
         self._temperature_init = temperature_init
@@ -157,14 +164,17 @@ class ClusteringHead(nn.Module):
         N: int,
     ) -> torch.Tensor:
         """
-        One round of sparse logit averaging over graph neighbors.
+        One round of sparse convex blending over graph neighbors.
 
         For each qubit u with neighbors {v1, v2, ...}:
             neighbor_avg[u] = mean(logits[vi])
-            logits[u] += alpha * neighbor_avg[u]
+            refined[u] = (1 - alpha) * logits[u] + alpha * neighbor_avg[u]
 
-        Only qubits with at least one neighbor are affected.
-        Isolated qubits keep their original logits unchanged.
+        Convex blend preserves logit scale: if cosine inputs are in [-1, 1],
+        the output stays in [-1, 1]. This avoids fighting the temperature
+        schedule with implicit scale inflation.
+
+        Isolated qubits (no neighbors) keep their original logits unchanged.
 
         Args:
             logits:     [N, K]
@@ -192,14 +202,15 @@ class ClusteringHead(nn.Module):
         neighbor_sum.index_add_(0, src, logits[dst])
         neighbor_count.index_add_(0, src, ones)
 
-        # Average (isolated qubits: count=0 -> no change)
-        has_neighbors = neighbor_count > 0                         # [N, 1]
+        # Average (isolated qubits: count=0 -> skip via mask)
+        has_neighbors = (neighbor_count > 0).float()               # [N, 1]
         neighbor_avg = neighbor_sum / neighbor_count.clamp(min=1)  # [N, K]
 
-        # Mix: only add where qubit has neighbors
+        # Convex blend: preserves logit scale in [-1, 1]
+        # Isolated qubits: mask ensures they keep original logits (alpha term zeroed)
         alpha = self.alpha  # scalar in (0, 1)
-        refinement = alpha * neighbor_avg * has_neighbors.float()
-        return logits + refinement
+        blended = (1.0 - alpha) * logits + alpha * neighbor_avg
+        return torch.where(has_neighbors.bool().expand_as(logits), blended, logits)
 
     def set_epoch(self, epoch: int) -> None:
         """
@@ -245,7 +256,7 @@ class SegmentClustering(nn.Module):
         temperature_init: float = 3.0,
         temperature_min: float = 0.5,
         temperature_gamma: float = 0.95,
-        neighbor_alpha_init: float = 0.0,
+        neighbor_alpha_init: float = 0.1,
     ):
         super().__init__()
         self.head = ClusteringHead(

@@ -54,9 +54,11 @@ CLUSTER_CFG = {
     "temperature_min":   0.5,
     "temperature_gamma": 0.95,
 
-    # Neighbor-logit coordination initial mixing weight (raw logit, sigmoid-bounded).
-    # 0.0 -> sigmoid(0)=0.5 initial mixing; learned during training.
-    "neighbor_alpha_init": 0.0,
+    # Neighbor-logit coordination initial mixing weight.
+    # Specifies the actual alpha value in (0, 1): fraction of a qubit's logits
+    # that comes from its neighbors.  0.1 = 10% neighbor influence at init.
+    # Stored internally as logit and learned during training.
+    "neighbor_alpha_init": 0.1,
 }
 
 # ----------------------------
