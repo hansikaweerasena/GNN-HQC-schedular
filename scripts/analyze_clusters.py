@@ -1,3 +1,5 @@
+# analyze_clusters.py
+
 import os, sys
 from copy import deepcopy
 import json
@@ -11,7 +13,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.circuit_sources import build_provider
 from src.circuit_representation import CircuitRepresentation
 from src.circuit_segmentation import segment_circuit
-from src.qubit_interaction_graph import build_segment_graph_arrays
+from src.qubit_interaction_graph import (
+    build_layer_graph_arrays,
+    compute_window_sizes_from_config,
+    NODE_FEAT_DIM,
+    EDGE_FEAT_DIM,
+)
+from src.inference_utils import enforce_capacity_sequence
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from utils.circuit_visualization import (
@@ -25,15 +33,17 @@ from utils.plot_utils import compute_drivers, plot_cost_dashboard
 from utils.print_utils import print_run_config_analyze
 from utils.cost_config_reader import load_scheduler_cfg
 
-def build_segment_data_list(rep, segments):
-    per_segment_graphs = build_segment_graph_arrays(rep, segments)
-    segment_data_list = []
-    for seg_id, x_s, edge_index_s, edge_attr_s in per_segment_graphs:
-        x_t  = torch.tensor(x_s, dtype=torch.float32)
-        ei_t = torch.tensor(edge_index_s, dtype=torch.long)
-        ea_t = torch.tensor(edge_attr_s, dtype=torch.float32)
-        segment_data_list.append(Data(x=x_t, edge_index=ei_t, edge_attr=ea_t))
-    return segment_data_list
+def build_layer_data_list(rep, w_short: int, w_long: int, device="cpu"):
+    """Build one PyG Data object per circuit layer — matches the training pipeline exactly."""
+    arrays = build_layer_graph_arrays(rep, w_short, w_long)
+    return [
+        Data(
+            x          = torch.tensor(x_np,  dtype=torch.float32).to(device),
+            edge_index = torch.tensor(ei_np, dtype=torch.long).to(device),
+            edge_attr  = torch.tensor(ea_np, dtype=torch.float32).to(device),
+        )
+        for x_np, ei_np, ea_np in arrays
+    ]
 
 
 def compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_index, device="cpu"):
@@ -51,7 +61,7 @@ def compute_total_cost_for_fixed_tech(total_cost_module, segments, rep, tech_ind
     return out["total_cost"].item()
 
 
-def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device="cpu"):
+def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, w_short, w_long, config, device="cpu"):
     src_name = circuit_cfg["name"]
     print(f"\n=== circuit_source={src_name} | seed={seed} ===")
 
@@ -87,20 +97,21 @@ def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol
     best_k = min(range(K), key=lambda k: costs_all[k])
     best = costs_all[best_k]
 
-    # 4) Build segment graphs
-    segment_data_list = build_segment_data_list(rep, segments)
+    # 4) Build layer graphs (one per circuit layer — matches training pipeline)
+    layer_data_list = build_layer_data_list(rep, w_short, w_long, device=device)
 
-    # 5) Recreate models and load weights (from config)
-    in_dim_node = segment_data_list[0].x.size(1)
-    in_dim_edge = segment_data_list[0].edge_attr.size(1) if segment_data_list[0].edge_attr.numel() > 0 else 0
-
+    # 5) Recreate models and load weights
     evol_model = EvolvingGNN(
-        in_dim_node=in_dim_node,
-        in_dim_edge=in_dim_edge,
-        gnn_hidden_dim=model_cfg["gnn_hidden_dim"],
-        gnn_out_dim=model_cfg["gnn_out_dim"],
-        rnn_hidden_dim=model_cfg["rnn_hidden_dim"],
-        heads=model_cfg["heads"],
+        node_feat_dim  = NODE_FEAT_DIM,
+        edge_feat_dim  = EDGE_FEAT_DIM,
+        mlp_hidden_dim = model_cfg["mlp_hidden_dim"],
+        mlp_out_dim    = model_cfg["mlp_out_dim"],
+        gnn_out_dim    = model_cfg["gnn_out_dim"],
+        gru_hidden_dim = model_cfg["gru_hidden_dim"],
+        heads          = model_cfg["heads"],
+        dropout        = model_cfg.get("dropout", 0.1),
+        bptt_steps     = model_cfg.get("bptt_steps", 3),
+        activation     = model_cfg.get("activation", "relu"),
     ).to(device)
 
     # SegmentClustering: pass config-driven parameters
@@ -121,8 +132,8 @@ def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol
 
     # 6) Run model to get P_seq
     with torch.no_grad():
-        h_seq, z_seq = evol_model(segment_data_list)   # list[T] of [N,H]
-        P_seq = cluster_module(h_seq, graphs=segment_data_list)  # list[T] of [N,K]
+        h_seq, z_seq = evol_model(layer_data_list)
+        P_seq = cluster_module(h_seq, graphs=layer_data_list)
 
     # --- Cost + dashboard for SOFT schedule (keep your existing dashboard code) ---
     cost_soft = total_cost_module(P_seq, segments, rep, debug=False)
@@ -135,14 +146,22 @@ def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol
         save_path_prefix=None,
     )
 
-    # 7) Stack soft assignments: [T, N, K]
+    # 7) Stack soft assignments for display: [T, N, K]
     T = len(P_seq)
     N = P_seq[0].size(0)
-    P_stack = torch.stack(P_seq, dim=0)  # [T, N, K]
 
-    # 8) Hard assignment via argmax
-    hard_idx = P_stack.argmax(dim=2)  # [T, N]
-    hard_np = hard_idx.cpu().numpy()
+    # 8) Hard assignment via capacity-feasible inference repair
+    # Simple argmax is NOT used here — it can produce infeasible schedules where
+    # a technology is assigned more qubits than its capacity allows.
+    # enforce_capacity_sequence repairs violations by reassigning the least-confident
+    # qubits to the best technology with remaining capacity.
+    caps = torch.tensor(
+        [float(t["capacity"]["max_qubits"]) for t in config["techs"]],
+        dtype=torch.float32,
+        device=device,
+    )
+    hard_assignments = enforce_capacity_sequence(P_seq, caps)  # list of [N] int tensors
+    hard_np = torch.stack(hard_assignments, dim=0).cpu().numpy()  # [T, N]
 
     plt.figure(figsize=(6, 4))
     plt.imshow(hard_np.T, aspect="auto", origin="lower", vmin=0, vmax=K-1, cmap="tab20")
@@ -150,14 +169,14 @@ def analyze_circuit(seed, circuit_cfg, dataset_cfg, model_cfg, cluster_cfg, evol
     cbar.ax.set_yticklabels(tech_names)
     cbar.set_label("Technology")
     plt.xlabel("Segment index"); plt.ylabel("Qubit index")
-    plt.title(f"Hard assignments (argmax) ({src_name}, seed={seed})")
+    plt.title(f"Hard assignments - capacity feasible ({src_name}, seed={seed})")
     plt.tight_layout(); plt.show()
 
-    # 9) Build one-hot P_seq from hard assignments
+    # 9) Build one-hot P_seq from capacity-feasible hard assignments
     P_seq_hard = []
-    for t in range(T):
+    for t_idx in range(T):
         P_t = torch.zeros(N, K, dtype=torch.float32, device=device)
-        idx = hard_idx[t].to(device)
+        idx = hard_assignments[t_idx].to(device)
         P_t[torch.arange(N, device=device), idx] = 1.0
         P_seq_hard.append(P_t)
 
@@ -193,6 +212,9 @@ def main():
     K = len(config["techs"])
     tech_names = [t.get("name", f"tech{k}") for k, t in enumerate(config["techs"])]
 
+    w_short, w_long = compute_window_sizes_from_config(config)
+    print(f"Window sizes: W_short={w_short}, W_long={w_long}")
+
     total_cost_module = TotalCost(config).to(device)
 
     print_run_config_analyze(
@@ -208,7 +230,7 @@ def main():
     # If you want ROI / fixed-seed analysis:
     fixed_seeds = [200, 30]
     for seed in fixed_seeds:
-        analyze_circuit(seed, CIRCUIT_SOURCE_CFG, DATASET_CFG, MODEL_CFG, CLUSTER_CFG, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, device=device)
+        analyze_circuit(seed, CIRCUIT_SOURCE_CFG, DATASET_CFG, MODEL_CFG, CLUSTER_CFG, evol_ckpt, cluster_ckpt, total_cost_module, K, tech_names, w_short, w_long, config, device=device)
 
     # Optional: keep your old ratio sweep when source is random_custom
     # ratios = [0.1, 0.5, 0.9, 1.0]
