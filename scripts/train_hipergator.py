@@ -619,6 +619,7 @@ def main():
 
         epoch_train_loss  = 0.0
         epoch_cap_penalty = 0.0
+        epoch_grad_norm   = 0.0
 
         for batch in train_loader:
             batch_loss_tensor = None
@@ -643,6 +644,15 @@ def main():
                 batch_count      += 1
 
             (batch_loss_tensor / batch_count).backward()
+
+            # Compute grad norm AFTER backward, BEFORE optimizer step
+            # so grads are populated. Cheap: just reads already-computed grads.
+            _gnorm_sq = 0.0
+            for _p in list(evol_model.parameters()) + list(cluster_module.parameters()):
+                if _p.grad is not None:
+                    _gnorm_sq += _p.grad.data.norm(2).item() ** 2
+            epoch_grad_norm += _gnorm_sq ** 0.5
+
             optimizer.step()
 
             epoch_train_loss  += batch_loss_float / batch_count
@@ -650,6 +660,7 @@ def main():
 
         avg_train  = epoch_train_loss  / len(train_loader)
         avg_cap    = epoch_cap_penalty / len(train_loader)
+        avg_gnorm  = epoch_grad_norm   / len(train_loader)
         train_losses.append(avg_train)
         cap_penalty_history.append(avg_cap)
 
@@ -658,6 +669,7 @@ def main():
         do_eval = (epoch % eval_every == 0) or is_last
 
         test_loss = float("nan")
+        test_cap  = float("nan")   # default for non-eval epochs
         if do_eval:
             test_loss, test_cap = evaluate_model(
                 evol_model, cluster_module, total_cost_module,
@@ -666,14 +678,22 @@ def main():
             test_losses.append(test_loss)
             test_epochs.append(epoch)
 
+        # Learned parameter health — cheap scalar reads, no grad needed
+        alpha_val  = cluster_module.head.alpha.item()
+        proto_norm = cluster_module.head.cluster_prototypes.norm(dim=-1).mean().item()
+
         # ---- Per-epoch log line ----
         print(
             f"[E {epoch:03d}/{n_epochs}] "
             f"train={avg_train:.4f}  "
             f"test={test_loss:.4f}  "
-            f"cap={avg_cap:.6f}  "
+            f"cap_tr={avg_cap:.4f}  "
+            f"cap_te={test_cap:.4f}  "
             f"T={cluster_T:.3f}  "
-            f"tau={cost_tau:.1f}",
+            f"tau={cost_tau:.1f}  "
+            f"alpha={alpha_val:.3f}  "
+            f"gnorm={avg_gnorm:.3f}  "
+            f"pnorm={proto_norm:.3f}",
             flush=True,
         )
 
