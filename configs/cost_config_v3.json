@@ -55,6 +55,6 @@
 
   "capacity_penalty": {
     "beta": 4,
-    "safety_factor": 5.0
+    "safety_factor": 10.0
   }
 }
