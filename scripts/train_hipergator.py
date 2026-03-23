@@ -478,12 +478,14 @@ def main():
         shuffle=True, collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda" and num_workers > 0),
+        persistent_workers=(num_workers > 0),
     )
     test_loader = DataLoader(
         test_dataset, batch_size=TRAIN_CFG["batch_size"],
         shuffle=False, collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda" and num_workers > 0),
+        persistent_workers=(num_workers > 0),
     )
     log(f"Dataset    : train={len(train_dataset)}, test={len(test_dataset)}, "
         f"batch={TRAIN_CFG['batch_size']}, num_workers={num_workers}")
