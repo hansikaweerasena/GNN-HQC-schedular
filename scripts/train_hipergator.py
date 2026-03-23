@@ -61,7 +61,7 @@ from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost, CapacityPenalty
 from utils.train_utils import train_step
-from utils.cost_config_reader import load_cost_config, load_scheduler_cfg
+from utils.cost_config_reader import load_cost_config, get_cost_config_path, load_scheduler_cfg
 from utils.print_utils import print_run_config
 
 
@@ -303,8 +303,12 @@ def save_model_arch_params(evol_model: EvolvingGNN, cluster_module: SegmentClust
     log(f"Saved model_arch_params.json -> {path}")
 
 
-def save_config_snapshots(sched_cfg_module_path: str, cost_cfg_path: str, run_dir: str):
-    """Copy both config files verbatim into the run directory."""
+def save_config_snapshots(sched_cfg_module_path: str, cost_cfg_resolved: str, run_dir: str):
+    """
+    Copy both config files verbatim into the run directory.
+    cost_cfg_resolved must be the absolute path already returned by load_cost_config —
+    not the raw CLI arg, which may be just a filename with no directory component.
+    """
     # scheduler config: resolve module path to file path
     module_rel = sched_cfg_module_path.replace(".", os.sep) + ".py"
     found = None
@@ -319,11 +323,11 @@ def save_config_snapshots(sched_cfg_module_path: str, cost_cfg_path: str, run_di
     else:
         log(f"WARNING: Could not locate scheduler config file for snapshot ({module_rel})")
 
-    if os.path.isfile(cost_cfg_path):
-        shutil.copy2(cost_cfg_path, os.path.join(run_dir, "cost_config_snapshot.json"))
+    if os.path.isfile(cost_cfg_resolved):
+        shutil.copy2(cost_cfg_resolved, os.path.join(run_dir, "cost_config_snapshot.json"))
         log(f"Saved cost_config_snapshot.json")
     else:
-        log(f"WARNING: Could not locate cost config file for snapshot ({cost_cfg_path})")
+        log(f"WARNING: Could not locate cost config file for snapshot ({cost_cfg_resolved})")
 
 
 # =============================================================================
@@ -425,8 +429,9 @@ def main():
         log("*** DRY RUN MODE — reduced dataset and 2 epochs ***")
 
     # ---- Cost config ----
-    config   = load_cost_config(args.cost_cfg)
-    w_short, w_long = compute_window_sizes_from_config(config)
+    config            = load_cost_config(args.cost_cfg)
+    cost_cfg_resolved = get_cost_config_path(args.cost_cfg)  # absolute path for snapshot copy
+    w_short, w_long   = compute_window_sizes_from_config(config)
     K = len(config["techs"])
 
     derived = {
@@ -521,7 +526,7 @@ def main():
     )
 
     # ---- Save config snapshots and arch params ----
-    save_config_snapshots(args.sched_cfg, args.cost_cfg, run_dir)
+    save_config_snapshots(args.sched_cfg, cost_cfg_resolved, run_dir)
     # arch params saved after training (captures learned alpha)
 
     # ---- Metric history (for plots) ----

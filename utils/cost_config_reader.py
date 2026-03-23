@@ -105,6 +105,42 @@ def _validate(cfg: Dict[str, Any]) -> None:
         raise ValueError("gate_names.measure must be a non-empty list of strings.")
 
 
+# ---------------------------------------------------------------------------
+# Path helper — single source of truth for cost config resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_cost_config_path(filename: str) -> Path:
+    """
+    Resolve a cost config filename to an absolute Path.
+    Mirrors exactly the logic in load_cost_config so both functions
+    always agree on where the file lives.
+    """
+    p = Path(os.path.join(os.path.dirname(__file__), "..", "configs", filename))
+    if p.suffix == "":
+        p = p.with_suffix(".json")
+    return p.resolve()
+
+
+def get_cost_config_path(filename: str) -> str:
+    """
+    Return the absolute path to a cost config file as a string.
+
+    Uses the same resolution logic as load_cost_config so the two
+    functions are always consistent.  Does NOT load or validate the
+    file contents.
+
+    Raises FileNotFoundError if the resolved path does not exist.
+    """
+    p = _resolve_cost_config_path(filename)
+    if not p.exists():
+        raise FileNotFoundError(f"Cost config not found: {p}")
+    return str(p)
+
+
+# ---------------------------------------------------------------------------
+# Main loader — unchanged behaviour, all existing call sites unaffected
+# ---------------------------------------------------------------------------
+
 def load_cost_config(
     filename: str,
     *,
@@ -117,11 +153,7 @@ def load_cost_config(
     - If relative: resolve under `data_dir` (defaults to ../data relative to src/).
     - If filename has no suffix, '.json' is appended.
     """
-    filename = os.path.join(os.path.dirname(__file__), "..", "configs", filename)
-    p = Path(filename)
-
-    if p.suffix == "":
-        p = p.with_suffix(".json")
+    p = _resolve_cost_config_path(filename)
 
     if not p.is_absolute():
         base = Path(data_dir) if data_dir is not None else _default_data_dir()
