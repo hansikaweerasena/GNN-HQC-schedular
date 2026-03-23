@@ -473,22 +473,54 @@ def main():
     # num_workers from config — on HiPerGator set to 4 or SLURM_CPUS_PER_TASK-1
     num_workers = int(TRAIN_CFG.get("num_workers", 0))
 
+    # pin_memory disabled: the B200's PCIe bandwidth makes the async-transfer
+    # benefit negligible, and pinning opens one /dev/shm fd per tensor which
+    # exhausts the OS default of 1024 open files within the first few batches
+    # (7 workers × prefetch × 80 layers × 3 tensors >> 1024).
     train_loader = DataLoader(
         train_dataset, batch_size=TRAIN_CFG["batch_size"],
         shuffle=True, collate_fn=collate_fn,
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda" and num_workers > 0),
+        pin_memory=False,
         persistent_workers=(num_workers > 0),
     )
     test_loader = DataLoader(
         test_dataset, batch_size=TRAIN_CFG["batch_size"],
         shuffle=False, collate_fn=collate_fn,
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda" and num_workers > 0),
+        pin_memory=False,
         persistent_workers=(num_workers > 0),
     )
     log(f"Dataset    : train={len(train_dataset)}, test={len(test_dataset)}, "
         f"batch={TRAIN_CFG['batch_size']}, num_workers={num_workers}")
+
+    # ---- Pre-warm dataset cache (fix for num_workers > 0 on Linux/HiPerGator) ----
+    # DataLoader workers are created via os.fork(). Forked children inherit the
+    # parent's memory pages (copy-on-write), so a cache populated HERE — in the
+    # main process, before the first DataLoader iteration — is visible to all
+    # workers at zero extra cost. Without this, each worker starts with an empty
+    # cache and regenerates every circuit from scratch every epoch (~6 min/epoch).
+    # With this, circuit generation happens exactly once; epoch 2+ costs only GNN
+    # forward/backward time.
+    # NOTE: only works with fork-based multiprocessing (Linux default). Safe on
+    # HiPerGator. Would need rework if start method is ever changed to "spawn".
+    if num_workers > 0:
+        log("Pre-warming dataset cache in main process (fork-safe, runs once)...")
+        t_warm = time.time()
+        n_train = len(train_dataset)
+        n_test  = len(test_dataset)
+        for i in range(n_train):
+            train_dataset[i]
+            if (i + 1) % 100 == 0 or (i + 1) == n_train:
+                log(f"  train {i+1}/{n_train} ...")
+        for i in range(n_test):
+            test_dataset[i]
+            if (i + 1) % 50 == 0 or (i + 1) == n_test:
+                log(f"  test  {i+1}/{n_test} ...")
+        log(f"Cache warm-up done in {(time.time() - t_warm)/60:.1f} min — "
+            f"all subsequent epochs will skip circuit generation entirely.")
+    else:
+        log("num_workers=0: cache will populate on first epoch (no pre-warm needed).")
 
     # ---- Build models ----
     evol_model = EvolvingGNN(

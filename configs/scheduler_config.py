@@ -78,7 +78,7 @@ TRAIN_CFG = {
     # DataLoader parallelism
     # 0 = single-process (safe everywhere, required on some Windows configs)
     # 4 = recommended for HiPerGator (set <= SLURM_CPUS_PER_TASK - 1)
-    "num_workers":      7,
+    "num_workers":      3,
 
     # different seed bases => no overlap between train/test
     "seed_base_train": 42,
