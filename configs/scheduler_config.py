@@ -68,7 +68,7 @@ TRAIN_CFG = {
     "n_samples_train": 800,
     "n_samples_test": 200,
     "batch_size": 16,
-    "n_epochs": 50,
+    "n_epochs": 150,
     "lr": 1e-4,
 
     # Evaluation and checkpointing cadence
@@ -82,7 +82,7 @@ TRAIN_CFG = {
 
     # different seed bases => no overlap between train/test
     "seed_base_train": 42,
-    "seed_base_test": 1000,
+    "seed_base_test": 10000,
 }
 
 # ----------------------------
