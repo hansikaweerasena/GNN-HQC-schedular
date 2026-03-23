@@ -1,6 +1,6 @@
-# utils/train_utils.py
+# src/train_utils.py
 
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch_geometric.data import Data
 
@@ -13,29 +13,32 @@ def train_step(
     segments,
     circuit,
     training: bool = True,
-    optimizer=None,   # kept for backward compatibility — not used in this function
+    optimizer=None,          # kept for backward compat — not used here
     capacity_penalty=None,
+    precomp_stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
-    One forward pass on a single circuit.
+    One forward pass on a single circuit. Does NOT call optimizer.step().
 
-    Does NOT call optimizer.zero_grad / backward / optimizer.step.
-    The caller accumulates loss tensors across circuits in a batch and steps once.
+    The caller is responsible for accumulating loss tensors across circuits in
+    a batch and calling backward() + optimizer.step() once per batch. This
+    ensures a true batch gradient update rather than a per-circuit update.
 
     Args:
         evol_model:        EvolvingGNN — produces h_seq from layer_data_list
         cluster_module:    SegmentClustering — maps h_seq -> P_seq
         total_cost_module: TotalCost — differentiable cost given P_seq
-        layer_data_list:   list of PyG Data objects, one per layer (on correct device)
+        layer_data_list:   list of PyG Data objects, one per layer
         segments:          segment/layer objects expected by TotalCost
         circuit:           CircuitRepresentation
-        training:          True  -> set both modules to train mode
-                           False -> set both modules to eval mode
-                           Caller controls mode explicitly — no implicit inference
-                           from optimizer presence.
-        optimizer:         Unused. Accepted for backward compatibility with old call
-                           sites that pass optimizer=None for eval. Ignored here.
+        training:          if True, sets train mode; False sets eval mode.
+        optimizer:         legacy param, unused — kept for backward compat.
         capacity_penalty:  optional CapacityPenalty module
+        precomp_stats:     pre-computed CPU stats dict from
+                           SegmentStatsExtractor.compute_stats_cpu(), stored in
+                           the dataset cache. When provided, TotalCost skips the
+                           expensive NetworkX/BFS computation entirely and just
+                           transfers tensors to device. Pass None to recompute.
 
     Returns:
         (loss_tensor, per_segment_total, cap_penalty_value)
@@ -54,8 +57,8 @@ def train_step(
     # 2) Soft technology assignments
     P_seq = cluster_module(h_seq, graphs=layer_data_list)  # list of [N, K]
 
-    # 3) Differentiable cost
-    cost_out = total_cost_module(P_seq, segments, circuit)
+    # 3) Differentiable cost — precomp_stats bypasses SegmentStatsExtractor
+    cost_out = total_cost_module(P_seq, segments, circuit, precomp_stats=precomp_stats)
     loss = cost_out["total_cost"]
 
     # 4) Optional capacity regulariser

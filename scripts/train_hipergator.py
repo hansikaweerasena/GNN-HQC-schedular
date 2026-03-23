@@ -59,7 +59,7 @@ from src.qubit_interaction_graph import (
 )
 from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
-from src.cost_function import TotalCost, CapacityPenalty
+from src.cost_function import TotalCost, CapacityPenalty, SegmentStatsExtractor
 from utils.train_utils import train_step
 from utils.cost_config_reader import load_cost_config, get_cost_config_path, load_scheduler_cfg
 from utils.print_utils import print_run_config
@@ -166,6 +166,12 @@ class CircuitDataset(Dataset):
     Always builds and caches tensors on CPU.
     Device transfer is the caller's responsibility (see transfer_layer_data_list).
     This is required to support num_workers > 0 in DataLoader.
+
+    If stats_extractor is provided, segment stats (gamma scoring, gate counts,
+    edge tensors) are pre-computed on CPU during __getitem__ and stored in the
+    cache alongside the circuit. This eliminates the dominant per-forward-pass
+    cost: NetworkX BFS, Jaccard similarity, and dense scoring loops — all pure
+    Python and re-run on every circuit every epoch without pre-computation.
     """
 
     def __init__(
@@ -176,6 +182,7 @@ class CircuitDataset(Dataset):
         segment_threshold: float,
         w_short: int,
         w_long: int,
+        stats_extractor=None,
     ):
         self.provider          = provider
         self.n_samples         = int(n_samples)
@@ -183,6 +190,7 @@ class CircuitDataset(Dataset):
         self.segment_threshold = float(segment_threshold)
         self.w_short           = w_short
         self.w_long            = w_long
+        self.stats_extractor   = stats_extractor   # SegmentStatsExtractor | None
         self._cache            = {}
 
     def __len__(self):
@@ -204,7 +212,14 @@ class CircuitDataset(Dataset):
         # Always build on CPU
         layer_data_list = build_layer_data_list_cpu(rep, self.w_short, self.w_long)
 
-        item = (layer_data_list, segments, rep)
+        # Pre-compute segment stats on CPU (eliminates NetworkX/BFS per forward pass)
+        stats_cpu = None
+        if self.stats_extractor is not None:
+            stats_cpu = self.stats_extractor.compute_stats_cpu(
+                segments, rep, N=rep.num_qubits,
+            )
+
+        item = (layer_data_list, segments, rep, stats_cpu)
         self._cache[idx] = item
         return item
 
@@ -226,13 +241,14 @@ def evaluate_model(model, cluster_module, cost_module, test_loader, device,
 
     with torch.no_grad():
         for batch in test_loader:
-            for layer_data_list_cpu, segments, rep in batch:
+            for layer_data_list_cpu, segments, rep, stats_cpu in batch:
                 layer_data_list = transfer_layer_data_list(layer_data_list_cpu, device)
                 loss, _, cap_val = train_step(
                     model, cluster_module, cost_module,
                     layer_data_list, segments, rep,
                     training=False,
                     capacity_penalty=capacity_penalty,
+                    precomp_stats=stats_cpu,
                 )
                 total_loss += loss.item()
                 total_cap  += cap_val
@@ -455,19 +471,27 @@ def main():
     train_provider = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_train"])
     test_provider  = build_provider(CIRCUIT_SOURCE_CFG, seed_base=TRAIN_CFG["seed_base_test"])
 
+    # Build stats_extractor before datasets so it can be passed in for pre-computation.
+    # SegmentStatsExtractor only needs the cost config (tech profiles, gate names) —
+    # it does NOT need the full TotalCost module and can be constructed here cheaply.
+    stats_extractor = SegmentStatsExtractor(config)
+    log("SegmentStatsExtractor built — will pre-compute gamma/gate stats during warm-up.")
+
     train_dataset = CircuitDataset(
         train_provider,
-        n_samples       = TRAIN_CFG["n_samples_train"],
-        segment_mode    = DATASET_CFG["segmentation_mode"],
+        n_samples         = TRAIN_CFG["n_samples_train"],
+        segment_mode      = DATASET_CFG["segmentation_mode"],
         segment_threshold = DATASET_CFG["segment_threshold"],
         w_short=w_short, w_long=w_long,
+        stats_extractor=stats_extractor,
     )
     test_dataset = CircuitDataset(
         test_provider,
-        n_samples       = TRAIN_CFG["n_samples_test"],
-        segment_mode    = DATASET_CFG["segmentation_mode"],
+        n_samples         = TRAIN_CFG["n_samples_test"],
+        segment_mode      = DATASET_CFG["segmentation_mode"],
         segment_threshold = DATASET_CFG["segment_threshold"],
         w_short=w_short, w_long=w_long,
+        stats_extractor=stats_extractor,
     )
 
     # num_workers from config — on HiPerGator set to 4 or SLURM_CPUS_PER_TASK-1
@@ -603,13 +627,14 @@ def main():
             batch_count       = 0
 
             optimizer.zero_grad()
-            for layer_data_list_cpu, segments, rep in batch:
+            for layer_data_list_cpu, segments, rep, stats_cpu in batch:
                 layer_data_list = transfer_layer_data_list(layer_data_list_cpu, device)
                 loss, _, cap_val = train_step(
                     evol_model, cluster_module, total_cost_module,
                     layer_data_list, segments, rep,
                     training=True,
                     capacity_penalty=cap_penalty_module,
+                    precomp_stats=stats_cpu,
                 )
                 batch_loss_tensor = loss if batch_loss_tensor is None \
                     else batch_loss_tensor + loss

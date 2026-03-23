@@ -243,6 +243,27 @@ class SegmentStatsExtractor(nn.Module):
         self._cached_val = stats
         return stats
 
+    def compute_stats_cpu(self, segments, circuit, N: int) -> Dict[str, Any]:
+        """
+        Compute full segment stats on CPU/float32.
+
+        Intended for dataset pre-warming: call once per circuit during
+        CircuitDataset warm-up and store the result alongside the cached item.
+        The result is then passed into TotalCost.forward() as `precomp_stats`,
+        which skips this extractor entirely and just does a device transfer —
+        eliminating the dominant per-epoch cost (NetworkX BFS, Jaccard, etc.).
+
+        Device is always CPU regardless of the training device; the caller
+        (transfer_stats_to_device) handles the GPU move at forward time.
+        """
+        return self.forward(
+            segments, circuit,
+            N=N,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
 class ExecCostV3(nn.Module):
     def __init__(self):
         super().__init__()
@@ -874,6 +895,43 @@ def _parse_decoherence_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def transfer_stats_to_device(
+    stats: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, Any]:
+    """
+    Move a CPU stats dict (from SegmentStatsExtractor.compute_stats_cpu)
+    to the target device and dtype.
+
+    Rules:
+      - Long (index) tensors: move device only, keep dtype=long.
+      - Float tensors: move to device + cast to dtype.
+      - Nested lists (edges, layer_ops) are reconstructed shallowly.
+    """
+    def _t(x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.long:
+            return x.to(device, non_blocking=True)
+        return x.to(device=device, dtype=dtype, non_blocking=True)
+
+    return {
+        "L":   _t(stats["L"]),
+        "n1q": _t(stats["n1q"]),
+        "nm":  _t(stats["nm"]),
+        "edges": [
+            {k: _t(v) for k, v in e.items()}
+            for e in stats["edges"]
+        ],
+        "layer_ops": [
+            [
+                {k: _t(v) for k, v in op.items()}
+                for op in seg_ops
+            ]
+            for seg_ops in stats["layer_ops"]
+        ],
+    }
+
+
 def _neglog_clamped(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     Stable -log(x) for probabilities.
@@ -964,6 +1022,7 @@ class TotalCost(nn.Module):
         segments,
         circuit,
         debug: bool = False,
+        precomp_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
         
         device = P_seq[0].device
@@ -971,7 +1030,15 @@ class TotalCost(nn.Module):
         S = len(P_seq)
         N = P_seq[0].shape[0]
 
-        stats = self.stats_extractor(segments, circuit, N=N, device=device, dtype=dtype)
+        if precomp_stats is not None:
+            # Fast path: pre-computed on CPU during dataset warm-up.
+            # Just move tensors to the training device/dtype — no Python loops,
+            # no NetworkX, no BFS.
+            stats = transfer_stats_to_device(precomp_stats, device, dtype)
+        else:
+            # Fallback: compute on the fly (first epoch without pre-warming,
+            # or when called outside the training loop).
+            stats = self.stats_extractor(segments, circuit, N=N, device=device, dtype=dtype)
 
         exec_out = self.exec_cost(P_seq, stats, c1q=self.c1q, c2q=self.c2q, cm=self.cm, debug=debug)
         # Optional: compute differentiable per-layer / per-segment durations
