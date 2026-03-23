@@ -71,6 +71,15 @@ TRAIN_CFG = {
     "n_epochs": 50,
     "lr": 1e-4,
 
+    # Evaluation and checkpointing cadence
+    "eval_every":       10,    # evaluate test set every N epochs
+    "checkpoint_every": 20,    # save periodic checkpoint every N epochs
+ 
+    # DataLoader parallelism
+    # 0 = single-process (safe everywhere, required on some Windows configs)
+    # 4 = recommended for HiPerGator (set <= SLURM_CPUS_PER_TASK - 1)
+    "num_workers":      0,
+
     # different seed bases => no overlap between train/test
     "seed_base_train": 42,
     "seed_base_test": 1000,

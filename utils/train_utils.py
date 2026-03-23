@@ -1,4 +1,4 @@
-# src/train_utils.py
+# utils/train_utils.py
 
 from typing import List, Tuple, Optional
 import torch
@@ -12,36 +12,36 @@ def train_step(
     layer_data_list: List[Data],
     segments,
     circuit,
-    optimizer=None,
+    training: bool = True,
+    optimizer=None,   # kept for backward compatibility — not used in this function
     capacity_penalty=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
-    One forward pass on a single circuit. Does NOT call optimizer.step().
+    One forward pass on a single circuit.
 
-    The caller is responsible for accumulating loss tensors across circuits in
-    a batch and calling backward() + optimizer.step() once per batch. This
-    ensures a true batch gradient update rather than a per-circuit update.
-
-    For evaluation, pass optimizer=None and wrap in torch.no_grad(). The
-    returned loss will be a scalar tensor with no grad_fn in that case.
+    Does NOT call optimizer.zero_grad / backward / optimizer.step.
+    The caller accumulates loss tensors across circuits in a batch and steps once.
 
     Args:
         evol_model:        EvolvingGNN — produces h_seq from layer_data_list
         cluster_module:    SegmentClustering — maps h_seq -> P_seq
         total_cost_module: TotalCost — differentiable cost given P_seq
-        layer_data_list:   list of PyG Data objects, one per layer
+        layer_data_list:   list of PyG Data objects, one per layer (on correct device)
         segments:          segment/layer objects expected by TotalCost
         circuit:           CircuitRepresentation
-        optimizer:         if None, sets eval mode; if provided, sets train mode.
-                           The actual zero_grad/backward/step are NOT performed
-                           here — the caller handles those after accumulation.
+        training:          True  -> set both modules to train mode
+                           False -> set both modules to eval mode
+                           Caller controls mode explicitly — no implicit inference
+                           from optimizer presence.
+        optimizer:         Unused. Accepted for backward compatibility with old call
+                           sites that pass optimizer=None for eval. Ignored here.
         capacity_penalty:  optional CapacityPenalty module
 
     Returns:
         (loss_tensor, per_segment_total, cap_penalty_value)
         loss_tensor: differentiable scalar tensor (caller calls .backward())
     """
-    if optimizer is not None:
+    if training:
         evol_model.train()
         cluster_module.train()
     else:
