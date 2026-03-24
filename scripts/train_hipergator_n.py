@@ -802,7 +802,7 @@ def main():
         cap_penalty_history.append(avg_cap)
 
         # ---- LR decay at temperature floor ----
-        if epoch == 65:
+        if epoch == 75:
             for g in optimizer.param_groups:
                 g['lr'] = g['lr'] * 0.3
             log("LR decayed: 1e-4 -> 3e-5 (both temperatures at floor)")
