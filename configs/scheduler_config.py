@@ -65,10 +65,10 @@ CLUSTER_CFG = {
 # Train/Test parameters
 # ----------------------------
 TRAIN_CFG = {
-    "n_samples_train": 800,
-    "n_samples_test": 200,
+    "n_samples_train": 1200,
+    "n_samples_test": 300,
     "batch_size": 64,
-    "n_epochs": 120,
+    "n_epochs": 140,
     "lr": 1e-4,
 
     # Evaluation and checkpointing cadence
