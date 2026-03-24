@@ -52,7 +52,7 @@ CLUSTER_CFG = {
     #   Late training:  T_min=0.5  -> sharp decisive assignments
     "temperature_init":  3.0,
     "temperature_min":   0.5,
-    "temperature_gamma": 0.95,
+    "temperature_gamma": 0.96,
 
     # Neighbor-logit coordination initial mixing weight.
     # Specifies the actual alpha value in (0, 1): fraction of a qubit's logits
@@ -68,13 +68,13 @@ TRAIN_CFG = {
     "n_samples_train": 800,
     "n_samples_test": 200,
     "batch_size": 16,
-    "n_epochs": 150,
+    "n_epochs": 140,
     "lr": 1e-4,
 
     # Evaluation and checkpointing cadence
     "eval_every":       10,    # evaluate test set every N epochs
     "checkpoint_every": 20,    # save periodic checkpoint every N epochs
- 
+
     # DataLoader parallelism
     # 0 = single-process (safe everywhere, required on some Windows configs)
     # 4 = recommended for HiPerGator (set <= SLURM_CPUS_PER_TASK - 1)
@@ -83,6 +83,20 @@ TRAIN_CFG = {
     # different seed bases => no overlap between train/test
     "seed_base_train": 42,
     "seed_base_test": 10000,
+
+    # --- Oversample-and-filter pipeline ---
+    # Generate oversample_factor * N candidates; retain the N circuits whose
+    # effective post-layering depth T is closest to target_depth.
+    # Removes Qiskit-induced outliers before any PyG tensor construction.
+    # Increase oversample_factor if the kept depth distribution is still wide.
+    "oversample_factor": 1.5,   # generate 1.5x, keep the best N
+    "target_depth":      80,    # T* — nominal post-layering depth to centre on
+
+    # --- Bucket batching ---
+    # Circuits within the same T // bucket_width bucket are batched together.
+    # Bounds T variance within a batch → minimal masked-max tail overhead.
+    # Narrower buckets = cleaner batches but fewer circuits per bucket.
+    "bucket_width":      10,    # circuits with T in [k*10, (k+1)*10) share a bucket
 }
 
 # ----------------------------

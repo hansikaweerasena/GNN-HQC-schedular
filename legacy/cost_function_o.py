@@ -243,26 +243,24 @@ class SegmentStatsExtractor(nn.Module):
         self._cached_val = stats
         return stats
 
-    def compute_stats_cpu(
-        self,
-        segments,
-        circuit,
-        N: int,
-        dtype: torch.dtype = torch.float32,
-    ) -> Dict[str, Any]:
+    def compute_stats_cpu(self, segments, circuit, N: int) -> Dict[str, Any]:
         """
-        Compute stats on CPU with float32.
+        Compute full segment stats on CPU/float32.
 
-        Identical to forward() but always targets CPU. Called during dataset
-        __getitem__ (cache warm-up) so the expensive NetworkX BFS, Jaccard
-        similarity, and gamma scoring run exactly once per circuit per training
-        run. TotalCost.forward() accepts the result via precomp_stats= and
-        transfers it to the compute device, skipping re-extraction entirely.
+        Intended for dataset pre-warming: call once per circuit during
+        CircuitDataset warm-up and store the result alongside the cached item.
+        The result is then passed into TotalCost.forward() as `precomp_stats`,
+        which skips this extractor entirely and just does a device transfer —
+        eliminating the dominant per-epoch cost (NetworkX BFS, Jaccard, etc.).
+
+        Device is always CPU regardless of the training device; the caller
+        (transfer_stats_to_device) handles the GPU move at forward time.
         """
         return self.forward(
-            segments, circuit, N=N,
+            segments, circuit,
+            N=N,
             device=torch.device("cpu"),
-            dtype=dtype,
+            dtype=torch.float32,
         )
 
 
@@ -897,6 +895,43 @@ def _parse_decoherence_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def transfer_stats_to_device(
+    stats: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, Any]:
+    """
+    Move a CPU stats dict (from SegmentStatsExtractor.compute_stats_cpu)
+    to the target device and dtype.
+
+    Rules:
+      - Long (index) tensors: move device only, keep dtype=long.
+      - Float tensors: move to device + cast to dtype.
+      - Nested lists (edges, layer_ops) are reconstructed shallowly.
+    """
+    def _t(x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.long:
+            return x.to(device, non_blocking=True)
+        return x.to(device=device, dtype=dtype, non_blocking=True)
+
+    return {
+        "L":   _t(stats["L"]),
+        "n1q": _t(stats["n1q"]),
+        "nm":  _t(stats["nm"]),
+        "edges": [
+            {k: _t(v) for k, v in e.items()}
+            for e in stats["edges"]
+        ],
+        "layer_ops": [
+            [
+                {k: _t(v) for k, v in op.items()}
+                for op in seg_ops
+            ]
+            for seg_ops in stats["layer_ops"]
+        ],
+    }
+
+
 def _neglog_clamped(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     Stable -log(x) for probabilities.
@@ -907,62 +942,6 @@ def _neglog_clamped(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 
 def _normalize_gate_name(name: Any) -> str:
     return str(name).strip().lower()
-
-
-def _transfer_stats_to_device(
-    stats: Dict[str, Any],
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Dict[str, Any]:
-    """
-    Transfer a CPU stats dict (from compute_stats_cpu) to the compute device.
-
-    Handles the nested structure of the stats dict:
-      - Top-level tensors: L, n1q, nm
-      - List[Dict[str, Tensor]] for edges  (one dict per segment)
-      - List[List[Dict[str, Tensor]]] for layer_ops  (segment × layer × op tensors)
-
-    Called once per forward pass instead of re-running the full expensive
-    SegmentStatsExtractor pipeline on every training step.
-    """
-    def _t(x: torch.Tensor) -> torch.Tensor:
-        return x.to(device=device, dtype=dtype, non_blocking=True)
-
-    def _t_long(x: torch.Tensor) -> torch.Tensor:
-        # Index tensors (oneq_u, twoq_u, etc.) must stay int64
-        return x.to(device=device, non_blocking=True)
-
-    transferred_edges = []
-    for e in stats["edges"]:
-        transferred_edges.append({
-            "u":       _t_long(e["u"]),
-            "v":       _t_long(e["v"]),
-            "w":       _t(e["w"]),
-            "gamma_e": _t(e["gamma_e"]),
-        })
-
-    transferred_layer_ops = []
-    for seg_ops in stats["layer_ops"]:
-        seg_transferred = []
-        for layer_d in seg_ops:
-            d: Dict[str, torch.Tensor] = {
-                "oneq_u": _t_long(layer_d["oneq_u"]),
-                "meas_u": _t_long(layer_d["meas_u"]),
-                "twoq_u": _t_long(layer_d["twoq_u"]),
-                "twoq_v": _t_long(layer_d["twoq_v"]),
-            }
-            if "twoq_gamma" in layer_d:
-                d["twoq_gamma"] = _t(layer_d["twoq_gamma"])
-            seg_transferred.append(d)
-        transferred_layer_ops.append(seg_transferred)
-
-    return {
-        "L":         _t(stats["L"]),
-        "n1q":       _t(stats["n1q"]),
-        "nm":        _t(stats["nm"]),
-        "edges":     transferred_edges,
-        "layer_ops": transferred_layer_ops,
-    }
 
 
 class TotalCost(nn.Module):
@@ -1045,31 +1024,20 @@ class TotalCost(nn.Module):
         debug: bool = False,
         precomp_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            P_seq:          List[Tensor[N, K]] — soft assignments per segment
-            segments:       segment objects
-            circuit:        CircuitRepresentation
-            debug:          if True, include extra diagnostic tensors in output
-            precomp_stats:  pre-computed CPU stats dict from
-                            SegmentStatsExtractor.compute_stats_cpu().
-                            When provided, skips the expensive stats extraction
-                            entirely and transfers the CPU stats to the compute
-                            device instead.  This eliminates the dominant
-                            per-forward-pass Python cost (NetworkX BFS, Jaccard
-                            similarity, gamma scoring) on every training step.
-        """
+        
         device = P_seq[0].device
         dtype = P_seq[0].dtype
         S = len(P_seq)
         N = P_seq[0].shape[0]
 
         if precomp_stats is not None:
-            # Fast path: transfer CPU stats to compute device (non-blocking)
-            stats = _transfer_stats_to_device(precomp_stats, device, dtype)
+            # Fast path: pre-computed on CPU during dataset warm-up.
+            # Just move tensors to the training device/dtype — no Python loops,
+            # no NetworkX, no BFS.
+            stats = transfer_stats_to_device(precomp_stats, device, dtype)
         else:
-            # Slow path: full extraction (used when no precomp available,
-            # e.g. standalone evaluation or inference without a dataset cache)
+            # Fallback: compute on the fly (first epoch without pre-warming,
+            # or when called outside the training loop).
             stats = self.stats_extractor(segments, circuit, N=N, device=device, dtype=dtype)
 
         exec_out = self.exec_cost(P_seq, stats, c1q=self.c1q, c2q=self.c2q, cm=self.cm, debug=debug)
