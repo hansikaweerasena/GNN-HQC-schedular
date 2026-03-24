@@ -67,7 +67,7 @@ CLUSTER_CFG = {
 TRAIN_CFG = {
     "n_samples_train": 800,
     "n_samples_test": 200,
-    "batch_size": 32,
+    "batch_size": 64,
     "n_epochs": 120,
     "lr": 1e-4,
 
@@ -91,12 +91,6 @@ TRAIN_CFG = {
     # Increase oversample_factor if the kept depth distribution is still wide.
     "oversample_factor": 1.5,   # generate 1.5x, keep the best N
     "target_depth":      80,    # T* — nominal post-layering depth to centre on
-
-    # --- Bucket batching ---
-    # Circuits within the same T // bucket_width bucket are batched together.
-    # Bounds T variance within a batch → minimal masked-max tail overhead.
-    # Narrower buckets = cleaner batches but fewer circuits per bucket.
-    "bucket_width":      10,    # circuits with T in [k*10, (k+1)*10) share a bucket
 }
 
 # ----------------------------

@@ -32,9 +32,10 @@ Dataset pipeline:
      effective post-layering depth T for each, retain the N circuits closest to
      target_depth. This removes Qiskit-induced outliers without any data loss on
      the kept circuits.
-  2. BucketBatchSampler: group circuits by T // bucket_width into buckets.
-     Batches are drawn entirely from one bucket, bounding T variance within a
-     batch and minimising masked-max tail overhead.
+  2. SortedBatchSampler: sort all circuits by T and group into contiguous
+     batches of size B. Each batch contains circuits of similar depth; only the
+     final batch of the full dataset may be smaller, giving full data coverage
+     with at most one partial batch per epoch.
   3. Masked-max batched GNN: circuits in a batch are processed in parallel up
      to Lmax = max(T_b). At each step only alive circuits are updated; ended
      circuits are frozen. ClusteringHead runs batched on the same disjoint graph.
@@ -304,76 +305,56 @@ def collate_fn(batch):
 
 
 # =============================================================================
-# BucketBatchSampler
+# SortedBatchSampler
 # =============================================================================
 
 
-class BucketBatchSampler(torch.utils.data.Sampler):
+class SortedBatchSampler(torch.utils.data.Sampler):
     """
-    Groups circuits by depth bucket (T // bucket_width) and yields batches
-    drawn entirely from one bucket.
+    Sorts all circuits by effective layer count T then groups them into
+    contiguous batches of size batch_size.
 
-    Effect on training:
-      - T variance within a batch is bounded by bucket_width, minimising the
-        masked-max tail (steps where only a few circuits are still alive).
-      - Gradient direction per batch is more coherent — the model sees circuits
-        of similar structural complexity together.
-      - drop_last=True (default) discards the partial leftover batch at the end
-        of each bucket, preventing partial batches from receiving a full
-        optimizer step and overweighting their samples vs full-size batches.
-        With 800 circuits and ~4 buckets the cost is at most ~60 dropped
-        samples per epoch (~7.5%), which is acceptable.
+    Because circuits are contiguous in the sorted order, each batch contains
+    circuits of similar depth — achieving the T-variance bound of bucket
+    batching without fixed-width buckets and without per-bucket leftovers.
+    Only the final batch of the entire dataset may be smaller than batch_size,
+    giving full data coverage with at most one partial batch per epoch.
+
+    Each epoch the batch *order* is shuffled so the model sees circuits in a
+    different sequence while within-batch T-similarity is preserved.
 
     Args:
-        depths:       List[int] — effective T for each dataset item (0-indexed)
-        batch_size:   number of circuits per batch
-        bucket_width: T range assigned to the same bucket (e.g. 10 means
-                      circuits with T in [20,29] share a bucket)
-        shuffle:      if True, shuffle within buckets and shuffle batch order
-        drop_last:    if True (default), discard partial batches at bucket end
-        seed:         RNG seed for reproducibility
+        depths:     List[int] — effective T for each dataset item (0-indexed)
+        batch_size: number of circuits per batch
+        shuffle:    if True, shuffle batch order each epoch (default True)
+                    within-batch order is always by ascending T
+        seed:       RNG seed for reproducibility
     """
 
     def __init__(
         self,
         depths: List[int],
         batch_size: int,
-        bucket_width: int,
         shuffle: bool = True,
-        drop_last: bool = False,
         seed: int = 0,
     ):
-        self.batch_size  = batch_size
-        self.shuffle     = shuffle
-        self._rng        = np.random.RandomState(seed)
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+        self._rng       = np.random.RandomState(seed)
 
-        # Assign each sample to a bucket
-        buckets: Dict[int, List[int]] = defaultdict(list)
-        for i, T in enumerate(depths):
-            bucket_id = T // bucket_width
-            buckets[bucket_id].append(i)
+        # Sort all indices by T (ascending) then slice into contiguous batches
+        sorted_indices = sorted(range(len(depths)), key=lambda i: depths[i])
 
-        # Build list of batches from each bucket
         self.batches: List[List[int]] = []
-        n_dropped = 0
-        for ids in buckets.values():
-            ids_copy = list(ids)
-            if shuffle:
-                self._rng.shuffle(ids_copy)
-            for start in range(0, len(ids_copy), batch_size):
-                chunk = ids_copy[start:start + batch_size]
-                if len(chunk) == batch_size:
-                    self.batches.append(chunk)
-                elif not drop_last and chunk:
-                    self.batches.append(chunk)
-                else:
-                    n_dropped += len(chunk)
+        for start in range(0, len(sorted_indices), batch_size):
+            self.batches.append(sorted_indices[start:start + batch_size])
 
-        bucket_sizes = {k: len(v) for k, v in buckets.items()}
-        log(f"  BucketBatchSampler: {len(buckets)} buckets, "
-            f"{len(self.batches)} batches, "
-            f"dropped {n_dropped} partial-bucket samples (drop_last={drop_last}), "
-            f"bucket sizes: {dict(sorted(bucket_sizes.items()))}")
+        T_arr     = np.array(depths)
+        n_full    = sum(1 for b in self.batches if len(b) == batch_size)
+        n_partial = len(self.batches) - n_full
+        log(f"  SortedBatchSampler: {len(self.batches)} batches "
+            f"({n_full} full, {n_partial} partial at tail), "
+            f"T range [{T_arr.min()}, {T_arr.max()}], mean {T_arr.mean():.1f}")
 
     def __iter__(self):
         order = list(range(len(self.batches)))
@@ -557,7 +538,6 @@ def main():
     # New dataset pipeline params (with sensible defaults for backward compat)
     oversample_factor = float(TRAIN_CFG.get("oversample_factor", 1.5))
     target_depth      = int(TRAIN_CFG.get("target_depth", 80))
-    bucket_width      = int(TRAIN_CFG.get("bucket_width", 10))
     batch_size        = int(TRAIN_CFG["batch_size"])
 
     # ---- Run directory ----
@@ -588,17 +568,16 @@ def main():
     K = len(config["techs"])
 
     derived = {
-        "device":           str(device),
-        "K_num_clusters":   K,
-        "w_short":          w_short,
-        "w_long":           w_long,
-        "node_feat_dim":    NODE_FEAT_DIM,
-        "edge_feat_dim":    EDGE_FEAT_DIM,
-        "eval_every":       eval_every,
-        "checkpoint_every": checkpoint_every,
+        "device":            str(device),
+        "K_num_clusters":    K,
+        "w_short":           w_short,
+        "w_long":            w_long,
+        "node_feat_dim":     NODE_FEAT_DIM,
+        "edge_feat_dim":     EDGE_FEAT_DIM,
+        "eval_every":        eval_every,
+        "checkpoint_every":  checkpoint_every,
         "oversample_factor": oversample_factor,
-        "target_depth":     target_depth,
-        "bucket_width":     bucket_width,
+        "target_depth":      target_depth,
     }
     print_run_config(
         MODEL_CFG=MODEL_CFG, CLUSTER_CFG=CLUSTER_CFG, TRAIN_CFG=TRAIN_CFG,
@@ -655,17 +634,19 @@ def main():
     )
     log(f"Datasets built: train={len(train_dataset)}, test={len(test_dataset)}")
 
-    # ---- Stage 3: bucket samplers ----
-    # BucketBatchSampler groups circuits with similar T into the same batch,
-    # minimising masked-max tail overhead and gradient direction variance.
-    log("Building BucketBatchSamplers ...")
+    # ---- Stage 3: sorted batch samplers ----
+    # SortedBatchSampler orders all circuits by T then groups them into
+    # contiguous batches of batch_size. Within each batch T-variance is
+    # minimised (neighbouring circuits in the sorted order). Only the final
+    # batch of the full dataset may be smaller — one partial batch at most.
+    log("Building SortedBatchSamplers ...")
     log("  Train:")
-    train_sampler = BucketBatchSampler(
-        train_depths, batch_size, bucket_width, shuffle=True, seed=0,
+    train_sampler = SortedBatchSampler(
+        train_depths, batch_size, shuffle=True, seed=0,
     )
     log("  Test:")
-    test_sampler = BucketBatchSampler(
-        test_depths, batch_size, bucket_width, shuffle=False, seed=0,
+    test_sampler = SortedBatchSampler(
+        test_depths, batch_size, shuffle=False, seed=0,
     )
 
     num_workers = int(TRAIN_CFG.get("num_workers", 0))
