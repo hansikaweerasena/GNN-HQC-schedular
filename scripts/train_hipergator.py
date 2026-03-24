@@ -340,7 +340,7 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         batch_size: int,
         bucket_width: int,
         shuffle: bool = True,
-        drop_last: bool = True,
+        drop_last: bool = False,
         seed: int = 0,
     ):
         self.batch_size  = batch_size
