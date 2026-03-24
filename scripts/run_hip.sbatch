@@ -16,7 +16,13 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
 
 cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
+
 python scripts/train_hipergator_n.py \
     --sched_cfg configs.scheduler_config_n \
     --cost_cfg  cost_config_v3_n.json \
+    --run_tag   v1_batched_hip
+
+python scripts/train_hipergator_n.py \
+    --sched_cfg configs.scheduler_config \
+    --cost_cfg  cost_config_v3.json \
     --run_tag   v1_batched_hip
