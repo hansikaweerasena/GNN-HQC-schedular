@@ -52,7 +52,7 @@ CLUSTER_CFG = {
     #   Late training:  T_min=0.5  -> sharp decisive assignments
     "temperature_init":  3.0,
     "temperature_min":   0.5,
-    "temperature_gamma": 0.96,
+    "temperature_gamma": 0.97,
 
     # Neighbor-logit coordination initial mixing weight.
     # Specifies the actual alpha value in (0, 1): fraction of a qubit's logits
@@ -68,11 +68,11 @@ TRAIN_CFG = {
     "n_samples_train": 800,
     "n_samples_test": 200,
     "batch_size": 16,
-    "n_epochs": 140,
+    "n_epochs": 120,
     "lr": 1e-4,
 
     # Evaluation and checkpointing cadence
-    "eval_every":       10,    # evaluate test set every N epochs
+    "eval_every":       5,    # evaluate test set every N epochs
     "checkpoint_every": 20,    # save periodic checkpoint every N epochs
 
     # DataLoader parallelism

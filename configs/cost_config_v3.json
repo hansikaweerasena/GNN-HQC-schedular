@@ -28,9 +28,9 @@
 
   "timing_model": {
     "mode": "smooth_max",              
-    "tau0": 500.0,
+    "tau0": 400.0,
     "tau_min": 25.0,
-    "tau_gamma": 0.96,
+    "tau_gamma": 0.958,
 
     "lambda0": 0.2,                    
     "lambda_max": 1.0,
@@ -55,6 +55,6 @@
 
   "capacity_penalty": {
     "beta": 4,
-    "safety_factor": 10.0
+    "safety_factor": 20.0
   }
 }
