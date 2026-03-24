@@ -65,8 +65,8 @@ CLUSTER_CFG = {
 # Train/Test parameters
 # ----------------------------
 TRAIN_CFG = {
-    "n_samples_train": 800,
-    "n_samples_test": 200,
+    "n_samples_train": 1200,
+    "n_samples_test": 300,
     "batch_size": 32,
     "n_epochs": 120,
     "lr": 1e-4,
