@@ -780,7 +780,7 @@ def main():
 
             torch.nn.utils.clip_grad_norm_(
                 list(evol_model.parameters()) + list(cluster_module.parameters()),
-                max_norm=40.0
+                max_norm=60.0
             )
 
             # Grad norm (reads already-computed grads; cheap)
@@ -804,7 +804,7 @@ def main():
         # ---- LR decay at temperature floor ----
         if epoch == 75:
             for g in optimizer.param_groups:
-                g['lr'] = g['lr'] * 0.3
+                g['lr'] = g['lr'] * 0.5
             log("LR decayed: 1e-4 -> 3e-5 (both temperatures at floor)")
 
         # ---- Evaluate ----
@@ -851,7 +851,7 @@ def main():
             else:
                 patience_count += 1
                 log(f"  >> No improvement ({patience_count}/4)")
-                if patience_count >= 4:
+                if patience_count >= 3:
                     log("Early stopping triggered — best model already saved")
                     break
 
