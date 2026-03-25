@@ -740,6 +740,7 @@ def main():
     cap_penalty_history = []
 
     best_test_loss = float("inf")
+    patience_count = 0
     n_epochs       = int(TRAIN_CFG["n_epochs"])
 
     # ---- Training Loop ----
@@ -777,6 +778,11 @@ def main():
             )
             avg_loss.backward()
 
+            torch.nn.utils.clip_grad_norm_(
+                list(evol_model.parameters()) + list(cluster_module.parameters()),
+                max_norm=70.0
+            )
+
             # Grad norm (reads already-computed grads; cheap)
             _gnorm_sq = 0.0
             for _p in list(evol_model.parameters()) + list(cluster_module.parameters()):
@@ -794,6 +800,12 @@ def main():
         avg_gnorm = epoch_grad_norm   / len(train_loader)
         train_losses.append(avg_train)
         cap_penalty_history.append(avg_cap)
+
+        # ---- LR decay at temperature floor ----
+        if epoch == 75:
+            for g in optimizer.param_groups:
+                g['lr'] = g['lr'] * 0.5
+            log("LR decayed: 1e-4 -> 3e-5 (both temperatures at floor)")
 
         # ---- Evaluate ----
         is_last = (epoch == n_epochs - 1)
@@ -830,10 +842,18 @@ def main():
         ckpt = make_checkpoint(evol_model, cluster_module, optimizer, epoch, test_loss)
         save_checkpoint(ckpt, os.path.join(run_dir, "checkpoint_last.pt"))
 
-        if do_eval and test_loss < best_test_loss:
-            best_test_loss = test_loss
-            save_checkpoint(ckpt, os.path.join(run_dir, "checkpoint_best.pt"))
-            log(f"  >> New best checkpoint at epoch {epoch:03d}  test={test_loss:.4f}")
+        if do_eval:
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss
+                patience_count = 0
+                save_checkpoint(ckpt, os.path.join(run_dir, "checkpoint_best.pt"))
+                log(f"  >> New best checkpoint at epoch {epoch:03d}  test={test_loss:.4f}")
+            else:
+                patience_count += 1
+                log(f"  >> No improvement ({patience_count}/4)")
+                if patience_count >= 3:
+                    log("Early stopping triggered — best model already saved")
+                    break
 
         if (epoch + 1) % checkpoint_every == 0:
             periodic_path = os.path.join(run_dir, f"checkpoint_epoch_{epoch:03d}.pt")
