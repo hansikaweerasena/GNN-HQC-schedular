@@ -780,7 +780,7 @@ def main():
 
             torch.nn.utils.clip_grad_norm_(
                 list(evol_model.parameters()) + list(cluster_module.parameters()),
-                max_norm=60.0
+                max_norm=90.0
             )
 
             # Grad norm (reads already-computed grads; cheap)

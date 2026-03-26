@@ -20,7 +20,7 @@
 
   "comm": {
     "f_comm": 0.95,
-    "f_move": 0.99,
+    "f_move": 0.98,
     "t_remote": 0.0
   },
 
