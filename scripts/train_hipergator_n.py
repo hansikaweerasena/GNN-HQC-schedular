@@ -778,10 +778,10 @@ def main():
             )
             avg_loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(
-                list(evol_model.parameters()) + list(cluster_module.parameters()),
-                max_norm=50.0
-            )
+            # torch.nn.utils.clip_grad_norm_(
+            #     list(evol_model.parameters()) + list(cluster_module.parameters()),
+            #     max_norm=50.0
+            # )
 
             # Grad norm (reads already-computed grads; cheap)
             _gnorm_sq = 0.0
