@@ -68,7 +68,7 @@ TRAIN_CFG = {
     "n_samples_train": 1200,
     "n_samples_test": 300,
     "batch_size": 32,
-    "n_epochs": 140,
+    "n_epochs": 170,
     "lr": 1e-4,
 
     # Evaluation and checkpointing cadence
