@@ -13,7 +13,7 @@
       "gate_fidelity": { "f1q": 0.9995, "f2q": 0.9970, "fm": 0.9800 },
       "coherence": { "T2": 200000.0 },
       "routing": { "kappa": 0, "all_to_all": true },
-      "gate_time": { "t1q": 200.0, "t2q": 400.0, "tm": 500.0 },
+      "gate_time": { "t1q": 100.0, "t2q": 400.0, "tm": 500.0 },
       "capacity": { "max_qubits": 20 }
     }
   ],
