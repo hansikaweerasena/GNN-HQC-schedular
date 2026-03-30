@@ -49,13 +49,13 @@ python scripts/train_hipergator.py \
 
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp3n_98.json \
-    --run_tag   v1_batched_tp3n_98    
+    --cost_cfg  cost_config_tp2n_98.json \
+    --run_tag   v1_batched_tp2n_98    
 
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp2n_98.json \
-    --run_tag   v1_batched_tp2n_98    
+    --cost_cfg  cost_config_tp3n_98.json \
+    --run_tag   v1_batched_tp3n_98    
 
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config \
