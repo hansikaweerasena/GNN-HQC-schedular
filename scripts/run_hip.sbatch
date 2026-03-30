@@ -42,8 +42,8 @@ python scripts/train_hipergator.py \
     --cost_cfg  cost_config_tp6n_99.json \
     --run_tag   v1_batched_tp6n_99
 
-python scripts/train_hipergator_n.py \
-    --sched_cfg configs.scheduler_config \
+python scripts/train_hipergator.py \
+    --sched_cfg configs.scheduler_config_n \
     --cost_cfg  cost_config_tp7n_99.json \
     --run_tag   v1_batched_tp7n_99
 
@@ -72,7 +72,7 @@ python scripts/train_hipergator.py \
     --cost_cfg  cost_config_tp6n_98.json \
     --run_tag   v1_batched_tp6n_98         
 
-python scripts/train_hipergator_n.py \
-    --sched_cfg configs.scheduler_config \
+python scripts/train_hipergator.py \
+    --sched_cfg configs.scheduler_config_n \
     --cost_cfg  cost_config_tp7n_98.json \
     --run_tag   v1_batched_tp7n_98             
