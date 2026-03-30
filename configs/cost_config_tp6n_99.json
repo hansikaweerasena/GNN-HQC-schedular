@@ -6,53 +6,60 @@
       "coherence": { "T2": 80000.0 },
       "routing": { "kappa": 2.3 },
       "gate_time": { "t1q": 20.0, "t2q": 200.0, "tm": 300.0 },
-      "capacity": { "max_qubits": 20 }
+      "capacity": { "max_qubits": 13 }
     },
     {
-      "name": "na",
-      "gate_fidelity": { "f1q": 0.9995, "f2q": 0.9970, "fm": 0.9800 },
+      "name": "ti",
+      "gate_fidelity": { "f1q": 0.9999, "f2q": 0.9997, "fm": 0.9950 },
       "coherence": { "T2": 2000000.0 },
       "routing": { "kappa": 0, "all_to_all": true },
-      "gate_time": { "t1q": 200.0, "t2q": 2000.0, "tm": 500.0 },
-      "capacity": { "max_qubits": 20 }
+      "gate_time": { "t1q": 10000.0, "t2q": 100000.0, "tm": 5000.0 },
+      "capacity": { "max_qubits": 13 }
+    },
+    {
+      "name": "spin",
+      "gate_fidelity": { "f1q": 0.9998, "f2q": 0.9985, "fm": 0.9930 },
+      "coherence": { "T2": 1000000.0 },
+      "routing": { "kappa": 2.7 },
+      "gate_time": { "t1q": 100.0, "t2q": 1000.0, "tm": 1500.0 },
+      "capacity": { "max_qubits": 13 }
     }
   ],
-
   "comm": {
     "f_comm": 0.95,
-    "f_move": 0.98,
+    "f_move": 0.99,
     "t_remote": 0.0
   },
-
-  "timing": { "delta": 500.0 },
-
+  "timing": {
+    "delta": 500.0
+  },
   "timing_model": {
-    "mode": "smooth_max",              
+    "mode": "smooth_max",
     "tau0": 400.0,
     "tau_min": 25.0,
     "tau_gamma": 0.9762,
-
-    "lambda0": 0.2,                    
+    "lambda0": 0.2,
     "lambda_max": 1.0,
     "lambda_gamma": 1.05,
-
     "use_routing_inflation_time": true
   },
   "decoherence_model": {
-    "mode": "idle_only"                
+    "mode": "idle_only"
   },
-
   "gate_names": {
-    "measure": ["measure", "meas", "m"]
+    "measure": [
+      "measure",
+      "meas",
+      "m"
+    ]
   },
-
   "connectivity_proxy": {
     "gamma_max": 2.5,
     "delta_community": 3,
     "pair_reuse_threshold": 2,
-    "dense_lambda_decay": 0.85
+    "dense_lambda_decay": 0.85,
+    "min_window_kappa": 3.0
   },
-
   "capacity_penalty": {
     "beta": 4,
     "safety_factor": 2.0

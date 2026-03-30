@@ -1,0 +1,36 @@
+{
+    "techs": [
+      {
+        "name": "sc",
+        "gate_fidelity": { "f1q": 0.9999, "f2q": 0.9990, "fm": 0.9900 },
+        "coherence": { "T2": 80000.0 },
+        "routing": { "kappa": 2.3 },
+        "gate_time": { "t1q": 20.0, "t2q": 200.0, "tm": 300.0 },
+        "capacity": { "max_qubits": 12 }
+      },
+      {
+        "name": "na",
+        "gate_fidelity": { "f1q": 0.9995, "f2q": 0.9970, "fm": 0.9800 },
+        "coherence": { "T2": 2000000.0 },
+        "routing": { "kappa": 0, "all_to_all": true },
+        "gate_time": { "t1q": 200.0, "t2q": 2000.0, "tm": 500.0 },
+        "capacity": { "max_qubits": 12 }
+      },
+      {
+        "name": "ti",
+        "gate_fidelity": { "f1q": 0.9999, "f2q": 0.9997, "fm": 0.9950 },
+        "coherence": { "T2": 2000000.0 },
+        "routing": { "kappa": 0, "all_to_all": true },
+        "gate_time": { "t1q": 10000.0, "t2q": 100000.0, "tm": 5000.0 },
+        "capacity": { "max_qubits": 12 }
+      },
+      {
+        "name": "spin",
+        "gate_fidelity": { "f1q": 0.9998, "f2q": 0.9985, "fm": 0.9930 },
+        "coherence": { "T2": 1000000.0 },
+        "routing": { "kappa": 2.7 },
+        "gate_time": { "t1q": 100.0, "t2q": 1000.0, "tm": 1500.0 },
+        "capacity": { "max_qubits": 12 }
+      }
+    ]
+  }

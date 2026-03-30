@@ -805,7 +805,7 @@ def main():
         if epoch == 115:
             for g in optimizer.param_groups:
                 g['lr'] = g['lr'] * 0.5
-            log("LR decayed: 1e-4 -> 3e-5 (both temperatures at floor)")
+            log("LR decayed: 1e-4 -> 5e-5 (both temperatures at floor)")
 
         # ---- Evaluate ----
         is_last = (epoch == n_epochs - 1)
@@ -850,7 +850,7 @@ def main():
                 log(f"  >> New best checkpoint at epoch {epoch:03d}  test={test_loss:.4f}")
             else:
                 patience_count += 1
-                log(f"  >> No improvement ({patience_count}/4)")
+                log(f"  >> No improvement ({patience_count}/3)")
                 if patience_count >= 3:
                     log("Early stopping triggered — best model already saved")
                     break
