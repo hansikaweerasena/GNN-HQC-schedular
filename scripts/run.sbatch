@@ -20,5 +20,5 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_v3.json \
-    --run_tag   v1_batched
+    --cost_cfg  cost_config_tp1n_98.json \
+    --run_tag   v1_batched_tp1n_98       
