@@ -11,7 +11,7 @@
     {
       "name": "na",
       "gate_fidelity": { "f1q": 0.9995, "f2q": 0.9970, "fm": 0.9800 },
-      "coherence": { "T2": 200000.0 },
+      "coherence": { "T2": 2000000.0 },
       "routing": { "kappa": 0, "all_to_all": true },
       "gate_time": { "t1q": 200.0, "t2q": 2000.0, "tm": 500.0 },
       "capacity": { "max_qubits": 20 }
@@ -30,7 +30,7 @@
     "mode": "smooth_max",              
     "tau0": 400.0,
     "tau_min": 25.0,
-    "tau_gamma": 0.9762,
+    "tau_gamma": 0.958,
 
     "lambda0": 0.2,                    
     "lambda_max": 1.0,
@@ -55,6 +55,6 @@
 
   "capacity_penalty": {
     "beta": 4,
-    "safety_factor": 2.0
+    "safety_factor": 20.0
   }
 }
