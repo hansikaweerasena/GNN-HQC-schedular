@@ -1,7 +1,7 @@
 """
 eval_scheduler_v1.py  —  MOSAIC Baseline Comparison Evaluation Script
 
-Evaluates a trained MOSAIC model against Tier-1 baselines (B1, B2, B3) on
+Evaluates a trained MOSAIC model against Tier-1 baselines (B1, B3) and
 freshly-generated circuits. Reports the four comparison metrics:
 
     1. Hard TotalCost             (↓ lower is better)
@@ -52,7 +52,7 @@ from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost, CapacityPenalty
 from utils.inference_utils import enforce_capacity_sequence
 from utils.cost_config_reader import load_cost_config
-from baselines_tier1 import baseline_b1, baseline_b2, baseline_b3, rank_techs_by
+from baselines_tier1 import baseline_b1, baseline_b3, rank_techs_by
 from baselines_tier2 import baseline_b4, baseline_b5
 
 
@@ -87,7 +87,10 @@ def parse_args():
     p.add_argument("--seed",       type=int, default=99999,
                    help="Seed base for eval circuit generation")
     p.add_argument("--save_dir",   type=str, default=None,
-                   help="Directory for output files. Defaults to <run_dir>/eval_v1_<timestamp>/")
+                   help="Directory for output files. Defaults to <run_dir>/eval_syn_<checkpoint>/")
+    p.add_argument("--num_qubits", type=int, default=None,
+                   help="Override num_qubits for generated circuits. "
+                        "Defaults to value in CIRCUIT_SOURCE_CFG from run_dir.")
     p.add_argument("--show",       action="store_true",
                    help="Show summary comparison plot interactively")
     return p.parse_args()
@@ -373,7 +376,7 @@ def compute_metrics_v1(
 # Summary table and figure
 # =============================================================================
 
-METHOD_NAMES = ["MOSAIC", "B1", "B2", "B3", "B4", "B5"]
+METHOD_NAMES = ["MOSAIC", "B1", "B3", "B4", "B5"]
 
 METRICS_CFG = [
     # (key,                    display_label,                  direction, fmt)
@@ -391,27 +394,28 @@ def _scale(key: str, val: float) -> float:
     return val * 100.0 if key in SCALE_PCT else val
 
 
-def print_comparison_table(
-    all_metrics: Dict[str, List[dict]],
-    tech_names:  List[str],
-    K:           int,
-    n_circuits:  int,
-):
-    log_section("BASELINE COMPARISON TABLE")
-    print(f"  Circuits evaluated : {n_circuits}")
-    print(f"  Technologies (K={K}): {', '.join(tech_names)}")
-    print()
+def _format_comparison_table_lines(
+    all_metrics:    Dict[str, List[dict]],
+    tech_names:     List[str],
+    K:              int,
+    n_circuits:     int,
+    number_of_qubits: int,
+) -> List[str]:
+    """Build comparison table as a list of lines (shared by print and txt save)."""
+    lines = []
+    lines.append(f"  Circuits evaluated : {n_circuits}")
+    lines.append(f"  Number of qubits   : {number_of_qubits}")
+    lines.append(f"  Technologies (K={K}): {', '.join(tech_names)}")
+    lines.append("")
 
-    method_w = 20
-    val_w    = 18
-    col_w    = 38
+    col_w = 38
+    val_w = 18
 
-    # Header
     header = f"  {'Metric':<{col_w}}"
     for m in METHOD_NAMES:
         header += f"  {m:^{val_w}}"
-    print(header)
-    print("  " + "-" * (col_w + (val_w + 2) * len(METHOD_NAMES)))
+    lines.append(header)
+    lines.append("  " + "-" * (col_w + (val_w + 2) * len(METHOD_NAMES)))
 
     for key, label, direction, fmt in METRICS_CFG:
         row = f"  {label + ' ' + direction:<{col_w}}"
@@ -419,51 +423,57 @@ def print_comparison_table(
             vals = [_scale(key, m[key]) for m in all_metrics[method]]
             cell = f"{np.mean(vals):{fmt}} ± {np.std(vals):{fmt}}"
             row += f"  {cell:^{val_w}}"
-        print(row)
+        lines.append(row)
 
-    print()
-
-    # Per-metric winner (best mean)
-    print("  " + "-" * (col_w + (val_w + 2) * len(METHOD_NAMES)))
-    row = f"  {'Best method':<{col_w}}"
+    lines.append("")
+    lines.append("  " + "-" * (col_w + (val_w + 2) * len(METHOD_NAMES)))
     for key, label, direction, fmt in METRICS_CFG:
-        means = {}
-        for method in METHOD_NAMES:
-            vals = [_scale(key, m[key]) for m in all_metrics[method]]
-            means[method] = np.mean(vals)
-        if direction == "↓":
-            winner = min(means, key=lambda m: means[m])
-        else:
-            winner = max(means, key=lambda m: means[m])
-        row += f"  {winner:^{val_w}}"
+        means = {m: np.mean([_scale(key, x[key]) for x in all_metrics[m]])
+                 for m in METHOD_NAMES}
+        winner = (min if direction == "↓" else max)(means, key=lambda m: means[m])
+        lines.append(f"  {'Best ' + label + ':':<{col_w + 2}}  {winner}")
 
-    # Print per-metric winner row across all metrics (one per column)
-    # Rebuild per-column
-    print()
-    for key, label, direction, fmt in METRICS_CFG:
-        means = {}
-        for method in METHOD_NAMES:
-            vals = [_scale(key, m[key]) for m in all_metrics[method]]
-            means[method] = np.mean(vals)
-        if direction == "↓":
-            winner = min(means, key=lambda m: means[m])
-        else:
-            winner = max(means, key=lambda m: means[m])
-        print(f"  {'Best ' + label + ':':<{col_w + 2}}  {winner}")
+    lines.append("")
 
+    # Win rates (hard_cost only)
+    baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
+    n = len(all_metrics["MOSAIC"])
+    lines.append("  Win Rates (MOSAIC hard_cost < baseline):")
+    for bl in baselines:
+        wins = sum(
+            1 for i in range(n)
+            if all_metrics["MOSAIC"][i]["hard_cost"] < all_metrics[bl][i]["hard_cost"]
+        )
+        lines.append(f"    MOSAIC vs {bl}: {wins}/{n}  ({100.0*wins/max(n,1):.1f}%)")
+    lines.append("")
+    return lines
+
+
+def print_comparison_table(
+    all_metrics:      Dict[str, List[dict]],
+    tech_names:       List[str],
+    K:                int,
+    n_circuits:       int,
+    number_of_qubits: int,
+):
+    log_section("BASELINE COMPARISON TABLE")
+    for line in _format_comparison_table_lines(
+            all_metrics, tech_names, K, n_circuits, number_of_qubits):
+        print(line)
     print()
 
 
 def plot_comparison_figure(
-    all_metrics: Dict[str, List[dict]],
-    save_dir:    str,
-    show:        bool = False,
+    all_metrics:      Dict[str, List[dict]],
+    save_dir:         str,
+    number_of_qubits: int,
+    show:             bool = False,
 ):
     """Simple 4-panel bar chart: one panel per metric, bars = methods."""
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     fig.suptitle("MOSAIC vs Tier-1 Baselines", fontsize=13, fontweight="bold")
 
-    colors = ["#2196F3", "#FF9800", "#4CAF50", "#9C27B0"]  # MOSAIC, B1, B2, B3
+    colors = ["#2196F3", "#FF9800", "#4CAF50", "#9C27B0", "#F44336"]  # MOSAIC, B1, B3, B4, B5
     x = np.arange(len(METHOD_NAMES))
 
     for ax, (key, label, direction, fmt) in zip(axes, METRICS_CFG):
@@ -487,7 +497,7 @@ def plot_comparison_figure(
         )
 
     plt.tight_layout()
-    fig_path = os.path.join(save_dir, "baseline_comparison.png")
+    fig_path = os.path.join(save_dir, f"baseline_comparison_N{number_of_qubits}.png")
     fig.savefig(fig_path, dpi=150, bbox_inches="tight")
     log(f"  Comparison figure saved: {fig_path}")
     if show:
@@ -496,23 +506,44 @@ def plot_comparison_figure(
 
 
 def save_results_json(
-    all_metrics: Dict[str, List[dict]],
-    save_dir:    str,
-    n_circuits:  int,
-    tech_names:  List[str],
+    all_metrics:      Dict[str, List[dict]],
+    save_dir:         str,
+    n_circuits:       int,
+    tech_names:       List[str],
+    number_of_qubits: int,
+    run_dir:          str,
 ):
     """Save per-circuit metrics for all methods as JSON for downstream use."""
+    baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
+    n = len(all_metrics["MOSAIC"])
+    win_rates = {
+        bl: {
+            "wins":  sum(1 for i in range(n)
+                         if all_metrics["MOSAIC"][i]["hard_cost"]
+                            < all_metrics[bl][i]["hard_cost"]),
+            "total": n,
+            "win_pct": round(
+                100.0 * sum(1 for i in range(n)
+                            if all_metrics["MOSAIC"][i]["hard_cost"]
+                               < all_metrics[bl][i]["hard_cost"]) / max(n, 1), 2),
+        }
+        for bl in baselines
+    }
+
     summary = {
-        "n_circuits": n_circuits,
-        "tech_names": tech_names,
-        "methods":    {},
+        "run_dir":          run_dir,
+        "n_circuits":       n_circuits,
+        "number_of_qubits": number_of_qubits,
+        "tech_names":       tech_names,
+        "win_rates":        win_rates,
+        "methods":          {},
     }
     for method in METHOD_NAMES:
         mlist = all_metrics[method]
         summary["methods"][method] = {
             "per_circuit": [
                 {k: float(v) for k, v in m.items()
-                 if k not in ("T", "N")}   # exclude non-scalar fields
+                 if k not in ("T", "N")}
                 for m in mlist
             ],
             "means": {
@@ -524,10 +555,28 @@ def save_results_json(
                 for key, *_ in METRICS_CFG
             },
         }
-    out_path = os.path.join(save_dir, "comparison_results.json")
+    out_path = os.path.join(save_dir, f"comparison_results_N{number_of_qubits}.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
     log(f"  Results saved: {out_path}")
+
+
+def save_summary_txt(
+    all_metrics:      Dict[str, List[dict]],
+    save_dir:         str,
+    tech_names:       List[str],
+    K:                int,
+    n_circuits:       int,
+    number_of_qubits: int,
+):
+    """Save summary.txt mirroring the console comparison table."""
+    lines = ["BASELINE COMPARISON TABLE", "=" * 72, ""]
+    lines += _format_comparison_table_lines(
+        all_metrics, tech_names, K, n_circuits, number_of_qubits)
+    out_path = os.path.join(save_dir, f"summary_N{number_of_qubits}.txt")
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+    log(f"  Summary txt saved: {out_path}")
 
 
 # =============================================================================
@@ -540,8 +589,7 @@ def main():
 
     # ---- Output directory ----
     if args.save_dir is None:
-        stamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(args.run_dir, f"eval_v1_{stamp}_{args.checkpoint}")
+        save_dir = os.path.join(args.run_dir, f"eval_syn_{args.checkpoint}")
     else:
         save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -568,6 +616,16 @@ def main():
     caps            = art["caps"]
     w_short         = art["w_short"]
     w_long          = art["w_long"]
+
+    # ---- Resolve num_qubits (CLI override or from run config) ----
+    default_nq = circuit_src_cfg.get("kwargs", {}).get("num_qubits", None)
+    if args.num_qubits is not None:
+        number_of_qubits = args.num_qubits
+        circuit_src_cfg.setdefault("kwargs", {})["num_qubits"] = number_of_qubits
+        log(f"  num_qubits  : {number_of_qubits} (CLI override; default was {default_nq})")
+    else:
+        number_of_qubits = default_nq
+        log(f"  num_qubits  : {number_of_qubits} (from run config)")
 
     # ---- Build eval circuit provider ----
     log_section("GENERATING EVALUATION CIRCUITS")
@@ -596,20 +654,16 @@ def main():
             mosaic_hard, rep, segments, cost_module, caps, K, config, device)
         all_metrics["MOSAIC"].append(mosaic_metrics)
 
-        # --- B1, B2, B3 ---
+        # --- B1, B3 ---
         b1_hard    = baseline_b1(rep, caps, config, K)
-        b2_hard    = baseline_b2(rep, caps, config, K)
         b3_hard    = baseline_b3(rep, caps, config, K)
 
         b1_metrics = compute_metrics_v1(
             b1_hard, rep, segments, cost_module, caps, K, config, device)
-        b2_metrics = compute_metrics_v1(
-            b2_hard, rep, segments, cost_module, caps, K, config, device)
         b3_metrics = compute_metrics_v1(
             b3_hard, rep, segments, cost_module, caps, K, config, device)
 
         all_metrics["B1"].append(b1_metrics)
-        all_metrics["B2"].append(b2_metrics)
         all_metrics["B3"].append(b3_metrics)
 
         # --- B4: Wu beam search (seed=i for per-circuit reproducibility) ---
@@ -629,7 +683,6 @@ def main():
             f"  [{i+1:3d}/{args.n_circuits}] N={N:2d}, T={T:3d} | "
             f"MOSAIC={mosaic_metrics['hard_cost']:.3f}  "
             f"B1={b1_metrics['hard_cost']:.3f}  "
-            f"B2={b2_metrics['hard_cost']:.3f}  "
             f"B3={b3_metrics['hard_cost']:.3f}  "
             f"B4={b4_metrics['hard_cost']:.3f}  "
             f"B5={b5_metrics['hard_cost']:.3f}  "
@@ -641,13 +694,16 @@ def main():
         f"({total_time / args.n_circuits:.2f}s/circuit)")
 
     # ---- Summary ----
-    print_comparison_table(all_metrics, tech_names, K, args.n_circuits)
+    print_comparison_table(all_metrics, tech_names, K, args.n_circuits, number_of_qubits)
 
     log_section("GENERATING COMPARISON FIGURE")
-    plot_comparison_figure(all_metrics, save_dir, show=args.show)
+    plot_comparison_figure(all_metrics, save_dir, number_of_qubits, show=args.show)
 
     log_section("SAVING RESULTS")
-    save_results_json(all_metrics, save_dir, args.n_circuits, tech_names)
+    save_results_json(all_metrics, save_dir, args.n_circuits, tech_names,
+                      number_of_qubits, args.run_dir)
+    save_summary_txt(all_metrics, save_dir, tech_names, K, args.n_circuits,
+                     number_of_qubits)
 
     log_section("EVALUATION COMPLETE")
     log(f"All outputs saved to: {save_dir}")

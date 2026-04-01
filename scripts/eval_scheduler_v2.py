@@ -65,7 +65,7 @@ from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
 from utils.inference_utils import enforce_capacity_sequence
 from utils.cost_config_reader import load_cost_config
-from baselines_tier1 import baseline_b1, baseline_b2, baseline_b3, rank_techs_by
+from baselines_tier1 import baseline_b1, baseline_b3, rank_techs_by
 from baselines_tier2 import baseline_b4, baseline_b5
 
 
@@ -505,7 +505,7 @@ def compute_metrics_v1(
 # Summary table, per-algorithm table, figures, JSON
 # =============================================================================
 
-METHOD_NAMES = ["MOSAIC", "B1", "B2", "B3", "B4", "B5"]
+METHOD_NAMES = ["MOSAIC", "B1", "B3", "B4", "B5"]
 
 METRICS_CFG = [
     ("hard_cost",             "Hard TotalCost",            "↓", ".4f"),
@@ -521,26 +521,26 @@ def _scale(key: str, val: float) -> float:
     return val * 100.0 if key in SCALE_PCT else val
 
 
-def print_aggregate_table(
+def _format_aggregate_table_lines(
     all_metrics:   Dict[str, List[dict]],
     circuit_info:  List[Tuple[str, int]],
     tech_names:    List[str],
     K:             int,
-):
-    """Aggregate comparison table across all MQT circuits."""
+) -> List[str]:
+    """Build aggregate comparison table as lines (shared by print and txt save)."""
     n = len(circuit_info)
-    log_section("AGGREGATE COMPARISON TABLE (all MQT circuits)")
-    print(f"  Circuits evaluated : {n}")
-    print(f"  Technologies (K={K}): {', '.join(tech_names)}")
-    print()
+    lines = []
+    lines.append(f"  Circuits evaluated : {n}")
+    lines.append(f"  Technologies (K={K}): {', '.join(tech_names)}")
+    lines.append("")
 
-    col_w  = 38
-    val_w  = 18
+    col_w = 38
+    val_w = 18
     header = f"  {'Metric':<{col_w}}"
     for m in METHOD_NAMES:
         header += f"  {m:^{val_w}}"
-    print(header)
-    print("  " + "-" * (col_w + (val_w + 2) * len(METHOD_NAMES)))
+    lines.append(header)
+    lines.append("  " + "-" * (col_w + (val_w + 2) * len(METHOD_NAMES)))
 
     for key, label, direction, fmt in METRICS_CFG:
         row = f"  {label + ' ' + direction:<{col_w}}"
@@ -548,33 +548,46 @@ def print_aggregate_table(
             vals = [_scale(key, m[key]) for m in all_metrics[method]]
             cell = f"{np.mean(vals):{fmt}} ± {np.std(vals):{fmt}}"
             row += f"  {cell:^{val_w}}"
-        print(row)
+        lines.append(row)
 
-    print()
+    lines.append("")
     for key, label, direction, fmt in METRICS_CFG:
         means = {m: np.mean([_scale(key, x[key]) for x in all_metrics[m]])
                  for m in METHOD_NAMES}
         winner = (min if direction == "↓" else max)(means, key=lambda m: means[m])
-        print(f"  {'Best ' + label + ':':<{col_w + 2}}  {winner}")
-    print()
+        lines.append(f"  {'Best ' + label + ':':<{col_w + 2}}  {winner}")
+    lines.append("")
+
+    # Win rates (hard_cost only)
+    baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
+    n_c = len(all_metrics["MOSAIC"])
+    lines.append("  Win Rates (MOSAIC hard_cost < baseline):")
+    for bl in baselines:
+        wins = sum(
+            1 for i in range(n_c)
+            if all_metrics["MOSAIC"][i]["hard_cost"] < all_metrics[bl][i]["hard_cost"]
+        )
+        lines.append(f"    MOSAIC vs {bl}: {wins}/{n_c}  ({100.0*wins/max(n_c,1):.1f}%)")
+    lines.append("")
+    return lines
 
 
-def print_per_algorithm_table(
+def _format_per_algorithm_table_lines(
     all_metrics:  Dict[str, List[dict]],
     circuit_info: List[Tuple[str, int]],
-):
-    """Print a compact per-algorithm breakdown showing MOSAIC vs best baseline."""
-    log_section("PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)")
-
-    # Group indices by algorithm
+) -> List[str]:
+    """Build per-algorithm breakdown as lines (shared by print and txt save)."""
     algo_groups: Dict[str, List[int]] = {}
     for i, (algo, _nq) in enumerate(circuit_info):
         algo_groups.setdefault(algo, []).append(i)
 
     col_w = 20
-    print(f"  {'Algorithm':<{col_w}}  {'N_circ':>6}  "
-          f"{'MOSAIC':>10}  {'BestBase':>10}  {'Winner':>10}  {'MOSAIC_cut%':>11}")
-    print("  " + "-" * 72)
+    lines = []
+    lines.append(
+        f"  {'Algorithm':<{col_w}}  {'N_circ':>6}  "
+        f"{'MOSAIC':>10}  {'BestBase':>10}  {'Winner':>10}  {'MOSAIC_cut%':>11}"
+    )
+    lines.append("  " + "-" * 72)
 
     for algo in sorted(algo_groups.keys()):
         idxs = algo_groups[algo]
@@ -594,9 +607,36 @@ def print_per_algorithm_table(
         mosaic_cut = np.mean([all_metrics["MOSAIC"][i]["remote_2q_cut_rate"] * 100
                               for i in idxs])
 
-        print(f"  {algo:<{col_w}}  {len(idxs):>6}  "
-              f"{mosaic_mean:>10.4f}  {best_base_cost:>10.4f}  "
-              f"{winner:>10}  {mosaic_cut:>10.1f}%")
+        lines.append(
+            f"  {algo:<{col_w}}  {len(idxs):>6}  "
+            f"{mosaic_mean:>10.4f}  {best_base_cost:>10.4f}  "
+            f"{winner:>10}  {mosaic_cut:>10.1f}%"
+        )
+    lines.append("")
+    return lines
+
+
+def print_aggregate_table(
+    all_metrics:   Dict[str, List[dict]],
+    circuit_info:  List[Tuple[str, int]],
+    tech_names:    List[str],
+    K:             int,
+):
+    """Aggregate comparison table across all MQT circuits."""
+    log_section("AGGREGATE COMPARISON TABLE (all MQT circuits)")
+    for line in _format_aggregate_table_lines(all_metrics, circuit_info, tech_names, K):
+        print(line)
+    print()
+
+
+def print_per_algorithm_table(
+    all_metrics:  Dict[str, List[dict]],
+    circuit_info: List[Tuple[str, int]],
+):
+    """Print a compact per-algorithm breakdown showing MOSAIC vs best baseline."""
+    log_section("PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)")
+    for line in _format_per_algorithm_table_lines(all_metrics, circuit_info):
+        print(line)
     print()
 
 
@@ -611,7 +651,7 @@ def plot_mqt_figures(
     Fig 1: 4-panel aggregate bar chart (same as eval_scheduler_v1.py)
     Fig 2: Per-algorithm MOSAIC vs best-baseline hard cost comparison
     """
-    colors_all = ["#2196F3", "#FF9800", "#4CAF50", "#9C27B0", "#F44336", "#00BCD4"]
+    colors_all = ["#2196F3", "#FF9800", "#4CAF50", "#9C27B0", "#F44336"]  # MOSAIC, B1, B3, B4, B5
 
     # --- Figure 1: aggregate bar chart ---
     fig1, axes = plt.subplots(1, 4, figsize=(18, 4))
@@ -696,12 +736,31 @@ def save_results_json(
     circuit_info: List[Tuple[str, int]],
     save_dir:     str,
     tech_names:   List[str],
+    run_dir:      str,
 ):
     """Save per-circuit metrics with algorithm labels for all methods."""
+    baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
+    n = len(all_metrics["MOSAIC"])
+    win_rates = {
+        bl: {
+            "wins":    sum(1 for i in range(n)
+                           if all_metrics["MOSAIC"][i]["hard_cost"]
+                              < all_metrics[bl][i]["hard_cost"]),
+            "total":   n,
+            "win_pct": round(
+                100.0 * sum(1 for i in range(n)
+                            if all_metrics["MOSAIC"][i]["hard_cost"]
+                               < all_metrics[bl][i]["hard_cost"]) / max(n, 1), 2),
+        }
+        for bl in baselines
+    }
+
     summary = {
+        "run_dir":      run_dir,
         "n_circuits":   len(circuit_info),
-        "circuit_info": [{"algo": a, "nq": n} for a, n in circuit_info],
+        "circuit_info": [{"algo": a, "nq": nq} for a, nq in circuit_info],
         "tech_names":   tech_names,
+        "win_rates":    win_rates,
         "methods":      {},
     }
     for method in METHOD_NAMES:
@@ -744,6 +803,24 @@ def save_results_json(
     log(f"  Results saved: {out_path}")
 
 
+def save_summary_txt(
+    all_metrics:  Dict[str, List[dict]],
+    circuit_info: List[Tuple[str, int]],
+    save_dir:     str,
+    tech_names:   List[str],
+    K:            int,
+):
+    """Save summary.txt with aggregate table and per-algorithm breakdown."""
+    lines = ["AGGREGATE COMPARISON TABLE (all MQT circuits)", "=" * 72, ""]
+    lines += _format_aggregate_table_lines(all_metrics, circuit_info, tech_names, K)
+    lines += ["", "PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)", "=" * 72, ""]
+    lines += _format_per_algorithm_table_lines(all_metrics, circuit_info)
+    out_path = os.path.join(save_dir, "summary.txt")
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+    log(f"  Summary txt saved: {out_path}")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -754,8 +831,7 @@ def main():
 
     # ---- Output directory ----
     if args.save_dir is None:
-        stamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(args.run_dir, f"eval_v2_mqt_{stamp}_{args.checkpoint}")
+        save_dir = os.path.join(args.run_dir, f"eval_mqt_{args.checkpoint}")
     else:
         save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -838,12 +914,10 @@ def main():
             log(f"  [{i+1:3d}] SKIP {algo}(N={nq}): MOSAIC inference failed — {e}")
             continue
 
-        # --- B1, B2, B3 ---
+        # --- B1, B3 ---
         b1_hard = baseline_b1(rep, caps, config, K)
-        b2_hard = baseline_b2(rep, caps, config, K)
         b3_hard = baseline_b3(rep, caps, config, K)
         b1_m = compute_metrics_v1(b1_hard, rep, segments, cost_module, caps, K, config, device)
-        b2_m = compute_metrics_v1(b2_hard, rep, segments, cost_module, caps, K, config, device)
         b3_m = compute_metrics_v1(b3_hard, rep, segments, cost_module, caps, K, config, device)
 
         # --- B4: Wu beam search ---
@@ -857,7 +931,6 @@ def main():
         # Record
         all_metrics["MOSAIC"].append(mosaic_m)
         all_metrics["B1"].append(b1_m)
-        all_metrics["B2"].append(b2_m)
         all_metrics["B3"].append(b3_m)
         all_metrics["B4"].append(b4_m)
         all_metrics["B5"].append(b5_m)
@@ -868,7 +941,6 @@ def main():
             f"  [{i+1:3d}] {algo:15s} N={N:2d} T={T:4d}{depth_note} | "
             f"MOSAIC={mosaic_m['hard_cost']:.3f} "
             f"B1={b1_m['hard_cost']:.3f} "
-            f"B2={b2_m['hard_cost']:.3f} "
             f"B3={b3_m['hard_cost']:.3f} "
             f"B4={b4_m['hard_cost']:.3f} "
             f"B5={b5_m['hard_cost']:.3f} "
@@ -892,7 +964,8 @@ def main():
     plot_mqt_figures(all_metrics, circuit_info, save_dir, show=args.show)
 
     log_section("SAVING RESULTS")
-    save_results_json(all_metrics, circuit_info, save_dir, tech_names)
+    save_results_json(all_metrics, circuit_info, save_dir, tech_names, args.run_dir)
+    save_summary_txt(all_metrics, circuit_info, save_dir, tech_names, K)
 
     log_section("EVALUATION COMPLETE")
     log(f"All outputs saved to: {save_dir}")
