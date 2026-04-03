@@ -4,6 +4,7 @@ roi_gen_trend*
 calibration/*
 phase*/*
 results_*
+results*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
