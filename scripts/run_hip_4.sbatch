@@ -20,17 +20,17 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config_20 \
     --cost_cfg  cost_config_tp2n_99_20.json \
-    --run_tag   v1_batched_tp2n_99_20      
-
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config_20 \
-    --cost_cfg  cost_config_tp2n_98_20.json \
-    --run_tag   v1_batched_tp2n_98_20  
+    --run_tag   v1_batched_tp2n_99_20    
 
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config_10 \
     --cost_cfg  cost_config_tp2n_99_10.json \
-    --run_tag   v1_batched_tp2n_99_10      
+    --run_tag   v1_batched_tp2n_99_10    
+
+python scripts/train_hipergator.py \
+    --sched_cfg configs.scheduler_config_20 \
+    --cost_cfg  cost_config_tp2n_98_20.json \
+    --run_tag   v1_batched_tp2n_98_20    
 
 python scripts/train_hipergator.py \
     --sched_cfg configs.scheduler_config_10 \
