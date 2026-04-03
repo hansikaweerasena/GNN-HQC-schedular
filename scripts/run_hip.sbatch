@@ -17,62 +17,83 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp2n_99.json \
-    --run_tag   v1_batched_tp2n_99
+
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config_20 \
+#     --cost_cfg  cost_config_tp2n_99_20.json \
+#     --run_tag   v1_batched_tp2n_99_20    
 
 python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp3n_99.json \
-    --run_tag   v1_batched_tp3n_99
+    --sched_cfg configs.scheduler_config_10 \
+    --cost_cfg  cost_config_tp2n_99_10.json \
+    --run_tag   v1_batched_tp2n_99_10    
+
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config_20 \
+#     --cost_cfg  cost_config_tp2n_98_20.json \
+#     --run_tag   v1_batched_tp2n_98_20    
 
 python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp4n_99.json \
-    --run_tag   v1_batched_tp4n_99
+    --sched_cfg configs.scheduler_config_10 \
+    --cost_cfg  cost_config_tp2n_98_10.json \
+    --run_tag   v1_batched_tp2n_98_10      
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp5n_99.json \
-    --run_tag   v1_batched_tp5n_99
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp2n_99.json \
+#     --run_tag   v1_batched_tp2n_99
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp6n_99.json \
-    --run_tag   v1_batched_tp6n_99
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp3n_99.json \
+#     --run_tag   v1_batched_tp3n_99
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config_n \
-    --cost_cfg  cost_config_tp7n_99.json \
-    --run_tag   v1_batched_tp7n_99
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp4n_99.json \
+#     --run_tag   v1_batched_tp4n_99
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp2n_98.json \
-    --run_tag   v1_batched_tp2n_98    
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp5n_99.json \
+#     --run_tag   v1_batched_tp5n_99
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp3n_98.json \
-    --run_tag   v1_batched_tp3n_98    
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp6n_99.json \
+#     --run_tag   v1_batched_tp6n_99
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp4n_98.json \
-    --run_tag   v1_batched_tp4n_98            
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config_n \
+#     --cost_cfg  cost_config_tp7n_99.json \
+#     --run_tag   v1_batched_tp7n_99
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp5n_98.json \
-    --run_tag   v1_batched_tp5n_98           
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp2n_98.json \
+#     --run_tag   v1_batched_tp2n_98    
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg  cost_config_tp6n_98.json \
-    --run_tag   v1_batched_tp6n_98         
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp3n_98.json \
+#     --run_tag   v1_batched_tp3n_98    
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config_n \
-    --cost_cfg  cost_config_tp7n_98.json \
-    --run_tag   v1_batched_tp7n_98             
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp4n_98.json \
+#     --run_tag   v1_batched_tp4n_98            
+
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp5n_98.json \
+#     --run_tag   v1_batched_tp5n_98           
+
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg  cost_config_tp6n_98.json \
+#     --run_tag   v1_batched_tp6n_98         
+
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config_n \
+#     --cost_cfg  cost_config_tp7n_98.json \
+#     --run_tag   v1_batched_tp7n_98             
