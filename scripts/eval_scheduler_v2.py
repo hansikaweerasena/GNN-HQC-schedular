@@ -769,7 +769,8 @@ def save_results_json(
             "per_circuit": [
                 {"algo": circuit_info[i][0],
                  "nq":   circuit_info[i][1],
-                 **{k: float(v) for k, v in m.items() if k not in ("T", "N")}}
+                 **{k: (int(v) if k in ("T", "N") else float(v))
+                    for k, v in m.items()}}
                 for i, m in enumerate(mlist)
             ],
             "aggregate_means": {
