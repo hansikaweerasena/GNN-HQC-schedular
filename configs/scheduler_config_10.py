@@ -148,7 +148,7 @@ CIRCUIT_SOURCE_CFG = {
         "min_block_w": 2,
         "max_block_w": 12,
         "min_block_h": 2,
-        "max_block_h": 10,
+        "max_block_h": 5,
 
         # Rectangle bounds - 20
         # "min_block_w": 2,
@@ -160,7 +160,7 @@ CIRCUIT_SOURCE_CFG = {
         "n_long": (1, 3),
         "long_w_min": 9,
         "long_w_max": 15,
-        "n_tall": (1, 3),
+        "n_tall": (2, 6),
         "tall_h_min": 6,
         "tall_h_max": 10,
 
