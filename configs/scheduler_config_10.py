@@ -126,7 +126,7 @@ CIRCUIT_SOURCE_CFG = {
         "option": "op2a",
 
         # Per-circuit ROI subset size (excluding idle)
-        "n_rois": 3,
+        "n_rois": 4,
 
         # Defaults / targets
         "twoq_to_oneq_ratio": 0.4,
