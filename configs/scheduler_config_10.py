@@ -90,7 +90,7 @@ TRAIN_CFG = {
     # Removes Qiskit-induced outliers before any PyG tensor construction.
     # Increase oversample_factor if the kept depth distribution is still wide.
     "oversample_factor": 1.5,   # generate 1.5x, keep the best N
-    "target_depth":      60,    # T* — nominal post-layering depth to centre on
+    "target_depth":      80,    # T* — nominal post-layering depth to centre on
 }
 
 # ----------------------------
@@ -119,7 +119,7 @@ CIRCUIT_SOURCE_CFG = {
         # Core size
         # "num_qubits": 20,
         "num_qubits": 10,
-        "num_layers": 60,
+        "num_layers": 80,
 
         # Fallback option if no mix is enabled
         # One of: "op1", "op2a", "op2b", "op3"
@@ -148,7 +148,7 @@ CIRCUIT_SOURCE_CFG = {
         "min_block_w": 2,
         "max_block_w": 12,
         "min_block_h": 2,
-        "max_block_h": 6,
+        "max_block_h": 10,
 
         # Rectangle bounds - 20
         # "min_block_w": 2,
@@ -160,7 +160,7 @@ CIRCUIT_SOURCE_CFG = {
         "n_long": (1, 3),
         "long_w_min": 9,
         "long_w_max": 15,
-        "n_tall": (2, 4),
+        "n_tall": (1, 3),
         "tall_h_min": 6,
         "tall_h_max": 10,
 
