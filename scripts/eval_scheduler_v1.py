@@ -796,8 +796,12 @@ def main():
     mosaic_burden: List[dict] = []
     t0 = time.time()
     global_idx = 0
+    capacity_exceeded = False
 
     for nq, n_in_bucket in size_schedule:
+        if capacity_exceeded:
+            break
+
         # Rebuild provider with this qubit count
         circuit_src_cfg.setdefault("kwargs", {})["num_qubits"] = nq
         provider = build_provider(circuit_src_cfg, seed_base=args.seed + global_idx)
@@ -812,8 +816,16 @@ def main():
             N   = rep.num_qubits
 
             # --- MOSAIC ---
-            P_seq            = run_inference(evol_model, cluster_module, layer_data_list)
-            mosaic_hard      = enforce_capacity_sequence(P_seq, caps)
+            P_seq = run_inference(evol_model, cluster_module, layer_data_list)
+            try:
+                mosaic_hard = enforce_capacity_sequence(P_seq, caps)
+            except ValueError as e:
+                log(f"\n  CAPACITY EXCEEDED at N={N}: {e}")
+                log(f"  Stopping range expansion. "
+                    f"Saving results for {global_idx} circuits evaluated so far.")
+                capacity_exceeded = True
+                break
+
             mosaic_metrics   = compute_metrics_v1(
                 mosaic_hard, rep, segments, cost_module, caps, K, config, device)
             all_metrics["MOSAIC"].append(mosaic_metrics)
@@ -860,12 +872,21 @@ def main():
             )
             global_idx += 1
 
+    n_evaluated = len(all_metrics["MOSAIC"])
     total_time = time.time() - t0
-    log(f"\nDone: {args.n_circuits} circuits in {total_time:.1f}s "
-        f"({total_time / args.n_circuits:.2f}s/circuit)")
+
+    if n_evaluated == 0:
+        log("No circuits successfully evaluated. Exiting.")
+        return
+
+    log(f"\nDone: {n_evaluated} circuits in {total_time:.1f}s "
+        f"({total_time / n_evaluated:.2f}s/circuit)")
+    if capacity_exceeded:
+        log(f"  (stopped early — {args.n_circuits - n_evaluated} circuits skipped "
+            f"due to capacity limit)")
 
     # ---- Summary ----
-    print_comparison_table(all_metrics, tech_names, K, args.n_circuits,
+    print_comparison_table(all_metrics, tech_names, K, n_evaluated,
                            number_of_qubits, is_range=args.is_range)
     print_mosaic_burden(mosaic_burden)
 
@@ -874,11 +895,11 @@ def main():
                            show=args.show)
 
     log_section("SAVING RESULTS")
-    save_results_json(all_metrics, save_dir, args.n_circuits, tech_names,
+    save_results_json(all_metrics, save_dir, n_evaluated, tech_names,
                       number_of_qubits, args.run_dir, file_tag,
                       is_range=args.is_range,
                       mosaic_burden=mosaic_burden)
-    save_summary_txt(all_metrics, save_dir, tech_names, K, args.n_circuits,
+    save_summary_txt(all_metrics, save_dir, tech_names, K, n_evaluated,
                      number_of_qubits, file_tag,
                      is_range=args.is_range,
                      mosaic_burden=mosaic_burden)
