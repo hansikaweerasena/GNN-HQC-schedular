@@ -9,9 +9,15 @@ freshly-generated circuits. Reports the four comparison metrics:
     3. Mean Temporal Movement     (↓ lower is better)
     4. Idle Decoherence Placement (↑ higher is better)
 
+Plus MOSAIC-only hardener burden metrics (mean_burden, pct_violating).
+
 The MOSAIC model loading, circuit generation, and preprocessing pipeline are
 identical to eval_scheduler.py. Per-circuit visual panels and summary figures
 from the old script are intentionally omitted; use eval_scheduler.py for those.
+
+Range mode (--is_range): generates circuits across sizes num_qubits to
+num_qubits+10 with a tapered distribution. Output filenames use
+{num_qubits}_range prefix to avoid overwriting fixed-size results.
 
 Usage:
     python eval_scheduler_v1.py \\
@@ -20,6 +26,11 @@ Usage:
         --n_circuits 300 \\
         --seed 99999 \\
         --save_dir eval_v1_out
+
+    # Range mode:
+    python eval_scheduler_v1.py \\
+        --run_dir  results/20250101_120000_run_v1 \\
+        --n_circuits 300 --num_qubits 30 --is_range
 """
 
 import argparse
@@ -91,6 +102,9 @@ def parse_args():
     p.add_argument("--num_qubits", type=int, default=None,
                    help="Override num_qubits for generated circuits. "
                         "Defaults to value in CIRCUIT_SOURCE_CFG from run_dir.")
+    p.add_argument("--is_range",   action="store_true",
+                   help="Generate circuits across sizes num_qubits .. num_qubits+10. "
+                        "Sizes +0..+8 get n_circuits//10 each, +9 and +10 get n_circuits//20 each.")
     p.add_argument("--show",       action="store_true",
                    help="Show summary comparison plot interactively")
     return p.parse_args()
@@ -372,6 +386,50 @@ def compute_metrics_v1(
     }
 
 
+def compute_mosaic_burden(
+    P_seq:            List[torch.Tensor],
+    hard_assignments: List[torch.Tensor],
+    caps:             torch.Tensor,
+) -> dict:
+    """
+    MOSAIC-only hardener burden metrics.
+
+    Compares soft model output to post-hardening hard assignments to quantify
+    how much work the hardener did to enforce capacity feasibility.
+
+    Returns dict with:
+        mean_burden     — avg qubits reassigned per layer (soft argmax → hard)
+        max_burden      — worst-case layer
+        pct_violating   — % of layers where soft expected occupancy exceeds capacity
+    """
+    T = len(P_seq)
+    caps_cpu = caps.cpu()
+
+    # --- hardening burden: qubits moved per layer ---
+    soft_argmax_list = [P_t.argmax(dim=1).cpu() for P_t in P_seq]
+    burden_per_layer = [
+        (soft_argmax_list[t] != hard_assignments[t].cpu()).float().sum().item()
+        for t in range(T)
+    ]
+    mean_burden = float(np.mean(burden_per_layer)) if burden_per_layer else 0.0
+    max_burden  = float(np.max(burden_per_layer))  if burden_per_layer else 0.0
+
+    # --- capacity overflow (expected occupancy) ---
+    violating_layers = 0
+    for P_t in P_seq:
+        expected_counts = P_t.detach().cpu().sum(dim=0)  # [K]
+        overflow = torch.relu(expected_counts - caps_cpu).sum().item()
+        if overflow > 0:
+            violating_layers += 1
+    pct_violating = violating_layers / max(T, 1) * 100.0
+
+    return {
+        "mean_burden":   mean_burden,
+        "max_burden":    max_burden,
+        "pct_violating": pct_violating,
+    }
+
+
 # =============================================================================
 # Summary table and figure
 # =============================================================================
@@ -400,11 +458,15 @@ def _format_comparison_table_lines(
     K:              int,
     n_circuits:     int,
     number_of_qubits: int,
+    is_range:       bool = False,
 ) -> List[str]:
     """Build comparison table as a list of lines (shared by print and txt save)."""
     lines = []
     lines.append(f"  Circuits evaluated : {n_circuits}")
-    lines.append(f"  Number of qubits   : {number_of_qubits}")
+    if is_range:
+        lines.append(f"  Qubit range        : {number_of_qubits} – {number_of_qubits + 10}")
+    else:
+        lines.append(f"  Number of qubits   : {number_of_qubits}")
     lines.append(f"  Technologies (K={K}): {', '.join(tech_names)}")
     lines.append("")
 
@@ -455,10 +517,11 @@ def print_comparison_table(
     K:                int,
     n_circuits:       int,
     number_of_qubits: int,
+    is_range:         bool = False,
 ):
     log_section("BASELINE COMPARISON TABLE")
     for line in _format_comparison_table_lines(
-            all_metrics, tech_names, K, n_circuits, number_of_qubits):
+            all_metrics, tech_names, K, n_circuits, number_of_qubits, is_range):
         print(line)
     print()
 
@@ -466,7 +529,7 @@ def print_comparison_table(
 def plot_comparison_figure(
     all_metrics:      Dict[str, List[dict]],
     save_dir:         str,
-    number_of_qubits: int,
+    file_tag:         str,
     show:             bool = False,
 ):
     """Simple 4-panel bar chart: one panel per metric, bars = methods."""
@@ -497,7 +560,7 @@ def plot_comparison_figure(
         )
 
     plt.tight_layout()
-    fig_path = os.path.join(save_dir, f"baseline_comparison_N{number_of_qubits}.png")
+    fig_path = os.path.join(save_dir, f"baseline_comparison_{file_tag}.png")
     fig.savefig(fig_path, dpi=150, bbox_inches="tight")
     log(f"  Comparison figure saved: {fig_path}")
     if show:
@@ -512,6 +575,9 @@ def save_results_json(
     tech_names:       List[str],
     number_of_qubits: int,
     run_dir:          str,
+    file_tag:         str,
+    is_range:         bool = False,
+    mosaic_burden:    Optional[List[dict]] = None,
 ):
     """Save per-circuit metrics for all methods as JSON for downstream use."""
     baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
@@ -534,16 +600,19 @@ def save_results_json(
         "run_dir":          run_dir,
         "n_circuits":       n_circuits,
         "number_of_qubits": number_of_qubits,
+        "is_range":         is_range,
         "tech_names":       tech_names,
         "win_rates":        win_rates,
         "methods":          {},
     }
+    if is_range:
+        summary["qubit_range"] = [number_of_qubits, number_of_qubits + 10]
     for method in METHOD_NAMES:
         mlist = all_metrics[method]
         summary["methods"][method] = {
             "per_circuit": [
-                {k: float(v) for k, v in m.items()
-                 if k not in ("T", "N")}
+                {k: (int(v) if k in ("T", "N") else float(v))
+                 for k, v in m.items()}
                 for m in mlist
             ],
             "means": {
@@ -555,7 +624,20 @@ def save_results_json(
                 for key, *_ in METRICS_CFG
             },
         }
-    out_path = os.path.join(save_dir, f"comparison_results_N{number_of_qubits}.json")
+
+    # MOSAIC-only burden metrics
+    if mosaic_burden:
+        mean_burdens   = [b["mean_burden"]   for b in mosaic_burden]
+        pct_violatings = [b["pct_violating"] for b in mosaic_burden]
+        summary["mosaic_burden"] = {
+            "mean_burden_mean":   float(np.mean(mean_burdens)),
+            "mean_burden_std":    float(np.std(mean_burdens)),
+            "pct_violating_mean": float(np.mean(pct_violatings)),
+            "pct_violating_std":  float(np.std(pct_violatings)),
+            "per_circuit":        mosaic_burden,
+        }
+
+    out_path = os.path.join(save_dir, f"comparison_results_{file_tag}.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
     log(f"  Results saved: {out_path}")
@@ -568,15 +650,83 @@ def save_summary_txt(
     K:                int,
     n_circuits:       int,
     number_of_qubits: int,
+    file_tag:         str,
+    is_range:         bool = False,
+    mosaic_burden:    Optional[List[dict]] = None,
 ):
-    """Save summary.txt mirroring the console comparison table."""
+    """Save summary.txt mirroring the console comparison table + burden block."""
     lines = ["BASELINE COMPARISON TABLE", "=" * 72, ""]
     lines += _format_comparison_table_lines(
-        all_metrics, tech_names, K, n_circuits, number_of_qubits)
-    out_path = os.path.join(save_dir, f"summary_N{number_of_qubits}.txt")
+        all_metrics, tech_names, K, n_circuits, number_of_qubits, is_range)
+    if mosaic_burden:
+        lines += _format_mosaic_burden_lines(mosaic_burden)
+    out_path = os.path.join(save_dir, f"summary_{file_tag}.txt")
     with open(out_path, "w") as f:
         f.write("\n".join(lines))
     log(f"  Summary txt saved: {out_path}")
+
+
+def _format_mosaic_burden_lines(mosaic_burden: List[dict]) -> List[str]:
+    """Build MOSAIC-only hardener burden summary as a list of lines."""
+    lines = []
+    lines.append("  MOSAIC HARDENER BURDEN (soft → hard correction)")
+    lines.append("  " + "-" * 60)
+
+    mean_burdens   = [b["mean_burden"]   for b in mosaic_burden]
+    pct_violatings = [b["pct_violating"] for b in mosaic_burden]
+
+    lines.append(
+        f"  Mean burden (qubits moved/layer)  : "
+        f"{np.mean(mean_burdens):.3f} ± {np.std(mean_burdens):.3f}  "
+        f"[min={np.min(mean_burdens):.3f}, max={np.max(mean_burdens):.3f}]"
+    )
+    lines.append(
+        f"  % layers violating capacity (soft): "
+        f"{np.mean(pct_violatings):.1f}% ± {np.std(pct_violatings):.1f}%  "
+        f"[min={np.min(pct_violatings):.1f}%, max={np.max(pct_violatings):.1f}%]"
+    )
+    lines.append("")
+    return lines
+
+
+def print_mosaic_burden(mosaic_burden: List[dict]):
+    """Print MOSAIC-only burden summary to console."""
+    log_section("MOSAIC HARDENER BURDEN")
+    for line in _format_mosaic_burden_lines(mosaic_burden):
+        print(line)
+    print()
+
+
+# =============================================================================
+# Range-mode size schedule
+# =============================================================================
+
+def build_range_schedule(base_nq: int, n_circuits: int) -> List[Tuple[int, int]]:
+    """
+    Build (qubit_count, num_circuits) pairs for range mode.
+
+    Sizes base_nq .. base_nq+8 each get n_circuits // 10 circuits.
+    Sizes base_nq+9 and base_nq+10 each get n_circuits // 20 circuits.
+
+    Example: base_nq=30, n_circuits=300
+      → 30 each for 30q–38q (9 × 30 = 270)
+      → 15 each for 39q, 40q  (2 × 15 = 30)
+      → total = 300
+    """
+    per_bucket = n_circuits // 10
+    per_tail   = n_circuits // 20
+    schedule = []
+    for offset in range(9):             # +0 .. +8
+        schedule.append((base_nq + offset, per_bucket))
+    for offset in range(9, 11):         # +9, +10
+        schedule.append((base_nq + offset, per_tail))
+    total = sum(c for _, c in schedule)
+    if total != n_circuits:
+        log(f"  WARNING: range schedule total={total} != n_circuits={n_circuits} "
+            f"(rounding). Adjusting first bucket.")
+        nq0, c0 = schedule[0]
+        schedule[0] = (nq0, c0 + (n_circuits - total))
+    return schedule
 
 
 # =============================================================================
@@ -599,6 +749,7 @@ def main():
     log(f"Checkpoint  : {args.checkpoint}")
     log(f"N circuits  : {args.n_circuits}")
     log(f"Eval seed   : {args.seed}")
+    log(f"is_range    : {args.is_range}")
     log(f"Save dir    : {save_dir}")
 
     # ---- Load model + cost config ----
@@ -627,83 +778,110 @@ def main():
         number_of_qubits = default_nq
         log(f"  num_qubits  : {number_of_qubits} (from run config)")
 
-    # ---- Build eval circuit provider ----
-    log_section("GENERATING EVALUATION CIRCUITS")
-    provider = build_provider(circuit_src_cfg, seed_base=args.seed)
-    log(f"Provider built: source={circuit_src_cfg['name']}, seed_base={args.seed}")
-    if "sampled_kwargs" in circuit_src_cfg and circuit_src_cfg["sampled_kwargs"]:
-        mix = circuit_src_cfg["sampled_kwargs"].get("option_mix", {})
-        log(f"  Option mix: {mix}")
+    # ---- File tag for outputs ----
+    file_tag = f"{number_of_qubits}_range" if args.is_range else f"N{number_of_qubits}"
+
+    # ---- Build size schedule ----
+    if args.is_range:
+        size_schedule = build_range_schedule(number_of_qubits, args.n_circuits)
+        log_section("RANGE MODE SIZE SCHEDULE")
+        for nq, cnt in size_schedule:
+            log(f"  {nq}q : {cnt} circuits")
+    else:
+        size_schedule = [(number_of_qubits, args.n_circuits)]
 
     # ---- Per-circuit loop ----
     log_section("RUNNING MOSAIC + BASELINES")
     all_metrics: Dict[str, List[dict]] = {m: [] for m in METHOD_NAMES}
+    mosaic_burden: List[dict] = []
     t0 = time.time()
+    global_idx = 0
 
-    for i in range(args.n_circuits):
-        t_circ = time.time()
-        qc  = provider.get(i)
-        rep, segments, layer_data_list = preprocess_circuit(qc, dataset_cfg, w_short, w_long)
-        T   = len(layer_data_list)
-        N   = rep.num_qubits
+    for nq, n_in_bucket in size_schedule:
+        # Rebuild provider with this qubit count
+        circuit_src_cfg.setdefault("kwargs", {})["num_qubits"] = nq
+        provider = build_provider(circuit_src_cfg, seed_base=args.seed + global_idx)
+        if args.is_range:
+            log(f"  --- {nq}q bucket: {n_in_bucket} circuits (seed_base={args.seed + global_idx}) ---")
 
-        # --- MOSAIC ---
-        P_seq            = run_inference(evol_model, cluster_module, layer_data_list)
-        mosaic_hard      = enforce_capacity_sequence(P_seq, caps)
-        mosaic_metrics   = compute_metrics_v1(
-            mosaic_hard, rep, segments, cost_module, caps, K, config, device)
-        all_metrics["MOSAIC"].append(mosaic_metrics)
+        for local_i in range(n_in_bucket):
+            t_circ = time.time()
+            qc  = provider.get(local_i)
+            rep, segments, layer_data_list = preprocess_circuit(qc, dataset_cfg, w_short, w_long)
+            T   = len(layer_data_list)
+            N   = rep.num_qubits
 
-        # --- B1, B3 ---
-        b1_hard    = baseline_b1(rep, caps, config, K)
-        b3_hard    = baseline_b3(rep, caps, config, K)
+            # --- MOSAIC ---
+            P_seq            = run_inference(evol_model, cluster_module, layer_data_list)
+            mosaic_hard      = enforce_capacity_sequence(P_seq, caps)
+            mosaic_metrics   = compute_metrics_v1(
+                mosaic_hard, rep, segments, cost_module, caps, K, config, device)
+            all_metrics["MOSAIC"].append(mosaic_metrics)
 
-        b1_metrics = compute_metrics_v1(
-            b1_hard, rep, segments, cost_module, caps, K, config, device)
-        b3_metrics = compute_metrics_v1(
-            b3_hard, rep, segments, cost_module, caps, K, config, device)
+            # --- MOSAIC burden (soft → hard) ---
+            burden = compute_mosaic_burden(P_seq, mosaic_hard, caps)
+            mosaic_burden.append(burden)
 
-        all_metrics["B1"].append(b1_metrics)
-        all_metrics["B3"].append(b3_metrics)
+            # --- B1, B3 ---
+            b1_hard    = baseline_b1(rep, caps, config, K)
+            b3_hard    = baseline_b3(rep, caps, config, K)
 
-        # --- B4: Wu beam search (seed=i for per-circuit reproducibility) ---
-        b4_hard    = baseline_b4(rep, caps, config, K, seed=i)
-        b4_metrics = compute_metrics_v1(
-            b4_hard, rep, segments, cost_module, caps, K, config, device)
-        all_metrics["B4"].append(b4_metrics)
+            b1_metrics = compute_metrics_v1(
+                b1_hard, rep, segments, cost_module, caps, K, config, device)
+            b3_metrics = compute_metrics_v1(
+                b3_hard, rep, segments, cost_module, caps, K, config, device)
 
-        # --- B5: Burt-style FM + gate-grouping ---
-        b5_hard    = baseline_b5(rep, caps, config, K)
-        b5_metrics = compute_metrics_v1(
-            b5_hard, rep, segments, cost_module, caps, K, config, device)
-        all_metrics["B5"].append(b5_metrics)
+            all_metrics["B1"].append(b1_metrics)
+            all_metrics["B3"].append(b3_metrics)
 
-        elapsed = time.time() - t_circ
-        log(
-            f"  [{i+1:3d}/{args.n_circuits}] N={N:2d}, T={T:3d} | "
-            f"MOSAIC={mosaic_metrics['hard_cost']:.3f}  "
-            f"B1={b1_metrics['hard_cost']:.3f}  "
-            f"B3={b3_metrics['hard_cost']:.3f}  "
-            f"B4={b4_metrics['hard_cost']:.3f}  "
-            f"B5={b5_metrics['hard_cost']:.3f}  "
-            f"({elapsed:.1f}s)"
-        )
+            # --- B4: Wu beam search (seed=global_idx for per-circuit reproducibility) ---
+            b4_hard    = baseline_b4(rep, caps, config, K, seed=global_idx)
+            b4_metrics = compute_metrics_v1(
+                b4_hard, rep, segments, cost_module, caps, K, config, device)
+            all_metrics["B4"].append(b4_metrics)
+
+            # --- B5: Burt-style FM + gate-grouping ---
+            b5_hard    = baseline_b5(rep, caps, config, K)
+            b5_metrics = compute_metrics_v1(
+                b5_hard, rep, segments, cost_module, caps, K, config, device)
+            all_metrics["B5"].append(b5_metrics)
+
+            elapsed = time.time() - t_circ
+            total_done = global_idx + 1
+            log(
+                f"  [{total_done:3d}/{args.n_circuits}] N={N:2d}, T={T:3d} | "
+                f"MOSAIC={mosaic_metrics['hard_cost']:.3f}  "
+                f"B1={b1_metrics['hard_cost']:.3f}  "
+                f"B3={b3_metrics['hard_cost']:.3f}  "
+                f"B4={b4_metrics['hard_cost']:.3f}  "
+                f"B5={b5_metrics['hard_cost']:.3f}  "
+                f"burden={burden['mean_burden']:.2f}  "
+                f"({elapsed:.1f}s)"
+            )
+            global_idx += 1
 
     total_time = time.time() - t0
     log(f"\nDone: {args.n_circuits} circuits in {total_time:.1f}s "
         f"({total_time / args.n_circuits:.2f}s/circuit)")
 
     # ---- Summary ----
-    print_comparison_table(all_metrics, tech_names, K, args.n_circuits, number_of_qubits)
+    print_comparison_table(all_metrics, tech_names, K, args.n_circuits,
+                           number_of_qubits, is_range=args.is_range)
+    print_mosaic_burden(mosaic_burden)
 
     log_section("GENERATING COMPARISON FIGURE")
-    plot_comparison_figure(all_metrics, save_dir, number_of_qubits, show=args.show)
+    plot_comparison_figure(all_metrics, save_dir, file_tag,
+                           show=args.show)
 
     log_section("SAVING RESULTS")
     save_results_json(all_metrics, save_dir, args.n_circuits, tech_names,
-                      number_of_qubits, args.run_dir)
+                      number_of_qubits, args.run_dir, file_tag,
+                      is_range=args.is_range,
+                      mosaic_burden=mosaic_burden)
     save_summary_txt(all_metrics, save_dir, tech_names, K, args.n_circuits,
-                     number_of_qubits)
+                     number_of_qubits, file_tag,
+                     is_range=args.is_range,
+                     mosaic_burden=mosaic_burden)
 
     log_section("EVALUATION COMPLETE")
     log(f"All outputs saved to: {save_dir}")
