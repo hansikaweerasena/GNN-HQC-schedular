@@ -19,6 +19,6 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 # easily exceeds the default 1024, causing "Too many open files" in the feeder thread.
 
 python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config_10 \
-    --cost_cfg  cost_config_tp2n_99_10_cap8.json \
-    --run_tag   v2_batched_tp2n_99_10_cap8    
+    --sched_cfg configs.scheduler_config \
+    --cost_cfg  cost_config_tp10n_99.json \
+    --run_tag   v2_batched_tp10n_99      
