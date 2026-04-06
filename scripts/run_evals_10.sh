@@ -5,25 +5,10 @@
 # set -e  # exit on first error
 
 DIRS=(
-    # tp2n_99
-    # tp1n_99
-    # tp3n_99
-    # tp4n_99
-    tp8n_99
-    # tp9n_99
-    # tp7n_99
-    # tp5n_98
-    # tp6n_98
-    # tp7n_98
-    # tp1n_98
-    # tp7n_99
-    # tp2n_98
-    # tp6n_99_50
-    # tp3n_98
-    # tp4n_98
-    # tp5n_98
-    # tp6n_98
-    # tp7n_98
+    tp2n_99_10
+    tp2n_98_10
+    tp2n_99_10_cap8
+    tp2n_98_10_cap8
     # add more directories here
 )
 
@@ -39,13 +24,12 @@ for DIR in "${DIRS[@]}"; do
     python eval_scheduler_v1.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
         --n_circuits 300 \
-        --is_range
 
     echo "[v2] MQT Bench zero-shot..."
     python eval_scheduler_v2.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
-        --qubit_min 28 \
-        --qubit_max 32
+        --qubit_min 8 \
+        --qubit_max 12
 
     echo "  Done: $DIR"
 done
