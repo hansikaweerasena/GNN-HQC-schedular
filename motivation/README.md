@@ -22,7 +22,7 @@ Verified against `qiskit 2.5.1` / `qiskit-aer 0.17.2`.
 MOSAIC_CONFIG_DIR=/path/to/cost_configs pytest -q
 ```
 
-91 tests: the NB1/NB2/NB3 checkpoints, ST1–ST19, carried placement, the circuit adapter
+92 tests: the NB1/NB2/NB3 checkpoints, ST1–ST19, carried placement, the circuit adapter
 (barrier grid preservation, SWAP pricing, layer validation), the routing guards, and the
 config drift check. **Run this before every experiment batch.** If anything here fails, every
 number the harness produces is suspect.
@@ -111,10 +111,14 @@ Nothing else. `lower()` is verbatim.
   double-count), and non-movers in the synchronised set pay real idle at their own T2.
   `movement_mode(derived=False, visible=0.0)` recovers the v4 overlapped numbers exactly and
   is the sensitivity foil — keep it, don't delete it.
-- **`t_comm` and `t_move_visible` are separate quantities.** They were one scalar
-  (`t_remote`) until v4, harmless only because it was 0. Never merge them again.
-- **`t_comm = max(t2q_a, t2q_b)` is an optimistic lower bound** — it drops the endpoint
-  measurements, the classical round trip, and the Pauli corrections. Say so in the paper.
+- **`t_comm` and `t_move` are different rules, not the same number twice.** A teleported
+  *gate* fires a local CNOT at **both** endpoints in parallel, so it waits for the slower:
+  `t_comm(a,b) = max(t2q_a, t2q_b)`, symmetric. A state *transfer* performs a Bell-basis
+  measurement at the **source** only (the destination applies 1Q Pauli corrections), so
+  `t_move(from,to) = t2q_from`, **asymmetric**. These were one scalar (`t_remote`) until
+  v4, harmless only because it was 0. Never merge them again.
+- **Both are optimistic lower bounds** — they drop the classical round trip and the
+  conditional corrections. Say so in the paper.
 
 ## Block boundaries and DP state sufficiency
 
@@ -139,7 +143,7 @@ generalise to K≥3 under module scope, where an untouched module keeps running 
 | uniform `f_comm`, `f_move` across module pairs | favours heterogeneous |
 | pre-shared Bell pairs, unlimited supply | favours heterogeneous |
 | unlimited communication qubits (concurrent remote gates never serialise) | favours heterogeneous |
-| `t_move = max(t2q_from, t2q_to)`, transfer exposed on the critical path | favours homogeneous / static |
+| `t_move = t2q_from` (source-side Bell measurement), transfer exposed on the critical path | favours homogeneous / static |
 | classical round trip and Pauli correction dropped from `t_move` and `t_comm` | favours heterogeneous |
 | `t_comm = max(t2q_a, t2q_b)`, derived per pair | favours homogeneous SC |
 | per-gate telegate, no cat-entanglement fan-out amortisation | favours homogeneous |
@@ -214,3 +218,31 @@ So `circuit_to_layers` raises on a source-level `swap`. Fix it with `to_cx_basis
 
 Note this means the existing `TWO_QUBIT_GATES = ("cx", "cz", "swap")` generator cannot be
 used for M1/M2 as-is: drop `swap` from the logical alphabet, or normalise the basis.
+
+
+## Why `t_move` is source-side, and why it matters to the argument
+
+State teleportation costs the **origin's** two-qubit gate time, not the maximum over the
+two endpoints. Only the source performs a 2Q operation (the Bell-basis measurement); the
+destination applies single-qubit Pauli corrections. The rule is therefore directional, and
+the direction is the whole point:
+
+| move | `t_move` | as fraction of T2_SC | |
+|---|---:|---:|---|
+| SC→TI (park) | 200 ns | 0.0025 | cheap |
+| TI→SC (retrieve) | 100,000 ns | 1.25 | **lethal** |
+| SC→NA (park) | 200 ns | 0.0025 | cheap |
+| NA→SC (retrieve) | 1,000 ns | 0.0125 | survivable |
+
+Parking costs identically in both pairs. **Retrieval differs by the ratio of the origin
+technologies' gate speeds**, and that single asymmetry is what makes SC+TI degenerate
+(Act I) while SC+NA stays workable (Act II). Under a `max` rule the contrast disappears,
+because parking into TI would be charged a TI gate time it never actually pays.
+
+Two tests pin this: `test_t_move_is_source_side_and_asymmetric` and
+`test_move_asymmetry_separates_the_two_pairs`. The latter derives the ratio from the tech
+table rather than hardcoding it, so it survives a refreeze.
+
+At a boundary with several concurrent movers the clock still advances by the **max** over
+movers — each transfer costs its own source's gate time, and the boundary clears when the
+slowest completes. Two different maxima; don't collapse them.

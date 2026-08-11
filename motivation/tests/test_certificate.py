@@ -154,19 +154,41 @@ class TestNB2:
         assert COMM["t_move_derived"] is True
         assert COMM["t_move_visible"] == 0.0, "the legacy scalar is the foil, and stays 0"
 
-    def test_t_move_derived_per_pair(self):
-        assert t_move("sc", "sc") == 200.0
-        assert t_move("sc", "na") == 2_000.0
-        assert t_move("na", "sc") == 2_000.0        # symmetric
-        assert t_move("sc", "ti") == 100_000.0
+    def test_t_move_is_source_side_and_asymmetric(self):
+        """Only the SOURCE performs a 2Q operation in state teleportation (the Bell-basis
+        measurement); the destination applies 1Q Pauli corrections. So the latency is the
+        origin's gate time, and the direction matters."""
         for a in TECHS:
             for b in TECHS:
-                assert t_move(a, b) >= max(TECHS[a].t2q, TECHS[b].t2q)
+                assert t_move(a, b) == TECHS[a].t2q
+        assert t_move("sc", "na") == 200.0
+        assert t_move("na", "sc") == 2_000.0
+        assert t_move("sc", "na") != t_move("na", "sc"), "the rule must NOT be symmetric"
 
-    def test_t_move_and_t_comm_stay_separate_symbols(self):
-        """They were one scalar until v4 and the conflation was harmless only because it
-        was 0. Equal values today do not make them the same quantity."""
+    def test_move_asymmetry_separates_the_two_pairs(self):
+        """The paper's Act I / Act II table. Parking costs the same in both pairs;
+        RETRIEVAL differs by 100x, and that is what makes SC+TI degenerate while SC+NA
+        stays workable. A max-rule t_move would hide this."""
+        T2sc = TECHS["sc"].T2
+        assert t_move("sc", "ti") == t_move("sc", "na")            # parking: identical
+        assert t_move("ti", "sc") / T2sc > 1.0                     # retrieval: lethal
+        assert t_move("na", "sc") / T2sc < 0.05                    # retrieval: survivable
+        # Retrieval cost is exactly the origin's 2Q gate time, so the ratio between the
+        # pairs is the ratio of TI's to NA's gate speed. Derived, not hardcoded, so this
+        # keeps holding when the tech table is refrozen.
+        assert (t_move("ti", "sc") / t_move("na", "sc")
+                == TECHS["ti"].t2q / TECHS["na"].t2q >= 50.0)
+
+    def test_t_move_and_t_comm_are_different_rules(self):
+        """A teleported GATE fires a local CNOT at BOTH endpoints in parallel, so it waits
+        for the slower one (max). A state TRANSFER measures only at the source. Different
+        primitives, different rules -- these were one scalar (`t_remote`) until v4."""
         assert t_move is not t_comm
+        assert t_comm("sc", "ti") == 100_000.0 and t_move("sc", "ti") == 200.0
+        for a in TECHS:
+            for b in TECHS:
+                assert t_comm(a, b) == max(TECHS[a].t2q, TECHS[b].t2q)
+                assert t_move(a, b) <= t_comm(a, b)
 
     def test_movement_mode_restores(self):
         before = dict(COMM)
@@ -520,14 +542,16 @@ class TestST9toST15:
             assert consistent(d), f"clock/decoherence inconsistency: {name}"
 
     def test_ST15_next_block_uses_destination_technology_gate_time(self):
-        """20 ns of SC 1Q + the sc->ti transfer + one TI 2Q gate. Under the v4 overlapped
-        model this was 100020; the transfer term is the only thing that changed."""
+        """20 ns of SC 1Q + the sc->ti transfer (200 ns, SOURCE-side) + one TI 2Q gate.
+        The GATE must be charged at the destination's rate even though the TRANSFER was
+        charged at the source's -- two different lookups, and swapping either one is a
+        silent 500x error."""
         args = ([[('1q', 0, H)], [('2q', 0, 2, CX)]],
                 [{0: 0, 2: 1}, {0: 1, 2: 1}],
                 [mod(0, 'sc', [0, 1]), mod(1, 'ti', [2, 3])])
         _, _, d = lower(*args)
-        assert d.makespan == 20.0 + t_move('sc', 'ti') + TECHS['ti'].t2q == 200_020.0, \
-            "would be 220 if SC t2q leaked through"
+        assert d.makespan == 20.0 + t_move('sc', 'ti') + TECHS['ti'].t2q == 100_220.0, \
+            "would be 220 if SC t2q leaked into the gate, 200020 if TI leaked into the move"
         with movement_mode(derived=False, visible=0.0):
             _, _, d0 = lower(*args)
         assert d0.makespan == 100_020.0, "v4 regression value must remain reachable"

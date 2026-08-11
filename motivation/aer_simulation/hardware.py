@@ -18,7 +18,7 @@ quantities -- the duration of a remote 2Q gate, and the latency of a
 block-boundary state transfer. At 0.0 the conflation was invisible.
 
   t_comm(a, b)            duration of a remote 2Q gate      max(t2q_a, t2q_b)
-  t_move(a, b)            latency of a state transfer       max(t2q_a, t2q_b)
+  t_move(from, to)        latency of a state transfer       t2q_from  (ASYMMETRIC)
   COMM["f_comm"]          aggregate fidelity of the whole teleported-gate primitive   0.95
   COMM["f_move"]          aggregate fidelity of the whole state-transfer primitive    0.99
 
@@ -44,7 +44,10 @@ it is cheap to remove.
 
 Default is now ``COMM["t_move_derived"] = True``: the boundary advances by
 ``max`` over movers of ``t_move(from, to)``, and every qubit synchronised at
-that boundary pays for the wait. Set ``t_move_derived = False`` (with
+that boundary pays for the wait. Note the two ``max``es are different things --
+each individual transfer costs its SOURCE's 2Q gate time (``t_move`` is
+asymmetric), and the boundary then clears when the slowest of the concurrent
+transfers completes. Set ``t_move_derived = False`` (with
 ``t_move_visible = 0.0``) to recover the v4 overlapped model exactly -- kept as
 the sensitivity foil, not deleted. Use the ``movement_mode`` context manager.
 
@@ -161,23 +164,38 @@ def t_comm(tech_a, tech_b):
 def t_move(tech_from, tech_to):
     """Critical-path latency of a state transfer from `tech_from` to `tech_to`.
 
-    Same max rule as `t_comm`, and deliberately so: state teleportation consumes
-    a Bell pair through a local Bell-basis measurement at the source and a
-    conditional Pauli correction at the destination. The measurement is a 2Q
-    operation on the source side, so the transfer cannot complete faster than
-    the source's native 2Q gate; the max rule additionally refuses to let a slow
-    destination look free.
+    SOURCE-SIDE rule: `t2q` of the ORIGIN technology. This is ASYMMETRIC, and
+    the asymmetry is the physics, not an approximation.
 
-    Relative to a source-only rule (`t2q_from`) this is CONSERVATIVE -- it never
-    under-charges. Relative to physical reality it remains an OPTIMISTIC LOWER
-    BOUND, because it still drops the classical round trip and the correction
-    latency, exactly as `t_comm` does. Declare both in the limitations paragraph.
+    State teleportation consumes a pre-shared Bell pair through
+      (1) a Bell-basis measurement at the SOURCE -- a 2Q operation, and
+      (2) conditional Pauli corrections at the DESTINATION -- 1Q operations.
+    Only the source performs a two-qubit gate, so the transfer cannot complete
+    faster than the source's native 2Q gate, and the destination's gate speed
+    does not gate it.
 
-    Kept as a SEPARATE function from `t_comm` on purpose. These were one scalar
-    (`t_remote`) until v4 and the conflation was harmless only because it was 0.
-    Never merge them again.
+    Contrast `t_comm`, which uses `max`: a teleported GATE applies a local CNOT
+    against a Bell-pair half at BOTH endpoints in parallel, so it waits for the
+    slower of the two. Different primitive, different rule. These were one
+    scalar (`t_remote`) until v4; never merge them again.
+
+    Why this matters for the paper -- the same rule that kills SC+TI passes SC+NA:
+
+        move        t_move      as fraction of T2_SC
+        SC->TI         200 ns       0.0025   parking is cheap
+        TI->SC     100,000 ns       1.25     RETRIEVAL IS LETHAL
+        SC->NA         200 ns       0.0025   parking is cheap
+        NA->SC       1,000 ns       0.0125   retrieval is survivable
+
+    Parking costs the same in both pairs; retrieval differs by 100x. Under a
+    `max` rule that asymmetry is invisible, because parking into TI would be
+    charged TI's gate time it never actually pays. The source rule states the
+    Act I infeasibility mechanism and the Act II feasibility claim in one line.
+
+    Still an OPTIMISTIC LOWER BOUND: it drops the classical round trip and the
+    destination correction latency, exactly as `t_comm` does. Declare both.
     """
-    return max(TECHS[tech_from].t2q, TECHS[tech_to].t2q)
+    return TECHS[tech_from].t2q
 
 
 class noiseless_comm:
