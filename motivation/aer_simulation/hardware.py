@@ -89,10 +89,17 @@ SABRE_SEEDS = list(range(10))
 
 
 # ---------------------------------------------------------------------------
-# 1. Technology specs
+# 1. Technology specs  -- FROZEN as techs_v1 (2026-08-11)
 # ---------------------------------------------------------------------------
-# Hardcoded from cost_config_v3.json (SC, NA) and cost_config_tp2n_99.json
-# (SC, TI). SC is byte-identical across both configs, so it is defined once.
+# `techs_v1.json` (next to this file) is the SINGLE SOURCE OF TRUTH and carries a
+# per-number citation slot. These values are hardcoded here only for speed;
+# `configs.drift_check()` asserts the two still agree and is part of the test
+# suite. Change a number in BOTH places, bump the frozen id, re-run pytest.
+#
+# The operating point is a defensible "good but not record" pair, chosen
+# deliberately: the claim is that heterogeneity pays on realistic hardware, not
+# only on hero devices. T2_SC is the number the result is most sensitive to.
+#
 # All times in NANOSECONDS.
 #
 # fm / tm are intentionally omitted. Data-qubit measurement is terminal and
@@ -113,20 +120,22 @@ class TechSpec:
 
 TECHS = {
     "sc": TechSpec(name="sc",
-                   f1q=0.9999, f2q=0.999,          # v3 / tp2n gate_fidelity
-                   T2=80_000.0,                    # coherence.T2
-                   t1q=20.0, t2q=200.0,            # gate_time
-                   kappa=2.3, all_to_all=False),   # routing.kappa
+                   f1q=0.9999, f2q=0.9990,
+                   T2=100_000.0,                   # 100 us
+                   t1q=20.0, t2q=100.0,
+                   kappa=2.3, all_to_all=False, max_qubits=1000),
     "na": TechSpec(name="na",
-                   f1q=0.9995, f2q=0.997,          # v3 gate_fidelity
-                   T2=200_000.0,                   # coherence.T2
-                   t1q=200.0, t2q=2_000.0,         # gate_time
-                   kappa=0.0, all_to_all=True),    # routing.all_to_all
+                   f1q=0.9995, f2q=0.9970,
+                   T2=2_000_000.0,                 # 2 ms
+                   t1q=500.0, t2q=1_000.0,
+                   kappa=0.0, all_to_all=True, max_qubits=6100),
+    # Act I only. Retrieval from TI costs a 100 us Bell measurement at the source,
+    # = 1.0x T2_SC, which kills the waiting spectator. Not a Phase-1 pair.
     "ti": TechSpec(name="ti",
-                   f1q=0.9999, f2q=0.9997,         # tp2n gate_fidelity
-                   T2=2_000_000.0,                 # coherence.T2
-                   t1q=10_000.0, t2q=100_000.0,    # gate_time
-                   kappa=0.0, all_to_all=True),    # routing.all_to_all
+                   f1q=0.9999, f2q=0.9997,
+                   T2=2_000_000.0,
+                   t1q=10_000.0, t2q=100_000.0,
+                   kappa=0.0, all_to_all=True, max_qubits=32),
 }
 
 

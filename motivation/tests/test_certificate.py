@@ -37,6 +37,7 @@ from qiskit.quantum_info import (
 from mosaic_aer import (
     dephasing_channel, gate_infidelity_channel, plus_coherence, idle_coherence_on_aer,
     TECHS, COMM, t_comm, t_move, HW, Module, noiseless_techs, noiseless_comm, movement_mode,
+    load_frozen,
     homogeneous_machine, heterogeneous_machine,
     route, un_permute, segment_blocks, lower, aer_fidelity, score, pareto_front,
     drift_check, H, CX, mod,
@@ -119,10 +120,42 @@ class TestNB1:
 
 class TestNB2:
 
-    def test_hardcoded_specs(self):
-        assert TECHS["sc"].f2q == 0.999 and TECHS["sc"].T2 == 80_000.0
-        assert TECHS["na"].t2q == 2_000.0 and TECHS["ti"].t2q == 100_000.0
-        assert TECHS["ti"].T2 == 2_000_000.0
+    def test_frozen_operating_point(self):
+        """Spot-check of techs_v1. `drift_check` is the real guard (it compares every
+        field against techs_v1.json); this exists so a casual reader can see the
+        operating point without opening the JSON."""
+        assert TECHS["sc"].f2q == 0.9990 and TECHS["sc"].T2 == 100_000.0
+        assert TECHS["sc"].t2q == 100.0
+        assert TECHS["na"].f2q == 0.9970 and TECHS["na"].T2 == 2_000_000.0
+        assert TECHS["na"].t1q == 500.0 and TECHS["na"].t2q == 1_000.0
+        assert TECHS["ti"].t2q == 100_000.0 and TECHS["ti"].T2 == 2_000_000.0
+
+    def test_frozen_table_is_the_source_of_truth(self):
+        """hardware.py must not drift from techs_v1.json."""
+        from mosaic_aer import load_frozen, drift_check
+        assert load_frozen()["_id"] == "techs_v1"
+        assert drift_check(verbose=False) == len(TECHS)
+
+    def test_non_domination_holds(self):
+        """The precondition for the whole paper: neither technology dominates. SC wins
+        gate error and speed, NA wins coherence and connectivity. If one ever dominated
+        on every axis the assignment problem would collapse to a trivial rule (which is
+        exactly what happens with SC+TI)."""
+        sc, na = TECHS["sc"], TECHS["na"]
+        assert sc.f2q > na.f2q and sc.t2q < na.t2q          # SC: accuracy + speed
+        assert na.T2 > sc.T2 and na.all_to_all and not sc.all_to_all   # NA: coherence + connectivity
+
+    def test_derived_constants_of_the_operating_point(self):
+        """The two numbers a reviewer can derive in two lines, so they are asserted here
+        rather than discovered in review. Both follow from the frozen table alone."""
+        sc, na = TECHS["sc"], TECHS["na"]
+        # M: what one partner-tech 2Q gate costs a spectator, relative to its own tech.
+        assert na.t2q / sc.t2q == 10.0
+        # Duty-cycle threshold: SC is the right home only above this. Compare
+        # 0.001*g + I/T2_sc  against  0.003*g + I/T2_na.
+        thr = ((1 - na.f2q) - (1 - sc.f2q)) / (1 / sc.T2 - 1 / na.T2)   # ns idle per gate
+        duty = sc.t2q / (sc.t2q + thr)
+        assert abs(duty - 0.32) < 0.02, f"duty threshold moved to {duty:.2f}"
 
     def test_sc_topology_by_capacity(self):
         ring = {tuple(sorted(e)) for e in HW.coupling_map("sc", 4).get_edges()}
@@ -133,7 +166,7 @@ class TestNB2:
 
     def test_swap_cost(self):
         assert np.isclose(HW.swap_fidelity("sc"), 0.999 ** 3)
-        assert np.isclose(HW.swap_duration("sc"), 600.0)
+        assert np.isclose(HW.swap_duration("sc"), 3 * TECHS["sc"].t2q)
 
     def test_machine_builders(self):
         M = homogeneous_machine("sc", 2, 4)
@@ -161,8 +194,8 @@ class TestNB2:
         for a in TECHS:
             for b in TECHS:
                 assert t_move(a, b) == TECHS[a].t2q
-        assert t_move("sc", "na") == 200.0
-        assert t_move("na", "sc") == 2_000.0
+        assert t_move("sc", "na") == 100.0
+        assert t_move("na", "sc") == 1_000.0
         assert t_move("sc", "na") != t_move("na", "sc"), "the rule must NOT be symmetric"
 
     def test_move_asymmetry_separates_the_two_pairs(self):
@@ -171,7 +204,7 @@ class TestNB2:
         stays workable. A max-rule t_move would hide this."""
         T2sc = TECHS["sc"].T2
         assert t_move("sc", "ti") == t_move("sc", "na")            # parking: identical
-        assert t_move("ti", "sc") / T2sc > 1.0                     # retrieval: lethal
+        assert t_move("ti", "sc") / T2sc >= 1.0                    # retrieval: lethal
         assert t_move("na", "sc") / T2sc < 0.05                    # retrieval: survivable
         # Retrieval cost is exactly the origin's 2Q gate time, so the ratio between the
         # pairs is the ratio of TI's to NA's gate speed. Derived, not hardcoded, so this
@@ -184,7 +217,7 @@ class TestNB2:
         for the slower one (max). A state TRANSFER measures only at the source. Different
         primitives, different rules -- these were one scalar (`t_remote`) until v4."""
         assert t_move is not t_comm
-        assert t_comm("sc", "ti") == 100_000.0 and t_move("sc", "ti") == 200.0
+        assert t_comm("sc", "ti") == 100_000.0 and t_move("sc", "ti") == TECHS["sc"].t2q
         for a in TECHS:
             for b in TECHS:
                 assert t_comm(a, b) == max(TECHS[a].t2q, TECHS[b].t2q)
@@ -197,20 +230,23 @@ class TestNB2:
         assert COMM == before
 
     def test_t_comm_derived_per_pair(self):
-        assert t_comm("sc", "sc") == 200.0        # homogeneous SC gets a CHEAP remote gate
-        assert t_comm("na", "na") == 2_000.0
-        assert t_comm("sc", "na") == 2_000.0      # remote gate is time-neutral vs slow endpoint
-        assert t_comm("ti", "ti") == 100_000.0
+        assert t_comm("sc", "sc") == 100.0        # homogeneous SC gets a CHEAP remote gate
+        assert t_comm("na", "na") == 1_000.0
+        assert t_comm("sc", "na") == 1_000.0      # time-neutral vs the slow endpoint
         assert t_comm("sc", "ti") == 100_000.0
-        assert t_comm("sc", "ti") == t_comm("ti", "sc")
+        assert t_comm("sc", "ti") == t_comm("ti", "sc"), "gate teleportation is symmetric"
         for a in TECHS:
             for b in TECHS:
-                assert t_comm(a, b) >= max(TECHS[a].t2q, TECHS[b].t2q)
+                assert t_comm(a, b) == max(TECHS[a].t2q, TECHS[b].t2q)
 
     def test_the_asymmetry_that_carries_the_paper(self):
-        """SC+TI is the only pair where a remote gate outlives the spectator's coherence."""
-        assert t_comm("sc", "ti") / TECHS["sc"].T2 > 1.0
-        assert t_comm("sc", "sc") / TECHS["sc"].T2 < 0.01
+        """A remote gate to TI outlives the SC spectator's coherence; to NA it barely
+        dents it. Written as survival fractions so it stays meaningful under a refreeze."""
+        T2 = TECHS["sc"].T2
+        surv = lambda a, b: np.exp(-t_comm(a, b) / T2)
+        assert surv("sc", "ti") < 0.40, "SC+TI must remain lethal to spectators"
+        assert surv("sc", "na") > 0.98, "SC+NA must remain survivable"
+        assert surv("sc", "sc") > 0.99
 
     def test_noiseless_techs_restores(self):
         before = dict(TECHS)
@@ -349,9 +385,11 @@ class TestST1toST8:
         assert np.isclose(f, 0.9997, atol=ATOL)
 
     def test_ST3_sc_idle(self):
+        """An SC qubit waits out a TI 2Q gate at its own T2. Idle = t2q_ti - t1q_sc."""
+        idle = TECHS['ti'].t2q - TECHS['sc'].t1q
         qc, l2w, _ = lower([[('1q', 0, H), ('2q', 2, 3, CX)]], [{0: 0, 1: 0, 2: 1, 3: 1}],
                            [mod(0, 'sc', [0, 1]), mod(1, 'ti', [2, 3])])
-        assert np.isclose(coh_of(qc, l2w[0]), np.exp(-99980 / 80000), atol=ATOL)
+        assert np.isclose(coh_of(qc, l2w[0]), np.exp(-idle / TECHS['sc'].T2), atol=ATOL)
 
     def test_ST4_f_comm(self):
         f, _ = aer_fidelity([[('2q', 0, 1, CX)]], [{0: 0, 1: 1}],
@@ -381,13 +419,15 @@ class TestST1toST8:
     def test_ST7_sync_idle_charged_at_pre_move_T2(self):
         """The mover pays for its own slack at its WORSE coherence time before it leaves.
         Pure ASAP would charge 0. This is why t_move_visible = 0 is not a subsidy."""
+        idle = TECHS['ti'].t2q - TECHS['sc'].t1q
         qc, l2w, d = lower([[('1q', 0, H), ('2q', 2, 3, CX)], [('2q', 2, 3, CX)]],
                            [{0: 0, 2: 1, 3: 1}, {0: 1, 2: 1, 3: 1}],
                            [mod(0, 'sc', [0, 1]), mod(1, 'ti', [2, 3, 4])])
-        exp = ((2 * 0.9999 - 1) * np.exp(-99980 / 80000)
-               * (2 * 0.99 - 1) * np.exp(-100000 / 2_000_000))
+        exp = ((2 * TECHS['sc'].f1q - 1) * np.exp(-idle / TECHS['sc'].T2)
+               * (2 * COMM['f_move'] - 1)
+               * np.exp(-TECHS['ti'].t2q / TECHS['ti'].T2))
         assert np.isclose(coh_of(qc, l2w[0]), exp, atol=ATOL)
-        assert abs(d.sync_idle.get(0, 0) - 99980) < 1
+        assert abs(d.sync_idle.get(0, 0) - idle) < 1
 
     def test_ST8_module_scope_leaves_untouched_module_running(self):
         layers = [[('1q', 0, H), ('2q', 2, 3, CX), ('2q', 5, 6, CX)], [('2q', 5, 6, CX)]]
@@ -421,11 +461,12 @@ class TestST9toST15:
     def test_ST10_spectator_dephases_through_a_remote_gate(self):
         """The paper's number. Under t_remote = 0 this was 0 ns and coherence 1.0 --
         EFCL was blind to 97% of a remote gate's cost."""
+        idle = TECHS['ti'].t2q - TECHS['sc'].t1q
         qc, l2w, d = lower([[('1q', 2, H), ('2q', 0, 1, CX)]], [{0: 0, 1: 1, 2: 0}],
                            [mod(0, 'sc', [0, 1]), mod(1, 'ti', [2])])
-        exp = (2 * 0.9999 - 1) * np.exp(-99980 / 80000)
+        exp = (2 * TECHS['sc'].f1q - 1) * np.exp(-idle / TECHS['sc'].T2)
         assert np.isclose(coh_of(qc, l2w[2]), exp, atol=ATOL)
-        assert abs(d.idle_time.get(2, 0) - 99980) < 1
+        assert abs(d.idle_time.get(2, 0) - idle) < 1
 
     def test_ST11_remote_branch_keys_on_module_not_technology(self):
         """2xSC baseline honesty: a cross-module SC-SC gate is remote and pays f_comm.
@@ -433,10 +474,10 @@ class TestST9toST15:
         fr, dr = aer_fidelity([[('2q', 0, 1, CX)]], [{0: 0, 1: 1}],
                               [mod(0, 'sc', [0]), mod(1, 'sc', [1])])
         fl, dl = aer_fidelity([[('2q', 0, 1, CX)]], [{0: 0, 1: 0}], [mod(0, 'sc', [0, 1])])
-        assert np.isclose(fr, 0.95, atol=ATOL)
-        assert np.isclose(fl, 0.999, atol=ATOL)
-        assert dr.comm_count == 1 and dr.comm_time == 200.0 and dl.comm_count == 0
-        assert dr.makespan == dl.makespan == 200.0, \
+        assert np.isclose(fr, COMM['f_comm'], atol=ATOL)
+        assert np.isclose(fl, TECHS['sc'].f2q, atol=ATOL)
+        assert dr.comm_count == 1 and dr.comm_time == TECHS['sc'].t2q and dl.comm_count == 0
+        assert dr.makespan == dl.makespan == TECHS['sc'].t2q, \
             "homogeneous SC pays for distribution in fidelity, not in time"
 
     def test_ST12a_exactly_one_f_move_per_mover(self):
@@ -542,7 +583,7 @@ class TestST9toST15:
             assert consistent(d), f"clock/decoherence inconsistency: {name}"
 
     def test_ST15_next_block_uses_destination_technology_gate_time(self):
-        """20 ns of SC 1Q + the sc->ti transfer (200 ns, SOURCE-side) + one TI 2Q gate.
+        """20 ns of SC 1Q + the sc->ti transfer (SOURCE-side, so t2q_sc) + one TI 2Q gate.
         The GATE must be charged at the destination's rate even though the TRANSFER was
         charged at the source's -- two different lookups, and swapping either one is a
         silent 500x error."""
@@ -550,11 +591,11 @@ class TestST9toST15:
                 [{0: 0, 2: 1}, {0: 1, 2: 1}],
                 [mod(0, 'sc', [0, 1]), mod(1, 'ti', [2, 3])])
         _, _, d = lower(*args)
-        assert d.makespan == 20.0 + t_move('sc', 'ti') + TECHS['ti'].t2q == 100_220.0, \
-            "would be 220 if SC t2q leaked into the gate, 200020 if TI leaked into the move"
+        assert d.makespan == 20.0 + t_move('sc', 'ti') + TECHS['ti'].t2q == 100_120.0, \
+            "would be 120 if SC t2q leaked into the gate, 200020 if TI leaked into the move"
         with movement_mode(derived=False, visible=0.0):
             _, _, d0 = lower(*args)
-        assert d0.makespan == 100_020.0, "v4 regression value must remain reachable"
+        assert d0.makespan == 20.0 + TECHS['ti'].t2q, "overlapped-movement model must remain reachable"
 
 
 # =========================================================================

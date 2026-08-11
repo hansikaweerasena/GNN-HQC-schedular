@@ -19,5 +19,8 @@ test = ["pytest"]
 [tool.setuptools]
 packages = ["mosaic_aer"]
 
+[tool.setuptools.package-data]
+mosaic_aer = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

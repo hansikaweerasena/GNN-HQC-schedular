@@ -14,7 +14,7 @@ Layout
     scoring    NB5   aer_fidelity, score, pareto_front
     circuits         make_layers (build directly), circuit_to_layers / from_qasm
                      (convert existing circuits), to_cx_basis (normalise the basis)
-    configs          drift_check against the EFCL cost configs
+    configs          techs_v1.json (frozen table) + drift_check
 
 Quick start
 -----------
@@ -52,7 +52,7 @@ from .circuits import (
     LayeredCircuit, make_layers, circuit_to_layers, from_qasm, layers_to_circuit,
     to_cx_basis, validate_layers,
 )
-from .configs import drift_check, find_config
+from .configs import drift_check, efcl_deltas, load_frozen, find_config, FROZEN_PATH
 
 __version__ = "0.1.0"
 
@@ -77,6 +77,6 @@ __all__ = [
     "aer_fidelity", "score", "pareto_front", "ideal_state",
     "LayeredCircuit", "make_layers", "circuit_to_layers", "from_qasm",
     "layers_to_circuit", "to_cx_basis", "validate_layers",
-    "drift_check", "find_config",
+    "drift_check", "efcl_deltas", "load_frozen", "find_config", "FROZEN_PATH",
     "H", "CX", "__version__",
 ]
