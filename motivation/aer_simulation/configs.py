@@ -28,7 +28,7 @@ from .hardware import TECHS, COMM
 __all__ = ["FROZEN_PATH", "load_frozen", "drift_check", "efcl_deltas",
            "find_config", "CONFIG_SEARCH_PATH"]
 
-FROZEN_PATH = os.path.join(os.path.dirname(__file__), "techs_v1.json")
+FROZEN_PATH = os.path.join(os.path.dirname(__file__), "techs.json")
 
 CONFIG_SEARCH_PATH = [
     os.environ.get("MOSAIC_CONFIG_DIR", ""),
