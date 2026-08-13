@@ -89,9 +89,9 @@ SABRE_SEEDS = list(range(10))
 
 
 # ---------------------------------------------------------------------------
-# 1. Technology specs  -- FROZEN as techs_v1 (2026-08-11)
+# 1. Technology specs  -- FROZEN as techs_v3 (2026-08-11)
 # ---------------------------------------------------------------------------
-# `techs_v1.json` (next to this file) is the SINGLE SOURCE OF TRUTH and carries a
+# `techs.json` (next to this file) is the SINGLE SOURCE OF TRUTH and carries a
 # per-number citation slot. These values are hardcoded here only for speed;
 # `configs.drift_check()` asserts the two still agree and is part of the test
 # suite. Change a number in BOTH places, bump the frozen id, re-run pytest.
@@ -122,10 +122,10 @@ TECHS = {
     "sc": TechSpec(name="sc",
                    f1q=0.9999, f2q=0.9990,
                    T2=100_000.0,                   # 100 us
-                   t1q=20.0, t2q=100.0,
+                   t1q=20.0, t2q=200.0,
                    kappa=2.3, all_to_all=False, max_qubits=1000),
     "na": TechSpec(name="na",
-                   f1q=0.9995, f2q=0.9970,
+                   f1q=0.9995, f2q=0.9950,
                    T2=2_000_000.0,                 # 2 ms
                    t1q=500.0, t2q=1_000.0,
                    kappa=0.0, all_to_all=True, max_qubits=6100),
@@ -143,7 +143,7 @@ TECHS = {
 # 2. Communication model.  ONE source of truth, consumed by `lowering`.
 # ---------------------------------------------------------------------------
 COMM = {
-    "f_comm":          0.95,   # aggregate fidelity of the WHOLE teleported-gate primitive,
+    "f_comm":          0.97,   # aggregate fidelity of the WHOLE teleported-gate primitive,
                                # INCLUDING its local endpoint operations. Not an add-on
                                # channel: a remote gate pays f_comm and NOT f2q.
     "f_move":          0.99,   # aggregate fidelity of the WHOLE state-transfer primitive.

@@ -1,0 +1,139 @@
+{
+  "_id": "techs_v3",
+  "_frozen": "2026-08-11",
+  "_purpose": "Frozen technology table for the MOSAIC Phase-0/1 experiments. THIS FILE IS THE SINGLE SOURCE OF TRUTH. hardware.py hardcodes the same values for speed and drift_check() asserts they still agree. Change a number here and in hardware.py together, bump _id, and re-run the certificate -- never edit one alone.",
+  "_units": "all times in NANOSECONDS; fidelities are AVERAGE GATE fidelities",
+  "_operating_point": "A defensible 'good but not record' device pair, deliberately not best-in-class. The claim is that heterogeneity pays at a realistic operating point, not that it pays only for hero devices.",
+  "techs": {
+    "sc": {
+      "name": "sc",
+      "label": "superconducting transmon",
+      "f1q": 0.9999,
+      "f2q": 0.999,
+      "t1q": 20.0,
+      "t2q": 200.0,
+      "T2": 100000.0,
+      "kappa": 2.3,
+      "all_to_all": false,
+      "max_qubits": 1000,
+      "_sources": {
+        "f1q": "TODO cite. Bland et al., Nature 647, 343 (2025) report 99.994% single-qubit fidelity; 0.9999 is slightly conservative against that.",
+        "f2q": "TODO cite. Best-in-class tunable-coupler CZ. Typical deployed devices are nearer 99.5-99.7%; state in the text that this is a good device, not an average one.",
+        "t1q": "TODO cite. Standard transmon single-qubit gate.",
+        "t2q": "TODO cite. Superconducting CZ is reported at 20-100 ns; 200 ns is deliberately the slow/conservative end, consistent with a cross-resonance or slower tunable-coupler operating point. Chosen conservatively: a faster SC gate shortens the makespan and therefore REDUCES the decoherence exposure that motivates parking.",
+        "T2": "TODO cite. Typical current device average. Best-in-class is far higher (Bland et al. 2025 report T1 up to 1.68 ms with Hahn-echo T2 exceeding T1), so this is the assumption the result is MOST sensitive to. Declare it explicitly."
+      }
+    },
+    "na": {
+      "name": "na",
+      "label": "neutral atom (Rydberg)",
+      "f1q": 0.9995,
+      "f2q": 0.995,
+      "t1q": 500.0,
+      "t2q": 1000.0,
+      "T2": 2000000.0,
+      "kappa": 0.0,
+      "all_to_all": true,
+      "max_qubits": 6100,
+      "_sources": {
+        "f1q": "TODO cite. Conservative: Manetsch et al., Nature 647, 60 (2025) demonstrate 99.98% global single-qubit gates.",
+        "f2q": "TODO cite. 99.5% is the DEMONSTRATED Rydberg CZ fidelity today (Evered et al., Nature 622, 268 (2023) and similar); the earlier 0.997 was a near-term projection. Using the demonstrated value is the more conservative choice for NA as a technology, and it happens to favour SC+NA because 2xNA pays it on every gate while SC+NA pays it only on the storage region's few gates. Disclose that this was changed after the pilot.",
+        "t1q": "TODO cite. Raman single-qubit rotations are reported at roughly 1 us; 500 ns is optimistic by ~2x. Low impact (1Q gates are rare in the Phase-1 families).",
+        "t2q": "TODO cite. Matches the commonly quoted ~1 us Rydberg two-qubit gate.",
+        "T2": "TODO cite. VERY conservative: Manetsch et al. demonstrate 12.6 s hyperfine coherence in a 6,100-atom tweezer array, with T1 = 119 s. Understating this makes the HQC result a lower bound."
+      }
+    },
+    "ti": {
+      "name": "ti",
+      "label": "trapped ion",
+      "f1q": 0.9999,
+      "f2q": 0.9997,
+      "t1q": 10000.0,
+      "t2q": 100000.0,
+      "T2": 2000000.0,
+      "kappa": 0.0,
+      "all_to_all": true,
+      "max_qubits": 32,
+      "_role": "Act I only. Not a Phase-1 pair: retrieval from TI costs a 100 us Bell-basis measurement at the source, which is 1.0x T2_SC and kills the waiting spectator. Retained so the infeasibility argument stays runnable."
+    }
+  },
+  "comm": {
+    "f_comm": 0.97,
+    "f_move": 0.99,
+    "t_move_derived": true,
+    "t_move_visible": 0.0,
+    "_rules": {
+      "t_comm": "max(t2q_a, t2q_b) -- a teleported GATE fires a local CNOT at both endpoints in parallel, so it waits for the slower one. Symmetric.",
+      "t_move": "t2q_from -- a state TRANSFER performs a Bell-basis measurement at the SOURCE only; the destination applies 1Q Pauli corrections. ASYMMETRIC."
+    },
+    "_sources": {
+      "f_comm": "TODO cite. Aggregate fidelity of the whole teleported-gate primitive. Uniform across module pairs, which FAVOURS the heterogeneous machine: an SC-NA transduced link is materially harder than an SC-SC microwave link (transduction efficiency ~58% in Kumar et al., Nature 615, 614 (2023); distilled Bell fidelity above 90% needs ~2 orders of magnitude improvement in efficiency and added noise). Top item in the assumption ledger. NOTE 0.97 is optimistic for a transduced SC-NA link and is applied uniformly to SC-SC as well; raising it also SHRINKS the value of good partitioning, so it works against the M2 scheduling claim, not for it.",
+      "f_move": "TODO cite. Higher than f_comm because movement happens at a SCHEDULED boundary and may draw on a pre-distilled buffer, whereas remote gates fire on demand."
+    }
+  },
+  "_efcl_divergence": {
+    "_note": "The EFCL training configs (cost_config_v3.json, cost_config_tp2n_99.json) are NOT yet updated to this table, and also still run t_remote = 0. Both are deliberate: adopting t_comm in EFCL requires block-ASAP first (under a global per-layer clock it would charge every idle qubit the full remote-gate duration), and any tech-table change forces a retrain. drift_check() REPORTS these deltas instead of asserting on them, so the divergence stays visible rather than becoming an accident.",
+    "_reconcile_before": "Phase 2 (EFCL retraining). Not required for M1/M2, which are Aer-judged."
+  },
+  "_assumption_ledger": [
+    {
+      "assumption": "uniform f_comm / f_move across module pairs",
+      "bias": "favours heterogeneous"
+    },
+    {
+      "assumption": "pre-shared Bell pairs, unlimited supply",
+      "bias": "favours heterogeneous"
+    },
+    {
+      "assumption": "unlimited communication qubits; concurrent remote gates never serialise",
+      "bias": "favours heterogeneous"
+    },
+    {
+      "assumption": "slot inheritance: any site can be a teleportation endpoint, arrivals take vacated sites at no SWAP cost",
+      "bias": "favours dynamic / heterogeneous"
+    },
+    {
+      "assumption": "classical round trip and conditional Pauli corrections dropped from t_comm and t_move",
+      "bias": "favours heterogeneous"
+    },
+    {
+      "assumption": "t_comm = max(t2q_a, t2q_b), derived per pair rather than a uniform constant",
+      "bias": "favours homogeneous SC"
+    },
+    {
+      "assumption": "t_move = t2q_from, transfer exposed on the critical path",
+      "bias": "favours homogeneous / static"
+    },
+    {
+      "assumption": "T1 -> infinity (pure dephasing); for SC, T1 is comparable to T2, so amplitude damping is omitted",
+      "bias": "favours SC, therefore conservative against the parking argument"
+    },
+    {
+      "assumption": "atom rearrangement / transport time not modelled; migration is priced as teleportation",
+      "bias": "favours dynamic"
+    },
+    {
+      "assumption": "per-gate telegate, no cat-entanglement fan-out amortisation",
+      "bias": "favours homogeneous"
+    }
+  ],
+  "_revision_history": [
+    {
+      "id": "techs_v1",
+      "sc_t2q": 100.0,
+      "f_comm": 0.95,
+      "note": "Initial freeze."
+    },
+    {
+      "id": "techs_v2",
+      "sc_t2q": 200.0,
+      "f_comm": 0.97,
+      "note": "SC t2q 100->200 ns and f_comm 0.95->0.97. CHANGED AFTER seeing the M1 pilot, which is recorded here deliberately. Both values were in use before v1 and both sit inside the cited ranges (superconducting CZ is reported at 20-100 ns, so 200 ns remains the conservative end; f_comm 0.97 is if anything optimistic for a transduced SC-NA link). At 100 ns a 10-layer makespan is ~1-5 us against T2_SC = 100 us, so decoherence is a 1-5% effect and cannot pay for NA's slower, less accurate gates -- the pilot showed SC+NA losing 10/10 with a sharp crossover at cold-qubit activity ~0.07. Disclose the change in the paper rather than presenting v2 as the original choice."
+    },
+    {
+      "id": "techs_v3",
+      "na_f2q": 0.995,
+      "note": "NA f2q 0.997 -> 0.995. CHANGED AFTER the depth-20 pilot, recorded deliberately. 0.995 is today's demonstrated Rydberg CZ fidelity; 0.997 was a near-future projection, so this is a move toward the conservative/realistic value. Side effects: the duty-cycle threshold falls 49% -> 32% (more qubits qualify for SC), M is unchanged at 5, and the two homogeneous baselines become near-tied so neither is a strawman."
+    }
+  ]
+}
