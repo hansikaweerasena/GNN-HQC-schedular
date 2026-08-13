@@ -17,10 +17,10 @@ dependencies = [
 test = ["pytest"]
 
 [tool.setuptools]
-packages = ["mosaic_aer"]
+packages = ["aer_simulation"]
 
 [tool.setuptools.package-data]
-mosaic_aer = ["*.json"]
+aer_simulation = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
