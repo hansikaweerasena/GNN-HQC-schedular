@@ -40,7 +40,7 @@ import time
 
 import numpy as np
 
-from .families import generate, generate_pair, duty_threshold, P_COLD
+from .families_o import generate, generate_pair, duty_threshold, P_COLD
 from .hardware import Module, TECHS, COMM
 from .scoring import score
 
@@ -97,8 +97,7 @@ def run_circuit(lc, meta, prof):
         contested=prof.contested, n_2q=lc.n_2q, cut=prof.n_cross_best)
 
 
-def run(seeds, seed0, depth, families, out=None, csv=None, verbose=True,
-        stratify=False):
+def run(seeds, seed0, depth, families, out=None, csv=None, verbose=True):
     rows, t0 = [], time.time()
     for s in range(seed0, seed0 + seeds):
         insts = []
@@ -108,8 +107,7 @@ def run(seeds, seed0, depth, families, out=None, csv=None, verbose=True,
                 insts.append((h, hm, hp))
             insts.append((u, um, up))
         else:
-            insts.append(generate("hotcore", s, depth=depth,
-                                  n_hot=("stratified" if stratify else None)))
+            insts.append(generate("hotcore", s, depth=depth))
 
         for lc, meta, prof in insts:
             r = run_circuit(lc, meta, prof)
@@ -281,9 +279,6 @@ def main():
     ap.add_argument("--seeds", type=int, default=30)
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--depth", type=int, default=20)
-    ap.add_argument("--stratify", action="store_true",
-                    help="force n_hot to cycle 3,4,5 by seed so the three "
-                         "capacity regimes get equal n (recommended)")
     ap.add_argument("--families", default="hotcore",
                     help="comma-separated: hotcore,uniform")
     ap.add_argument("--out", default=None,
@@ -311,8 +306,7 @@ def main():
     fams = [x.strip() for x in a.families.split(",") if x.strip()]
     print(f"M1: seeds {a.seed0}..{a.seed0+a.seeds-1}, depth {a.depth}, families {fams}")
     print(f"    {_config(a.depth)}\n")
-    rows = run(a.seeds, a.seed0, a.depth, fams, a.out, a.csv,
-               stratify=a.stratify)
+    rows = run(a.seeds, a.seed0, a.depth, fams, a.out, a.csv)
     print()
     report(rows, _config(a.depth))
 
