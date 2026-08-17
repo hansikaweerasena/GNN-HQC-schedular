@@ -856,6 +856,10 @@ class ASAPTimingCost(nn.Module):
 
         move_time_total = zero
         n_2q_seen = 0
+        # Per-qubit idle TIME (ns, not cost). Debug only. Test T1 compares this
+        # against lowering.Diagnostics.idle_time entry by entry -- a summed
+        # comparison hides errors that cancel across qubits.
+        idle_time_pq = torch.zeros((N,), device=device, dtype=dtype) if debug else None
 
         for s in range(S):
             P = P_seq[s]                    # [N,K]
@@ -895,6 +899,13 @@ class ASAPTimingCost(nn.Module):
                     idle_s = idle_s + (
                         (start - ru) * invT[tu] + (start - rv) * invT[tv]
                     ).sum()
+
+                    if debug:
+                        idle_time_pq = idle_time_pq.index_add(
+                            0,
+                            torch.cat([tu, tv], dim=0),
+                            torch.cat([start - ru, start - rv], dim=0).detach(),
+                        )
 
                     Pu = P[tu]                                 # [G,K]
                     Pv = P[tv]                                 # [G,K]
@@ -944,6 +955,11 @@ class ASAPTimingCost(nn.Module):
             out["asap_idle_gate"] = C_idle_gate.detach()
             out["asap_idle_tail"] = C_tail.detach()
             out["asap_n_2q"] = torch.tensor(float(n_2q_seen), device=device, dtype=dtype)
+            # tail idle time per qubit = makespan - ready
+            out["asap_idle_time_per_qubit"] = (
+                idle_time_pq + (makespan - ready).detach()
+            )
+            out["asap_ready"] = ready.detach()
 
         return out
 
@@ -1420,7 +1436,8 @@ class TotalCost(nn.Module):
             }
             if debug:
                 for k in ("asap_makespan", "asap_move_time_total",
-                          "asap_idle_gate", "asap_idle_tail", "asap_n_2q"):
+                          "asap_idle_gate", "asap_idle_tail", "asap_n_2q",
+                          "asap_idle_time_per_qubit", "asap_ready"):
                     out[k] = asap_out[k]
                 for k in ("comm_num_edges", "comm_twoq_ops", "comm_avg_cut_prob",
                           "move_total_mass", "move_avg_mass",
