@@ -524,21 +524,37 @@ class CommMoveCostV3(nn.Module):
         cmove_s = cmove.to(dtype)  # scalar
 
         if S >= 2:
-            # stay_prob[s,u] = Σ_k w[s,u,k] * w[s+1,u,k]
-            stay_prob = (W[:-1, :, :] * W[1:, :, :]).sum(dim=2)  # [S-1, N]
-            change_prob = 1.0 - stay_prob                        # [S-1, N]
+            # Moved probability MASS (min-coupling / optimal transport), not the
+            # product form 1 - Σ_k w[s,u,k] w[s+1,u,k].
+            #
+            # The product form assumes qubit u's assignments at s and s+1 are
+            # INDEPENDENT. They are the same qubit at two times, so the natural
+            # coupling is the maximal one: π_kk = min(w_s[u,k], w_{s+1}[u,k]).
+            # What is left over is exactly relu(w_s - w_{s+1}), i.e. the mass that
+            # genuinely has to leave technology k. Consequences:
+            #   * a CONSTANT soft assignment ([0.5,0.5] -> [0.5,0.5]) costs 0,
+            #     where the product form charged 0.5 of a move per qubit;
+            #   * on one-hot inputs it reproduces the hard indicator exactly;
+            #   * it agrees with what argmax rounding does at inference.
+            #
+            # This is the SAME definition ASAPTimingCost uses for movement time,
+            # so latency and fidelity can no longer disagree about whether a
+            # qubit moved. Do not change one without the other.
+            #
+            #   p_moved[s,u] = Σ_k relu(w[s,u,k] - w[s+1,u,k]) = ½‖P_s[u] - P_{s+1}[u]‖₁
+            p_moved = torch.relu(W[:-1, :, :] - W[1:, :, :]).sum(dim=2)  # [S-1, N]
 
-            # per_segment_move[s] = cmove * Σ_u change_prob[s,u]
-            per_segment_move[:-1] = cmove_s * change_prob.sum(dim=1)
+            # per_segment_move[s] = cmove * Σ_u p_moved[s,u]
+            per_segment_move[:-1] = cmove_s * p_moved.sum(dim=1)
 
             if debug:
-                move_total_change = change_prob.sum(dim=1)        # [S-1]
-                move_avg_change = change_prob.mean(dim=1)         # [S-1]
+                move_total_mass = p_moved.sum(dim=1)              # [S-1]
+                move_avg_mass = p_moved.mean(dim=1)               # [S-1]
                 # pad to length S for easy plotting
-                move_total_change_padded = torch.zeros((S,), device=device, dtype=dtype)
-                move_avg_change_padded = torch.zeros((S,), device=device, dtype=dtype)
-                move_total_change_padded[:-1] = move_total_change
-                move_avg_change_padded[:-1] = move_avg_change
+                move_total_mass_padded = torch.zeros((S,), device=device, dtype=dtype)
+                move_avg_mass_padded = torch.zeros((S,), device=device, dtype=dtype)
+                move_total_mass_padded[:-1] = move_total_mass
+                move_avg_mass_padded[:-1] = move_avg_mass
 
         out = {
             "per_segment_comm": per_segment_comm,
@@ -551,8 +567,8 @@ class CommMoveCostV3(nn.Module):
             out["comm_avg_cut_prob"] = comm_avg_cut_prob.detach()
 
             if S >= 2:
-                out["move_total_change"] = move_total_change_padded.detach()
-                out["move_avg_change"] = move_avg_change_padded.detach()
+                out["move_total_mass"] = move_total_mass_padded.detach()
+                out["move_avg_mass"] = move_avg_mass_padded.detach()
 
         return out
 
@@ -682,6 +698,253 @@ class SegmentTimeV3(nn.Module):
         if debug:
             out["timing_tau"] = tau.detach()
             out["timing_mode"] = mode
+        return out
+
+
+class ASAPTimingCost(nn.Module):
+    """Movement-aware ASAP timing surrogate (EFCL).
+
+    Replaces SegmentTimeV3 + IdleCostV3(idle_only) on the mode="asap" path.
+    Computes per-qubit ready times and the decoherence cost of *actual* waiting,
+    in one pass. Stateless: all hardware buffers are passed in by TotalCost,
+    matching the ExecCostV3 / IdleCostV3 / CommMoveCostV3 convention.
+
+    Model
+    -----
+    Each logical qubit u carries its own clock r[u].
+
+      boundary (segment s-1 -> s)
+          Moved probability mass leaves each technology:
+              leaving = relu(P_{s-1} - P_s)                      [N,K]
+              d_move  = sum_k leaving[u,k] * t2q[k]              [N]
+          r[u] += d_move[u]. Movement is BUSY time: no T2 charge, because
+          f_move already aggregates the state-transfer failure (matches
+          lowering.py, which books movers as busy).
+
+          This relu form is the exact min-coupling optimal-transport cost of the
+          hard movement rule, NOT a heuristic. It holds ONLY because
+          t_move(i,j) = t2q_i depends on the SOURCE index alone. If t_move ever
+          becomes symmetric (e.g. max(t2q_i, t2q_j)), relu stops being the
+          transport cost and this breaks SILENTLY. See _assert_source_side_rule.
+
+      1Q gate on u
+          r[u] += sum_k P_s[u,k] * t1q[k].    No wait, no idle.
+
+      2Q gate on (u,v)
+          start = max(r[u], r[v])                       (exact max, not LSE)
+          the earlier operand waits; charge that wait at its expected 1/T2:
+              C_idle += (start - r[u]) * <P_s[u], 1/T2>
+                      + (start - r[v]) * <P_s[v], 1/T2>
+          duration from a [K,K] matrix, local and remote in one expression:
+              B[i,i] = t2q_i                  local
+              B[i,j] = max(t2q_i, t2q_j)      remote (t_comm: teleported gate
+                                              fires a local CNOT at BOTH
+                                              endpoints in parallel, so it waits
+                                              for the slower one; symmetric)
+              d = sum_ij P_u(i) P_v(j) B[i,j]
+                + sum_k  P_u(k) P_v(k) Gamma[k] t2q[k]     <- routing inflation,
+                                                              gives (1+Gamma)t2q
+                                                              on the diagonal
+          r[u] = r[v] = start + d
+
+      tail
+          T_max = max_u r[u];  every early finisher holds its state:
+              C_tail = sum_u (T_max - r[u]) * <P_last[u], 1/T2>
+
+    Why walking segments/layers in index order IS ASAP
+    --------------------------------------------------
+    r[u] advances ONLY when u is touched by an operation, and the layering is a
+    valid topological sort of the circuit DAG. So processing layers in index
+    order reproduces per-qubit as-soon-as-possible issue. Qubits on independent
+    dependency chains drift apart freely; nothing resynchronises them. This is
+    the correctness argument and it is not obvious from the loop — do not
+    "optimise" it into a per-layer clock.
+
+    What this deliberately does NOT model
+    -------------------------------------
+    Block-boundary synchronisation. lowering.py synchronises the modules whose
+    occupancy changes, so that decision-layer occupancy and wall-clock occupancy
+    cannot diverge. Reproducing that under soft P would require differentiable
+    block detection. It is omitted on purpose: capacity remains enforced in the
+    scheduler's DECISION space, and the final hard schedule is judged by Aer.
+    The omission drops only non-movers' synchronisation wait, which is
+    nonnegative, so it is an optimistic timing bias.
+
+    Measurement timing is not modelled — readout is stripped from the input
+    circuits. Measurement FIDELITY (cm) is untouched, in ExecCostV3.
+
+    Exactness limit: with one-hot P and zero migrations there are no boundaries,
+    so this must agree with lowering.py exactly (test T1).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _assert_source_side_rule(t_move_matrix: Optional[torch.Tensor]) -> None:
+        """Guard: the moved-mass relu is only the transport cost for a
+        source-side t_move. If someone later introduces a [K,K] move matrix,
+        every row must be constant off-diagonal or this module is wrong.
+
+        Not called on the hot path — invoke from tests / TotalCost.__init__ if a
+        move matrix is ever added to the config.
+        """
+        if t_move_matrix is None:
+            return
+        K = t_move_matrix.shape[0]
+        for i in range(K):
+            off = [t_move_matrix[i, j] for j in range(K) if j != i]
+            if len(off) > 1:
+                ref = off[0]
+                for x in off[1:]:
+                    if not torch.allclose(x, ref):
+                        raise ValueError(
+                            "ASAPTimingCost: t_move is not source-side (row "
+                            f"{i} varies with destination). The moved-mass relu "
+                            "is no longer the optimal-transport cost; movement "
+                            "time must be recomputed with a real transport step."
+                        )
+
+    @staticmethod
+    def _assert_layer_disjoint(layer_d: Dict[str, torch.Tensor], s: int, ell: int) -> None:
+        """A circuit layer must act on disjoint qubits. If it does not, the
+        scatter below silently keeps one writer and drops the other.
+        Test/debug only — not on the hot path.
+        """
+        parts = [layer_d[k] for k in ("oneq_u", "twoq_u", "twoq_v") if layer_d[k].numel() > 0]
+        if not parts:
+            return
+        allq = torch.cat(parts, dim=0)
+        if int(torch.unique(allq).numel()) != int(allq.numel()):
+            raise ValueError(
+                f"ASAPTimingCost: segment {s} layer {ell} touches a qubit twice; "
+                "layers must be sets of parallel, disjoint operations."
+            )
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        P_seq: List[torch.Tensor],          # list of [N,K], one per segment
+        stats: Dict[str, Any],              # from SegmentStatsExtractor
+        *,
+        t1q: torch.Tensor,                  # [K]
+        t2q: torch.Tensor,                  # [K]
+        T2: torch.Tensor,                   # [K]
+        use_routing_inflation_time: bool = True,
+        validate: bool = False,
+        debug: bool = False,
+    ) -> Dict[str, Any]:
+
+        device = P_seq[0].device
+        dtype = P_seq[0].dtype
+        S = len(P_seq)
+        N = int(P_seq[0].shape[0])
+
+        t1q = t1q.to(device=device, dtype=dtype)
+        t2q = t2q.to(device=device, dtype=dtype)
+        invT2 = 1.0 / torch.clamp(T2.to(device=device, dtype=dtype), min=1e-12)  # [K]
+
+        # B[i,j] = expected 2Q duration for technologies (i, j).
+        # torch.maximum already yields t2q_i on the diagonal, so local and
+        # remote fall out of one expression with no diagonal fix-up.
+        B = torch.maximum(t2q[:, None], t2q[None, :])  # [K,K]
+
+        ready = torch.zeros((N,), device=device, dtype=dtype)
+        seg_idle: List[torch.Tensor] = []
+        zero = torch.zeros((), device=device, dtype=dtype)
+
+        move_time_total = zero
+        n_2q_seen = 0
+
+        for s in range(S):
+            P = P_seq[s]                    # [N,K]
+            invT = P @ invT2                # [N]  post-move technology (see docstring)
+
+            # ---- boundary: movement busy time -------------------------------
+            if s > 0:
+                leaving = torch.relu(P_seq[s - 1] - P)        # [N,K]
+                d_move = (leaving * t2q).sum(dim=1)           # [N]
+                ready = ready + d_move
+                if debug:
+                    move_time_total = move_time_total + d_move.sum().detach()
+
+            idle_s = zero
+
+            for ell, layer_d in enumerate(stats["layer_ops"][s]):
+                if validate:
+                    self._assert_layer_disjoint(layer_d, s, ell)
+
+                # ---- 1Q: advance, no wait, no idle -------------------------
+                oneq_u = layer_d["oneq_u"]
+                if oneq_u.numel() > 0:
+                    d1 = P[oneq_u] @ t1q                       # [G1]
+                    ready = ready.index_add(0, oneq_u, d1)     # out-of-place
+
+                # ---- 2Q: the only operation that produces waiting ----------
+                tu = layer_d["twoq_u"]
+                if tu.numel() > 0:
+                    tv = layer_d["twoq_v"]
+
+                    ru = ready[tu]                             # [G]
+                    rv = ready[tv]                             # [G]
+                    start = torch.maximum(ru, rv)              # exact max
+
+                    # Gradient reaches BOTH operands: the later one through
+                    # `start`, the earlier one through its own wait term below.
+                    idle_s = idle_s + (
+                        (start - ru) * invT[tu] + (start - rv) * invT[tv]
+                    ).sum()
+
+                    Pu = P[tu]                                 # [G,K]
+                    Pv = P[tv]                                 # [G,K]
+                    d = torch.einsum("gi,gj,ij->g", Pu, Pv, B)
+
+                    if use_routing_inflation_time:
+                        Ge = layer_d.get("twoq_gamma", None)   # [G,K]
+                        if Ge is not None:
+                            d = d + ((Pu * Pv) * Ge.to(dtype) * t2q).sum(dim=1)
+
+                    new = start + d                            # [G]
+                    ready = ready.scatter(
+                        0,
+                        torch.cat([tu, tv], dim=0),
+                        torch.cat([new, new], dim=0),
+                    )
+
+                    if debug:
+                        n_2q_seen += int(tu.numel())
+
+            seg_idle.append(idle_s)
+
+        # ---- tail: early finishers still hold their state -------------------
+        makespan = ready.max()
+        invT_last = P_seq[-1] @ invT2                          # [N]
+        C_tail = ((makespan - ready) * invT_last).sum()
+
+        per_segment_idle = torch.stack(seg_idle)               # [S]
+        C_idle_gate = per_segment_idle.sum()
+
+        # Attribute the tail to the last segment so per_segment_total keeps its
+        # shape and nothing downstream changes.
+        per_segment_idle = per_segment_idle.clone()
+        per_segment_idle[-1] = per_segment_idle[-1] + C_tail
+
+        out: Dict[str, Any] = {
+            "per_segment_idle": per_segment_idle,              # [S]
+            "C_idle_gate": C_idle_gate,
+            "C_tail": C_tail,
+            "makespan": makespan,
+            "ready": ready,
+        }
+
+        if debug:
+            out["asap_makespan"] = makespan.detach()
+            out["asap_move_time_total"] = move_time_total
+            out["asap_idle_gate"] = C_idle_gate.detach()
+            out["asap_idle_tail"] = C_tail.detach()
+            out["asap_n_2q"] = torch.tensor(float(n_2q_seen), device=device, dtype=dtype)
+
         return out
 
 
@@ -872,12 +1135,31 @@ def _parse_timing_buffers(config: Dict[str, Any], dtype=torch.float32) -> Dict[s
     return {"delta": delta}
 
 def _parse_timing_model_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse differentiable timing model configuration (optional)."""
+    """Parse timing model configuration.
+
+    Modes:
+      "asap"        movement-aware ASAP timing surrogate (ASAPTimingCost).
+                    Per-qubit ready times, exact max, real waiting charged as
+                    decoherence, tail idle at the makespan. THE DEFAULT PATH.
+      "smooth_max"  legacy per-layer barrier clock (SegmentTimeV3 + IdleCostV3).
+      "hybrid"      as above, mixed with a per-layer average.
+      "none"        no timing model at all; idle falls back to L(s) * delta.
+
+    "smooth_max"/"hybrid"/"none" are retained ONLY for the block-vs-barrier
+    ablation (E4). They are not modified by the ASAP change.
+    """
     tm = config.get("timing_model", {}) or {}
     mode = str(tm.get("mode", "none")).strip().lower()
 
+    valid = {"asap", "smooth_max", "hybrid", "none"}
+    if mode not in valid:
+        raise ValueError(
+            f"timing_model.mode={mode!r} is not one of {sorted(valid)}. "
+            "Did you mean 'asap'?"
+        )
+
     return {
-        "mode": mode,  # "none" | "smooth_max" | "hybrid"
+        "mode": mode,  # "asap" | "smooth_max" | "hybrid" | "none"
         "tau0": float(tm.get("tau0", 1.0)),
         "tau_min": float(tm.get("tau_min", 1e-6)),
         "tau_gamma": float(tm.get("tau_gamma", 1.0)),
@@ -990,6 +1272,10 @@ class TotalCost(nn.Module):
         self.decoh_mode = decoh_cfg["mode"]                  # "all_qubits" | "idle_only"
         self.use_routing_inflation_time = bool(timing_model_cfg["use_routing_inflation_time"])
 
+        # Per-layer disjointness assertion in ASAPTimingCost. Costs a unique()
+        # per layer, so it is off in training and on in tests.
+        self.asap_validate = bool((config.get("timing_model", {}) or {}).get("validate", False))
+
         # Annealing schedules (epoch-driven)
         self._tau0 = float(timing_model_cfg["tau0"])
         self._tau_min = float(timing_model_cfg["tau_min"])
@@ -1029,12 +1315,26 @@ class TotalCost(nn.Module):
         self.register_buffer("ccomm", _neglog_clamped(self.f_comm))  # scalar
         self.register_buffer("cmove", _neglog_clamped(self.f_move))  # scalar
 
+        # NOTE on dead knobs. On the "asap" path, `delta` (per-layer time proxy)
+        # and `t_remote` (single scalar remote-gate duration) are NOT read by the
+        # timing model: ASAPTimingCost uses per-qubit ready times and a [K,K]
+        # duration matrix instead, and forward() dispatches to it before the
+        # legacy timing path is reached.
+        #
+        # They are deliberately left at their configured values rather than
+        # poisoned (e.g. with NaN). CapacityPenalty._derive_lambda_cap reads
+        # cost_module.delta unconditionally to size Delta_idle, so a poisoned
+        # delta would make lambda_cap NaN and take the whole training loss with
+        # it. The explicit mode dispatch is the safeguard here, not the buffer
+        # value.
+
         self.stats_extractor = SegmentStatsExtractor(config)
         self.exec_cost = ExecCostV3()
         self.idle_cost = IdleCostV3()
         self.comm_move_cost = CommMoveCostV3()
 
         self.segment_time = SegmentTimeV3()
+        self.asap_timing = ASAPTimingCost()
 
 
     def forward(
@@ -1073,7 +1373,73 @@ class TotalCost(nn.Module):
             stats = self.stats_extractor(segments, circuit, N=N, device=device, dtype=dtype)
 
         exec_out = self.exec_cost(P_seq, stats, c1q=self.c1q, c2q=self.c2q, cm=self.cm, debug=debug)
-        # Optional: compute differentiable per-layer / per-segment durations
+
+        # ------------------------------------------------------------------
+        # Timing + idle. Two mutually exclusive paths.
+        #
+        #   "asap"  : ASAPTimingCost computes ready times AND idle in one pass.
+        #             SegmentTimeV3 / IdleCostV3 are NOT called.
+        #   else    : legacy per-layer barrier clock (E4 ablation), unchanged.
+        # ------------------------------------------------------------------
+        asap_out = None
+        if self.timing_mode == "asap":
+            asap_out = self.asap_timing(
+                P_seq,
+                stats,
+                t1q=self.t1q,
+                t2q=self.t2q,
+                T2=self.T2,
+                use_routing_inflation_time=self.use_routing_inflation_time,
+                validate=self.asap_validate,
+                debug=debug,
+            )
+            idle_out = {"per_segment_idle": asap_out["per_segment_idle"]}
+            comm_out = self.comm_move_cost(P_seq, stats, ccomm=self.ccomm, cmove=self.cmove, debug=debug)
+
+            per_segment_exec = exec_out["per_segment_exec"]
+            per_segment_idle = idle_out["per_segment_idle"]
+            per_segment_comm = comm_out["per_segment_comm"]
+            per_segment_move = comm_out["per_segment_move"]
+            per_segment_total = per_segment_exec + per_segment_idle + per_segment_comm + per_segment_move
+
+            out = {
+                "total_cost": per_segment_total.sum(),
+                "per_segment_total": per_segment_total,
+                "per_segment_exec": per_segment_exec,
+                "per_segment_idle": per_segment_idle,
+                "per_segment_comm": per_segment_comm,
+                "per_segment_move": per_segment_move,
+                "per_segment_C1q": exec_out["per_segment_C1q"],
+                "per_segment_Cm": exec_out["per_segment_Cm"],
+                "per_segment_C2q_local": exec_out["per_segment_C2q_local"],
+                # ASAP-specific, needed by test T1 (zero-migration vs lowering.py)
+                "makespan": asap_out["makespan"],
+                "ready": asap_out["ready"],
+                "C_idle_gate": asap_out["C_idle_gate"],
+                "C_tail": asap_out["C_tail"],
+            }
+            if debug:
+                for k in ("asap_makespan", "asap_move_time_total",
+                          "asap_idle_gate", "asap_idle_tail", "asap_n_2q"):
+                    out[k] = asap_out[k]
+                for k in ("comm_num_edges", "comm_twoq_ops", "comm_avg_cut_prob",
+                          "move_total_mass", "move_avg_mass",
+                          "exec_num_edges", "exec_twoq_ops", "exec_avg_local_prob",
+                          "exec_1q_ops", "exec_meas_ops"):
+                    if k in comm_out:
+                        out[k] = comm_out[k]
+                    elif k in exec_out:
+                        out[k] = exec_out[k]
+                out["debug_stats"] = {
+                    "L": stats["L"].detach(),
+                    "n1q_sum": stats["n1q"].sum(dim=1).detach(),
+                    "nm_sum": stats["nm"].sum(dim=1).detach(),
+                    "num_edges": torch.tensor([e["w"].numel() for e in stats["edges"]], device=device, dtype=dtype),
+                    "twoq_ops": torch.tensor([float(e["w"].sum()) for e in stats["edges"]], device=device, dtype=dtype),
+                }
+            return out
+
+        # ---- legacy barrier path (E4 ablation) — unchanged below -----------
         dt_override = None
         per_layer_dt = None
         if self.timing_mode in {"smooth_max", "hybrid"}:
@@ -1152,6 +1518,14 @@ class TotalCost(nn.Module):
         For hybrid mode (optional):
           lambda(e) = min(lambda_max, lambda0 * lambda_gamma^e)
         """
+        # tau / hybrid_lambda drive SegmentTimeV3 only. The ASAP path uses an
+        # exact torch.maximum and has no temperature, so there is nothing to
+        # anneal. Return early rather than quietly updating a dead buffer --
+        # eval_scheduler.py fills tau to tau_min, and that must stay a harmless
+        # no-op rather than looking like it configured something.
+        if self.timing_mode == "asap":
+            return
+
         e = int(epoch)
         with torch.no_grad():
             tau_new = max(self._tau_min, self._tau0 * (self._tau_gamma ** e))
