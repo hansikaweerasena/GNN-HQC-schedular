@@ -18,8 +18,14 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 # Raise open-file limit: 7 DataLoader workers × prefetch × 80 layers × 3 tensors
 # easily exceeds the default 1024, causing "Too many open files" in the feeder thread.
 
+# python scripts/train_hipergator.py \
+#   --sched_cfg configs.scheduler_config \
+#   --cost_cfg  cost_config_v3.json \
+#   --run_tag   asap_dry \
+#   --dry_run  
+
+
 python scripts/train_hipergator.py \
   --sched_cfg configs.scheduler_config \
   --cost_cfg  cost_config_v3.json \
-  --run_tag   asap_dry \
-  --dry_run   
+  --run_tag   asap_smoke
