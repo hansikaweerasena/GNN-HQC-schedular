@@ -760,21 +760,55 @@ class ASAPTimingCost(nn.Module):
     the correctness argument and it is not obvious from the loop — do not
     "optimise" it into a per-layer clock.
 
-    What this deliberately does NOT model
-    -------------------------------------
-    Block-boundary synchronisation. lowering.py synchronises the modules whose
-    occupancy changes, so that decision-layer occupancy and wall-clock occupancy
-    cannot diverge. Reproducing that under soft P would require differentiable
-    block detection. It is omitted on purpose: capacity remains enforced in the
-    scheduler's DECISION space, and the final hard schedule is judged by Aer.
-    The omission drops only non-movers' synchronisation wait, which is
-    nonnegative, so it is an optimistic timing bias.
+    Block-boundary synchronisation (boundary_sync)
+    ---------------------------------------------
+    boundary_sync="hard" reproduces lowering.py's rule discretely: if the
+    assignment changed at a boundary, every clock is pulled to max(ready) and
+    the wait is charged as decoherence at the PREVIOUS segment's technology,
+    then movement busy time is added. a_s is exactly {0,1}.
+
+    This is the EVALUATION path. It is exact for one-hot P, which is all E0
+    scores. It is NOT safe under soft P: `leaving.sum() > 0` is true almost
+    everywhere from optimizer noise, so a_s would be 1 at every layer and the
+    module would degenerate into the global per-layer barrier clock that ASAP
+    exists to replace.
+
+    "hard" was measured on E0 and REGRESSED ranking badly (rho 0.78 -> 0.17):
+    charging the accumulated clock spread assumes EFCL's spread matches Aer's,
+    but EFCL does not model SC SABRE serialisation, so its clocks drift wider
+    and the charge lands hardest on low-migration schedules. Retained for
+    reference; not recommended.
+
+    boundary_sync="transfer" is the RECOMMENDED mode. It drops the max(ready)
+    resynchronisation entirely and charges only the exposed transfer duration:
+    concurrent moves at one boundary share the interconnect, so the boundary
+    lasts as long as the slowest of them (d_bnd = max_u d_move_u) and every
+    qubit advances by d_bnd, accruing decoherence over the part not covered by
+    its own move. Parameter-free -- d_bnd is a max over durations already
+    derived from the frozen technology table.
+
+    Unlike "hard", this mode is SOFT-COMPATIBLE AS WRITTEN and needs no a_s
+    gate: d_move already scales continuously with migration mass through
+    relu(P_{s-1} - P_s), so there is no step function to smooth and no beta to
+    calibrate. Two notes for training: substitute the module's smooth max for
+    d_move.max() so gradient reaches every qubit rather than only the argmax
+    (LSE upper-bounds the true max, so `exposed` stays nonnegative); and log
+    mean C_sync per epoch, since soft P makes relu(.) nonzero almost everywhere
+    early on and the resulting offset should decay as P sharpens.
+
+    boundary_sync="off" is the original behaviour: it drops non-movers'
+    synchronisation wait AND the exposed transfer window, both nonnegative,
+    hence an optimistic timing bias that grows with migration count. E0
+    measured it: corr(signed rank error, move count) = -0.61, removed to +0.27
+    under "transfer".
 
     Measurement timing is not modelled — readout is stripped from the input
     circuits. Measurement FIDELITY (cm) is untouched, in ExecCostV3.
 
     Exactness limit: with one-hot P and zero migrations there are no boundaries,
-    so this must agree with lowering.py exactly (test T1).
+    so this must agree with lowering.py exactly (test T1) -- and then only when
+    SABRE inserts no SWAP on the critical path, since SC routing is priced here
+    by the continuous gamma proxy rather than integer SWAPs.
     """
 
     def __init__(self):
@@ -832,6 +866,7 @@ class ASAPTimingCost(nn.Module):
         t2q: torch.Tensor,                  # [K]
         T2: torch.Tensor,                   # [K]
         use_routing_inflation_time: bool = True,
+        boundary_sync: str = "off",         # "off" | "hard"
         validate: bool = False,
         debug: bool = False,
     ) -> Dict[str, Any]:
@@ -855,6 +890,8 @@ class ASAPTimingCost(nn.Module):
         zero = torch.zeros((), device=device, dtype=dtype)
 
         move_time_total = zero
+        bnd_time_total = zero
+        sync_idle_total = zero
         n_2q_seen = 0
         # Per-qubit idle TIME (ns, not cost). Debug only. Test T1 compares this
         # against lowering.Diagnostics.idle_time entry by entry -- a summed
@@ -865,15 +902,93 @@ class ASAPTimingCost(nn.Module):
             P = P_seq[s]                    # [N,K]
             invT = P @ invT2                # [N]  post-move technology (see docstring)
 
-            # ---- boundary: movement busy time -------------------------------
+            # ---- boundary ----------------------------------------------------
             if s > 0:
                 leaving = torch.relu(P_seq[s - 1] - P)        # [N,K]
+
+                # (a) HARD boundary synchronisation.
+                #
+                # lowering.py synchronises the modules whose occupancy changes,
+                # so a qubit that finished early cannot run ahead of a migration
+                # happening around it. ASAP originally omitted this, which drops
+                # only the NON-MOVERS' wait -- a nonnegative quantity, hence an
+                # optimistic bias that grows with migration count. E0 measured
+                # that bias directly: corr(signed rank error, move count) = -0.61.
+                #
+                # This is the hard/evaluation path only: a_s in {0, 1} from a
+                # discrete test on the assignment change. It is exact for one-hot
+                # P and is what E0 scores. The differentiable soft path
+                # (a_s = 1 - exp(-beta * M_s)) is deliberately NOT implemented
+                # here -- see the class docstring.
+                #
+                # Charging convention: the wait is pre-movement, so it is booked
+                # at the PREVIOUS segment's technology (where the qubit actually
+                # sat while waiting), not the post-move one.
+                if boundary_sync == "hard":
+                    migrated = (leaving.sum() > 0)
+                    if bool(migrated):
+                        r_sync = ready.max()
+                        wait = r_sync - ready                  # [N], >= 0
+                        invT_prev = P_seq[s - 1] @ invT2       # [N]
+                        idle_boundary = (wait * invT_prev).sum()
+                        sync_idle_total = sync_idle_total + idle_boundary
+                        ready = ready + wait                   # -> all at r_sync
+                        if debug:
+                            idle_time_pq = idle_time_pq.index_add(
+                                0, torch.arange(N, device=device), wait.detach())
+                    else:
+                        idle_boundary = zero
+                else:
+                    idle_boundary = zero
+
+                # (b) movement busy time
                 d_move = (leaving * t2q).sum(dim=1)           # [N]
-                ready = ready + d_move
+
+                if boundary_sync == "transfer":
+                    # EXPOSED TRANSFER DURATION ONLY.
+                    #
+                    # No ready.max() resynchronisation: the accumulated spread
+                    # between per-qubit clocks is NOT charged, because EFCL's
+                    # spread is not Aer's (EFCL does not model SC SABRE
+                    # serialisation, so its clocks drift wider) and charging it
+                    # over-penalises exactly the low-migration schedules Aer
+                    # prefers -- measured, see e0_sync.
+                    #
+                    # What IS charged is the transfer itself. Concurrent moves at
+                    # one boundary occupy the interconnect together, so the
+                    # boundary lasts as long as the SLOWEST of them, and every
+                    # qubit in the affected modules is blocked for that whole
+                    # window. Parameter-free: d_bnd is a max over durations that
+                    # are already derived from the frozen technology table.
+                    #
+                    # Qubits are charged decoherence for the part of the window
+                    # not covered by their own move: non-movers pay the full
+                    # d_bnd, a mover pays d_bnd - d_move_u (zero for the slowest
+                    # mover). Booked at the PREVIOUS segment's technology, where
+                    # the qubit physically sat while waiting.
+                    d_bnd = d_move.max()
+                    exposed = d_bnd - d_move                   # [N], >= 0
+                    invT_prev = P_seq[s - 1] @ invT2           # [N]
+                    idle_boundary = (exposed * invT_prev).sum()
+                    sync_idle_total = sync_idle_total + idle_boundary
+                    ready = ready + d_bnd                      # uniform advance
+                    if debug:
+                        # d_bnd is the wall-clock the boundary occupies; the sum
+                        # of per-qubit d_move is the total mover busy time. They
+                        # are different quantities, so log both.
+                        bnd_time_total = bnd_time_total + d_bnd.detach()
+                        move_time_total = move_time_total + d_move.sum().detach()
+                    if debug:
+                        idle_time_pq = idle_time_pq.index_add(
+                            0, torch.arange(N, device=device), exposed.detach())
+                else:
+                    ready = ready + d_move
                 if debug:
                     move_time_total = move_time_total + d_move.sum().detach()
+            else:
+                idle_boundary = zero
 
-            idle_s = zero
+            idle_s = idle_boundary          # boundary wait belongs to this segment
 
             for ell, layer_d in enumerate(stats["layer_ops"][s]):
                 if validate:
@@ -947,11 +1062,13 @@ class ASAPTimingCost(nn.Module):
             "C_tail": C_tail,
             "makespan": makespan,
             "ready": ready,
+            "C_sync": sync_idle_total,
         }
 
         if debug:
             out["asap_makespan"] = makespan.detach()
             out["asap_move_time_total"] = move_time_total
+            out["asap_boundary_time_total"] = bnd_time_total
             out["asap_idle_gate"] = C_idle_gate.detach()
             out["asap_idle_tail"] = C_tail.detach()
             out["asap_n_2q"] = torch.tensor(float(n_2q_seen), device=device, dtype=dtype)
@@ -1183,6 +1300,11 @@ def _parse_timing_model_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
         "lambda_max": float(tm.get("lambda_max", 1.0)),
         "lambda_gamma": float(tm.get("lambda_gamma", 1.0)),
         "use_routing_inflation_time": bool(tm.get("use_routing_inflation_time", True)),
+        # "off"  original behaviour: non-movers' pre-migration wait is dropped,
+        #        an optimistic bias growing with migration count.
+        # "hard" discrete a_s in {0,1}; exact for one-hot P. EVALUATION ONLY --
+        #        unsafe under soft P, see ASAPTimingCost docstring.
+        "boundary_sync": str(tm.get("boundary_sync", "off")).strip().lower(),
     }
 
 
@@ -1287,6 +1409,11 @@ class TotalCost(nn.Module):
         self.timing_mode = timing_model_cfg["mode"]          # "none" | "smooth_max" | "hybrid"
         self.decoh_mode = decoh_cfg["mode"]                  # "all_qubits" | "idle_only"
         self.use_routing_inflation_time = bool(timing_model_cfg["use_routing_inflation_time"])
+        self.boundary_sync = timing_model_cfg["boundary_sync"]
+        if self.boundary_sync not in ("off", "hard", "transfer"):
+            raise ValueError(
+                f"timing_model.boundary_sync={self.boundary_sync!r}; expected "
+                "'off', 'hard' or 'transfer'.")
 
         # Per-layer disjointness assertion in ASAPTimingCost. Costs a unique()
         # per layer, so it is off in training and on in tests.
@@ -1406,6 +1533,7 @@ class TotalCost(nn.Module):
                 t2q=self.t2q,
                 T2=self.T2,
                 use_routing_inflation_time=self.use_routing_inflation_time,
+                boundary_sync=self.boundary_sync,
                 validate=self.asap_validate,
                 debug=debug,
             )
@@ -1436,6 +1564,7 @@ class TotalCost(nn.Module):
             }
             if debug:
                 for k in ("asap_makespan", "asap_move_time_total",
+                          "asap_boundary_time_total",
                           "asap_idle_gate", "asap_idle_tail", "asap_n_2q",
                           "asap_idle_time_per_qubit", "asap_ready"):
                     out[k] = asap_out[k]
