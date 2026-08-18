@@ -64,7 +64,8 @@
     "lambda0": 0.2,
     "lambda_max": 1.0,
     "lambda_gamma": 1.05,
-    "use_routing_inflation_time": true
+    "use_routing_inflation_time": true,
+    "boundary_sync": "transfer"
   },
   "decoherence_model": {
     "mode": "idle_only"
