@@ -25,3 +25,15 @@ python scripts/train_hipergator.py \
     --no_early_stop \
     --dry_run \
     --run_tag dry_sinkhorn
+
+
+echo "=== DRY RUN: SOFTMAX, seed=0 ==="
+
+python scripts/train_hipergator.py \
+    --sched_cfg configs.scheduler_config \
+    --cost_cfg cost_config_v3.json \
+    --capacity_mode softmax \
+    --seed 0 \
+    --no_early_stop \
+    --dry_run \
+    --run_tag dry_softmax
