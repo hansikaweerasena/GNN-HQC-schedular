@@ -4,7 +4,7 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64gb
+#SBATCH --mem=32gb
 #SBATCH --time=20:00:00
 #SBATCH --output=logs/softmax_%j.log
 
