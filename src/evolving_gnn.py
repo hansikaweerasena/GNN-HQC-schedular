@@ -350,8 +350,12 @@ class EvolvingGNN(nn.Module):
             # h_new and batched.edge_index share the same |alive|*N node space.
             # Disjoint edge_index guarantees per-circuit neighbor coordination.
             if cluster_head is not None:
+                # n_qubits=N is required by the Sinkhorn path: capacity is a
+                # per-circuit constraint, so the flat [|alive|*N, K] logit
+                # tensor must be reshaped to [|alive|, N, K] before projection.
+                # Omitting it would pool capacity across circuits in the batch.
                 P_batched = cluster_head(
-                    h_new, edge_index=batched.edge_index
+                    h_new, edge_index=batched.edge_index, n_qubits=N
                 )                                                       # [|alive|*N, K]
                 P_split = P_batched.reshape(len(alive), N, -1)         # [|alive|, N, K]
 
