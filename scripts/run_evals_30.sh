@@ -6,12 +6,12 @@
 
 DIRS=(
     tp2n_99
-    tp1n_99
-    tp3n_99
-    tp4n_99
-    tp5n_99
-    tp6n_99
-    tp7n_99
+    # tp1n_99
+    # tp3n_99
+    # tp4n_99
+    # tp5n_99
+    # tp6n_99
+    # tp7n_99
     # tp5n_98
     # tp6n_98
     # tp7n_98
@@ -44,8 +44,8 @@ for DIR in "${DIRS[@]}"; do
     echo "[v2] MQT Bench zero-shot..."
     python eval_scheduler_v2.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
-        --qubit_min 28 \
-        --qubit_max 32
+        --qubit_min 30 \
+        --qubit_max 40
 
     echo "  Done: $DIR"
 done

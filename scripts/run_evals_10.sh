@@ -5,10 +5,10 @@
 # set -e  # exit on first error
 
 DIRS=(
-    tp2n_99_10
-    tp2n_98_10
+    # tp2n_99_10
+    # tp2n_98_10
     tp2n_99_10_cap8
-    tp2n_98_10_cap8
+    # tp2n_98_10_cap8
     # add more directories here
 )
 
@@ -24,12 +24,13 @@ for DIR in "${DIRS[@]}"; do
     python eval_scheduler_v1.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
         --n_circuits 300 \
+        --is_range
 
     echo "[v2] MQT Bench zero-shot..."
     python eval_scheduler_v2.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
-        --qubit_min 8 \
-        --qubit_max 12
+        --qubit_min 10 \
+        --qubit_max 16
 
     echo "  Done: $DIR"
 done

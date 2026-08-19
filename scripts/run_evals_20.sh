@@ -6,7 +6,6 @@
 
 DIRS=(
     tp2n_99_20
-    tp2n_98_20
     # add more directories here
 )
 
@@ -22,12 +21,13 @@ for DIR in "${DIRS[@]}"; do
     python eval_scheduler_v1.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
         --n_circuits 300 \
+        --is_range
     
     echo "[v2] MQT Bench zero-shot..."
     python eval_scheduler_v2.py \
         --run_dir "${RESULTS_BASE}/${DIR}" \
-        --qubit_min 18 \
-        --qubit_max 22
+        --qubit_min 20 \
+        --qubit_max 26
 
     echo "  Done: $DIR"
 done

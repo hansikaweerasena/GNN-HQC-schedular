@@ -9,7 +9,7 @@ DIRS=(
     # tp1n_99
     # tp3n_99
     # tp4n_99
-    tp8n_99
+    # tp9n_98
     # tp9n_99
     # tp7n_99
     # tp5n_98
@@ -24,6 +24,7 @@ DIRS=(
     # tp5n_98
     # tp6n_98
     # tp7n_98
+    tp10n_99
     # add more directories here
 )
 
