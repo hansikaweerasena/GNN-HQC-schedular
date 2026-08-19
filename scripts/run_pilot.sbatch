@@ -3,7 +3,7 @@
 #SBATCH --partition=hpg-b200
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=64gb
 #SBATCH --time=20:00:00
 #SBATCH --output=logs/sinkhorn_%j.log
