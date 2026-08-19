@@ -17,13 +17,13 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 
 echo "=== DRY RUN: SINKHORN, seed=0 ==="
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg cost_config_v3.json \
+python scripts/train_hipergator_try.py \
+    --sched_cfg configs.scheduler_config_try \
+    --cost_cfg cost_config_v3_try.json \
     --capacity_mode sinkhorn \
     --seed 0 \
     --no_early_stop \
-    --run_tag pilot30_sinkhorn
+    --run_tag pilot38_sinkhorn
 
 
 # echo "=== DRY RUN: SOFTMAX, seed=0 ==="
