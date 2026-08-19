@@ -28,8 +28,8 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 
 echo "=== DRY RUN: SOFTMAX, seed=0 ==="
 
-python scripts/train_hipergator_temp.py \
-    --sched_cfg configs.scheduler_config \
+python scripts/train_hipergator.py \
+    --sched_cfg configs.scheduler_config_temp \
     --cost_cfg cost_config_v3.json \
     --capacity_mode softmax \
     --seed 0 \
