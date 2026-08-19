@@ -20,7 +20,7 @@
         "tm": 300.0
       },
       "capacity": {
-        "max_qubits": 15
+        "max_qubits": 20
       }
     },
     {
@@ -43,7 +43,7 @@
         "tm": 500.0
       },
       "capacity": {
-        "max_qubits": 15
+        "max_qubits": 20
       }
     }
   ],

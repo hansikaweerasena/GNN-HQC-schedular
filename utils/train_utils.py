@@ -82,7 +82,7 @@ def train_step(
     if capacity_penalty is not None:
         cap_out = capacity_penalty(P_seq)
         loss = loss + cap_out["penalty"]
-        cap_penalty_val = float(cap_out["penalty"].item())
+        cap_penalty_val = float(cap_out["penalty"].item())   # single circuit: 1 sync
 
     return loss, cost_out["per_segment_total"].detach(), cap_penalty_val
 
@@ -103,7 +103,8 @@ def batch_train_step(
     device: torch.device,
     capacity_penalty=None,
     training: bool = True,
-) -> Tuple[torch.Tensor, float]:
+    return_P: bool = False,
+) -> Tuple[torch.Tensor, float, float]:
     """
     Batched forward over one mini-batch.
 
@@ -121,12 +122,25 @@ def batch_train_step(
         total_cost_module: TotalCost
         batch:             collated list from BucketBatchSampler DataLoader
         device:            target compute device
-        capacity_penalty:  optional CapacityPenalty module
+        capacity_penalty:  optional CapacityPenalty module. MUST be None when
+                           the head runs in capacity_mode="sinkhorn" -- capacity
+                           is enforced structurally there and must not also
+                           appear in the loss.
         training:          sets train/eval mode on both models
+        return_P:          also return the per-circuit P_seq list (evaluation
+                           only -- holding every P alive costs memory).
 
     Returns:
-        (avg_loss_tensor, avg_cap_penalty_float)
+        (avg_loss_tensor, avg_cap_penalty_float, avg_efcl_float)
+        and, if return_P, a fourth element: List[List[Tensor]] of P_seq.
+
         avg_loss_tensor is differentiable; caller calls .backward() on it.
+
+        EFCL is returned SEPARATELY from the loss because the two arms optimise
+        different objectives: arm R's loss is EFCL + R_cap, arm S's loss is
+        EFCL alone. Comparing losses across arms would compare different
+        quantities. Every cross-arm comparison -- the gate, the checkpoint
+        selection, the plots -- must use EFCL.
     """
     if training:
         evol_model.train()
@@ -151,8 +165,19 @@ def batch_train_step(
     )
 
     # --- Per-circuit cost (cheap: no GNN, just tensor arithmetic) ---
+    # Accumulate the logging scalars as DEVICE tensors, not Python floats.
+    # Calling .item() per circuit would force one CPU<->GPU synchronisation per
+    # circuit per batch (32 for arm S, 64 for arm R at batch_size=32), which
+    # serialises exactly the batched execution this loop exists to exploit.
+    # One .item() after the loop gives the same number.
+    #
+    # float64 accumulation so the reported value matches the previous
+    # Python-float summation to full precision; the tensors are scalars, so the
+    # fp64 cost is nil.
     total_loss: Optional[torch.Tensor] = None
-    total_cap  = 0.0
+    total_cap_t: Optional[torch.Tensor] = None
+    total_efcl_t: Optional[torch.Tensor] = None
+    all_P: List[List[torch.Tensor]] = []
 
     for b, item in enumerate(batch):
         _, segments, rep, stats_cpu = item
@@ -167,12 +192,27 @@ def batch_train_step(
         cost_out = total_cost_module(P_seq, segments, rep, precomp_stats=stats_cpu)
         loss     = cost_out["total_cost"]
 
+        e = loss.detach().double()
+        total_efcl_t = e if total_efcl_t is None else total_efcl_t + e
+
         if capacity_penalty is not None:
             cap_out  = capacity_penalty(P_seq)
-            loss     = loss + cap_out["penalty"]
-            total_cap += float(cap_out["penalty"].item())
+            penalty  = cap_out["penalty"]
+            loss     = loss + penalty
+            c = penalty.detach().double()
+            total_cap_t = c if total_cap_t is None else total_cap_t + c
 
         total_loss = loss if total_loss is None else total_loss + loss
 
+        if return_P:
+            all_P.append([p.detach() for p in P_seq])
+
     B = len(batch)
-    return total_loss / B, total_cap / B
+    # Exactly two synchronisations per batch (one if there is no penalty),
+    # regardless of batch size.
+    avg_efcl = float(total_efcl_t.item()) / B if total_efcl_t is not None else 0.0
+    avg_cap  = float(total_cap_t.item()) / B if total_cap_t is not None else 0.0
+
+    if return_P:
+        return total_loss / B, avg_cap, avg_efcl, all_P
+    return total_loss / B, avg_cap, avg_efcl

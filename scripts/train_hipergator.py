@@ -75,6 +75,9 @@ from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost, CapacityPenalty, SegmentStatsExtractor
 from utils.train_utils import train_step, batch_train_step, transfer_layer_data_list
+from src.pilot_metrics import (
+    circuit_diagnostics, aggregate_diagnostics, METRIC_COLUMNS,
+)
 from utils.cost_config_reader import load_cost_config, get_cost_config_path, load_scheduler_cfg
 from utils.print_utils import print_run_config
 
@@ -99,7 +102,35 @@ def parse_args():
                         "(overrides TRAIN_CFG['checkpoint_every'] if set)")
     p.add_argument("--dry_run", action="store_true",
                    help="Quick smoke-test: 2 epochs, 10 train / 5 test samples")
+    # ---- S-vs-R pilot ----
+    p.add_argument("--capacity_mode", type=str, default=None,
+                   choices=["sinkhorn", "softmax"],
+                   help="Arm S = sinkhorn (structural capacity, no penalty); "
+                        "arm R = softmax + CapacityPenalty. Overrides CLUSTER_CFG.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Global seed. The two arms MUST share a seed to be "
+                        "comparable: without it they start from different "
+                        "random inits and any EFCL gap is init noise.")
+    p.add_argument("--no_early_stop", action="store_true",
+                   help="Disable early stopping. Required for the pilot: arms "
+                        "stopping at different epochs would be compared at "
+                        "different points on the temperature schedule.")
     return p.parse_args()
+
+
+def set_global_seed(seed: int):
+    """
+    Seed every RNG that affects model init, data order, and dropout.
+
+    The base script never called manual_seed, so two runs differed in their
+    initial weights. For a two-arm comparison that is fatal -- the measured
+    EFCL gap would contain an unknown amount of initialisation noise.
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # =============================================================================
@@ -373,29 +404,47 @@ class SortedBatchSampler(torch.utils.data.Sampler):
 
 
 def evaluate_model(model, cluster_module, cost_module, test_loader, device,
-                   capacity_penalty=None):
+                   capacity_penalty=None, caps=None, K=2):
     """
     Evaluate on the test set using the same batched forward as training.
-    Returns (avg_loss, avg_cap_penalty) averaged over batches.
+
+    Returns (avg_loss, avg_cap_penalty, avg_efcl, diagnostics).
+
+    EFCL is separated from the loss because the arms optimise different
+    objectives (arm R adds R_cap). Every cross-arm comparison uses EFCL.
+
+    When `caps` is given, the pilot gate diagnostics are computed from the
+    P sequences -- hardener burden, transition statistics, occupancy spread.
+    This is the only place P is retained, and only under no_grad.
     """
     model.eval()
     cluster_module.eval()
-    total_loss, total_cap, n_batches = 0.0, 0.0, 0
+    total_loss, total_cap, total_efcl, n_batches = 0.0, 0.0, 0.0, 0
+    per_circuit = []
 
     with torch.no_grad():
         for batch in test_loader:
-            loss, cap = batch_train_step(
+            out = batch_train_step(
                 model, cluster_module, cost_module,
                 batch, device,
                 capacity_penalty=capacity_penalty,
                 training=False,
+                return_P=(caps is not None),
             )
+            if caps is not None:
+                loss, cap, efcl, P_batch = out
+                for P_seq in P_batch:
+                    per_circuit.append(circuit_diagnostics(P_seq, caps))
+            else:
+                loss, cap, efcl = out
             total_loss += loss.item()
             total_cap  += cap
+            total_efcl += efcl
             n_batches  += 1
 
     denom = max(n_batches, 1)
-    return total_loss / denom, total_cap / denom
+    diag = aggregate_diagnostics(per_circuit, K) if caps is not None else {}
+    return total_loss / denom, total_cap / denom, total_efcl / denom, diag
 
 
 # =============================================================================
@@ -403,13 +452,17 @@ def evaluate_model(model, cluster_module, cost_module, test_loader, device,
 # =============================================================================
 
 
-def make_checkpoint(evol_model, cluster_module, optimizer, epoch, test_loss):
+def make_checkpoint(evol_model, cluster_module, optimizer, epoch, test_loss,
+                    test_efcl=None, arm=None, seed=None):
     return {
         "evol_model":   evol_model.state_dict(),
         "cluster_head": cluster_module.state_dict(),
         "optimizer":    optimizer.state_dict(),
         "epoch":        epoch,
         "test_loss":    test_loss,
+        "test_efcl":    test_efcl,
+        "arm":          arm,
+        "seed":         seed,
     }
 
 
@@ -445,6 +498,14 @@ def save_model_arch_params(evol_model: EvolvingGNN, cluster_module: SegmentClust
             "temperature_min":        cluster_module.head._temperature_min,
             "temperature_gamma":      cluster_module.head._temperature_gamma,
             "neighbor_alpha_learned": float(cluster_module.head.alpha.item()),
+            # Required to rebuild a Sinkhorn head. caps and n_iters also travel
+            # inside the checkpoint buffers, but the constructor needs them
+            # BEFORE load_state_dict can run, so they are recorded here too.
+            "capacity_mode":  cluster_module.head.capacity_mode,
+            "sinkhorn_iters": (int(cluster_module.head.sinkhorn.n_iters)
+                               if cluster_module.head.sinkhorn is not None else None),
+            "caps":           (cluster_module.head.sinkhorn.caps.tolist()
+                               if cluster_module.head.sinkhorn is not None else None),
         },
     }
     path = os.path.join(run_dir, "model_arch_params.json")
@@ -480,14 +541,17 @@ def save_config_snapshots(sched_cfg_module_path: str, cost_cfg_resolved: str, ru
 
 
 def save_plots(run_dir, train_losses, test_losses, test_epochs,
-               cluster_T_history, cost_tau_history, cap_penalty_history):
+               cluster_T_history, cost_tau_history, cap_penalty_history,
+               arm=None):
+    """Curves are EFCL, not loss — the only quantity comparable across arms."""
 
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(train_losses, label="Train", alpha=0.85)
     if test_losses:
         ax.plot(test_epochs, test_losses, label="Test", alpha=0.85, marker="o", markersize=3)
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Average Total Cost")
-    ax.set_title("Training Curve"); ax.legend(); ax.grid(True, alpha=0.3)
+    ax.set_xlabel("Epoch"); ax.set_ylabel("EFCL (average total cost)")
+    ax.set_title(f"EFCL Curve{f' — arm {arm}' if arm else ''}")
+    ax.legend(); ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(run_dir, "training_curve.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -500,6 +564,13 @@ def save_plots(run_dir, train_losses, test_losses, test_epochs,
     fig.tight_layout()
     fig.savefig(os.path.join(run_dir, "temperature_schedule.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+    # Arm S has no capacity penalty by construction; the curve would be a
+    # flat zero line and is skipped rather than shown as a false signal.
+    if arm == "S" or not any(cap_penalty_history):
+        log("Plots saved: training_curve.png, temperature_schedule.png "
+            "(capacity_penalty_curve.png skipped — no penalty in this arm)")
+        return
 
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(cap_penalty_history, label="Cap Penalty", color="tab:orange", alpha=0.85)
@@ -522,6 +593,16 @@ def main():
 
     MODEL_CFG, CLUSTER_CFG, TRAIN_CFG, DATASET_CFG, CIRCUIT_SOURCE_CFG = \
         load_scheduler_cfg(args.sched_cfg)
+
+    # ---- Pilot arm + seed (must be set before ANY model construction) ----
+    set_global_seed(args.seed)
+    CLUSTER_CFG = dict(CLUSTER_CFG)
+    if args.capacity_mode is not None:
+        CLUSTER_CFG["capacity_mode"] = args.capacity_mode
+    capacity_mode = CLUSTER_CFG.get("capacity_mode", "sinkhorn")
+    use_sinkhorn  = (capacity_mode == "sinkhorn")
+    arm = "S" if use_sinkhorn else "R"
+    args.run_tag = f"{args.run_tag}_{arm}_seed{args.seed}"
 
     # --dry_run overrides: tiny dataset, 2 epochs
     if args.dry_run:
@@ -567,6 +648,22 @@ def main():
     w_short, w_long   = compute_window_sizes_from_config(config)
     K = len(config["techs"])
 
+    # ---- Capacity: the pilot's structural precondition ----
+    base_caps = torch.tensor(
+        [float(t["capacity"]["max_qubits"]) for t in config["techs"]],
+        dtype=torch.float32,
+    )
+    c_total  = int(base_caps.sum().item())
+    n_qubits = int(CIRCUIT_SOURCE_CFG["kwargs"]["num_qubits"])
+    if c_total <= n_qubits:
+        raise SystemExit(
+            f"C_total={c_total} <= N={n_qubits}. The pilot requires C_total > N "
+            f"strictly: at equality there are zero dummy rows, so no unused "
+            f"capacity is exercised and the slack behaviour the pilot exists to "
+            f"validate is never tested. Fix cost_config capacities."
+        )
+    rho = n_qubits / c_total
+
     derived = {
         "device":            str(device),
         "K_num_clusters":    K,
@@ -578,6 +675,14 @@ def main():
         "checkpoint_every":  checkpoint_every,
         "oversample_factor": oversample_factor,
         "target_depth":      target_depth,
+        "pilot_arm":         arm,
+        "capacity_mode":     capacity_mode,
+        "seed":              args.seed,
+        "caps":              base_caps.tolist(),
+        "C_total":           c_total,
+        "N_qubits":          n_qubits,
+        "rho_load_factor":   round(rho, 4),
+        "early_stopping":    not args.no_early_stop,
     }
     print_run_config(
         MODEL_CFG=MODEL_CFG, CLUSTER_CFG=CLUSTER_CFG, TRAIN_CFG=TRAIN_CFG,
@@ -642,7 +747,7 @@ def main():
     log("Building SortedBatchSamplers ...")
     log("  Train:")
     train_sampler = SortedBatchSampler(
-        train_depths, batch_size, shuffle=True, seed=0,
+        train_depths, batch_size, shuffle=True, seed=args.seed,
     )
     log("  Test:")
     test_sampler = SortedBatchSampler(
@@ -713,15 +818,54 @@ def main():
         temperature_min     = CLUSTER_CFG["temperature_min"],
         temperature_gamma   = CLUSTER_CFG["temperature_gamma"],
         neighbor_alpha_init = CLUSTER_CFG["neighbor_alpha_init"],
+        capacity_mode       = capacity_mode,
+        caps                = base_caps if use_sinkhorn else None,
+        sinkhorn_iters      = int(CLUSTER_CFG.get("sinkhorn_iters", 30)),
     ).to(device)
 
-    total_cost_module  = TotalCost(config).to(device)
-    cap_penalty_module = CapacityPenalty(total_cost_module, config).to(device)
+    total_cost_module = TotalCost(config).to(device)
+
+    # Arm S: capacity leaves the loss entirely. None, NOT zero-weighted --
+    # if both mechanisms are live the competing gradient the change exists to
+    # remove is still there, and the ablation measures nothing.
+    cap_penalty_module = (
+        None if use_sinkhorn else CapacityPenalty(total_cost_module, config).to(device)
+    )
 
     log(f"EvolvingGNN params  : {sum(p.numel() for p in evol_model.parameters()):,}")
     log(f"ClusterHead params  : {sum(p.numel() for p in cluster_module.parameters()):,}")
-    log(f"Cap penalty         : lambda={cap_penalty_module.lambda_cap.item():.6f}, "
-        f"beta={cap_penalty_module.beta}, caps={cap_penalty_module.cap.tolist()}")
+    log(f"Pilot arm           : {arm}  (capacity_mode={capacity_mode})")
+    log(f"Capacity            : caps={base_caps.tolist()}  C_total={c_total}  "
+        f"N={n_qubits}  rho={rho:.3f}  dummy_rows={c_total - n_qubits}")
+    if cap_penalty_module is not None:
+        log(f"Cap penalty         : lambda={cap_penalty_module.lambda_cap.item():.6f}, "
+            f"beta={cap_penalty_module.beta}, caps={cap_penalty_module.cap.tolist()}")
+    else:
+        log(f"Cap penalty         : DISABLED (capacity is structural; "
+            f"sinkhorn_iters={cluster_module.head.sinkhorn.n_iters})")
+
+    # ---- Pilot metadata, written up front so a killed run is still identifiable ----
+    with open(os.path.join(run_dir, "pilot_meta.json"), "w") as f:
+        json.dump({
+            "arm": arm, "capacity_mode": capacity_mode, "seed": args.seed,
+            "caps": base_caps.tolist(), "C_total": c_total, "N": n_qubits,
+            "rho": rho,
+            "sinkhorn_iters": (int(cluster_module.head.sinkhorn.n_iters)
+                               if use_sinkhorn else None),
+            "temperature_init":  CLUSTER_CFG["temperature_init"],
+            "temperature_min":   CLUSTER_CFG["temperature_min"],
+            "temperature_gamma": CLUSTER_CFG["temperature_gamma"],
+            "n_epochs": int(TRAIN_CFG["n_epochs"]),
+            "batch_size": batch_size,
+            "n_samples_train": int(TRAIN_CFG["n_samples_train"]),
+            "early_stopping": not args.no_early_stop,
+            "lr": TRAIN_CFG["lr"],
+        }, f, indent=2)
+
+    # ---- Per-epoch metrics CSV, for cross-run aggregation ----
+    metrics_path = os.path.join(run_dir, "metrics.csv")
+    with open(metrics_path, "w") as f:
+        f.write(",".join(METRIC_COLUMNS) + "\n")
 
     optimizer = torch.optim.Adam(
         list(evol_model.parameters()) + list(cluster_module.parameters()),
@@ -734,12 +878,17 @@ def main():
     # ---- Metric history (for plots) ----
     train_losses        = []
     test_losses         = []
+    train_efcls         = []
+    test_efcls          = []
     test_epochs         = []
     cluster_T_history   = []
     cost_tau_history    = []
     cap_penalty_history = []
 
-    best_test_loss = float("inf")
+    # Selection is on test EFCL, not on the loss: arm R's loss includes R_cap,
+    # so selecting on it would pick each arm's best under a different objective
+    # and make the comparison meaningless.
+    best_test_efcl = float("inf")
     patience_count = 0
     n_epochs       = int(TRAIN_CFG["n_epochs"])
 
@@ -748,10 +897,15 @@ def main():
     t_start = time.time()
 
     for epoch in range(n_epochs):
+        t_epoch = time.time()
 
         # Anneal temperatures
         total_cost_module.set_epoch(epoch)
         cluster_module.set_epoch(epoch)
+
+        # Residuals accumulate as a running max; without this reset they would
+        # report the peak over the entire run rather than over this epoch.
+        cluster_module.reset_diagnostics()
 
         cluster_T = cluster_module.head.temperature.item()
         cost_tau  = total_cost_module.tau.item()
@@ -762,15 +916,21 @@ def main():
         cluster_module.train()
 
         epoch_train_loss  = 0.0
+        epoch_train_efcl  = 0.0
         epoch_cap_penalty = 0.0
-        epoch_grad_norm   = 0.0
+        # Gradient norm accumulates on device and is read ONCE at the end of the
+        # epoch. The previous version called .item() per parameter per batch --
+        # one CUDA sync each, times ~40 parameter tensors, times 38 batches,
+        # times 140 epochs. It is a diagnostic only, so nothing about training
+        # changes; only the number of synchronisations does.
+        epoch_grad_norm_t = torch.zeros((), device=device, dtype=torch.float64)
 
         for batch in train_loader:
             optimizer.zero_grad()
 
             # True batched forward: GNN + clustering head in parallel (masked-max),
             # then per-circuit cost accumulation.
-            avg_loss, avg_cap = batch_train_step(
+            avg_loss, avg_cap, avg_efcl = batch_train_step(
                 evol_model, cluster_module, total_cost_module,
                 batch, device,
                 capacity_penalty=cap_penalty_module,
@@ -783,22 +943,25 @@ def main():
             #     max_norm=80.0
             # )
 
-            # Grad norm (reads already-computed grads; cheap)
-            _gnorm_sq = 0.0
+            # Grad norm, computed entirely on device (no sync inside the loop).
+            _gsq = torch.zeros((), device=device, dtype=torch.float64)
             for _p in list(evol_model.parameters()) + list(cluster_module.parameters()):
                 if _p.grad is not None:
-                    _gnorm_sq += _p.grad.data.norm(2).item() ** 2
-            epoch_grad_norm += _gnorm_sq ** 0.5
+                    _gsq += _p.grad.detach().double().pow(2).sum()
+            epoch_grad_norm_t += torch.sqrt(_gsq)
 
             optimizer.step()
 
             epoch_train_loss  += avg_loss.item()
+            epoch_train_efcl  += avg_efcl
             epoch_cap_penalty += avg_cap
 
         avg_train = epoch_train_loss  / len(train_loader)
+        avg_efcl_tr = epoch_train_efcl / len(train_loader)
         avg_cap   = epoch_cap_penalty / len(train_loader)
-        avg_gnorm = epoch_grad_norm   / len(train_loader)
+        avg_gnorm = float(epoch_grad_norm_t.item()) / len(train_loader)   # 1 sync/epoch
         train_losses.append(avg_train)
+        train_efcls.append(avg_efcl_tr)
         cap_penalty_history.append(avg_cap)
 
         # ---- LR decay at temperature floor ----
@@ -813,47 +976,82 @@ def main():
 
         test_loss = float("nan")
         test_cap  = float("nan")
+        test_efcl = float("nan")
+        diag = {}
         if do_eval:
-            test_loss, test_cap = evaluate_model(
+            test_loss, test_cap, test_efcl, diag = evaluate_model(
                 evol_model, cluster_module, total_cost_module,
                 test_loader, device, capacity_penalty=cap_penalty_module,
+                caps=base_caps.to(device), K=K,
             )
             test_losses.append(test_loss)
+            test_efcls.append(test_efcl)
             test_epochs.append(epoch)
 
         alpha_val  = cluster_module.head.alpha.item()
         proto_norm = cluster_module.head.cluster_prototypes.norm(dim=-1).mean().item()
 
+        sk = cluster_module.diagnostics          # {} in arm R
+        row_res = sk.get("row_residual", float("nan"))
+        col_res = sk.get("col_residual", float("nan"))
+        cur_lr  = optimizer.param_groups[0]["lr"]
+        epoch_secs = time.time() - t_epoch
+
         print(
-            f"[E {epoch:03d}/{n_epochs}] "
-            f"train={avg_train:.4f}  "
-            f"test={test_loss:.4f}  "
+            f"[{arm}|s{args.seed}][E {epoch:03d}/{n_epochs}] "
+            f"efcl_tr={avg_efcl_tr:.4f}  "
+            f"efcl_te={test_efcl:.4f}  "
+            f"loss_tr={avg_train:.4f}  "
             f"cap_tr={avg_cap:.4f}  "
-            f"cap_te={test_cap:.4f}  "
             f"T={cluster_T:.3f}  "
             f"tau={cost_tau:.1f}  "
             f"alpha={alpha_val:.3f}  "
             f"gnorm={avg_gnorm:.3f}  "
-            f"pnorm={proto_norm:.3f}",
+            f"pnorm={proto_norm:.3f}  "
+            f"res={col_res:.1e}  "
+            f"hard={diag.get('hardener_burden', float('nan')):.2f}  "
+            f"trans={diag.get('transition_frac', float('nan')):.2f}  "
+            f"occsd={diag.get('occ_std', float('nan')):.3f}  "
+            f"({epoch_secs:.0f}s)",
             flush=True,
         )
 
+        # ---- Append the epoch row to metrics.csv ----
+        row = {
+            "epoch": epoch, "arm": arm, "seed": args.seed,
+            "train_efcl": avg_efcl_tr, "test_efcl": test_efcl,
+            "train_loss": avg_train, "test_loss": test_loss,
+            "cap_penalty_train": avg_cap, "cap_penalty_test": test_cap,
+            "T": cluster_T, "cost_tau": cost_tau, "lr": cur_lr,
+            "grad_norm": avg_gnorm, "alpha": alpha_val, "proto_norm": proto_norm,
+            "sinkhorn_row_res": row_res, "sinkhorn_col_res": col_res,
+            "epoch_seconds": epoch_secs,
+        }
+        row.update({k: diag.get(k, float("nan")) for k in METRIC_COLUMNS
+                    if k not in row})
+        with open(metrics_path, "a") as f:
+            f.write(",".join(str(row.get(c, "")) for c in METRIC_COLUMNS) + "\n")
+
         # ---- Checkpointing ----
-        ckpt = make_checkpoint(evol_model, cluster_module, optimizer, epoch, test_loss)
+        ckpt = make_checkpoint(evol_model, cluster_module, optimizer, epoch,
+                               test_loss, test_efcl=test_efcl, arm=arm, seed=args.seed)
         save_checkpoint(ckpt, os.path.join(run_dir, "checkpoint_last.pt"))
 
         if do_eval:
-            if test_loss < best_test_loss:
-                best_test_loss = test_loss
+            if test_efcl < best_test_efcl:
+                best_test_efcl = test_efcl
                 patience_count = 0
                 save_checkpoint(ckpt, os.path.join(run_dir, "checkpoint_best.pt"))
-                log(f"  >> New best checkpoint at epoch {epoch:03d}  test={test_loss:.4f}")
+                log(f"  >> New best checkpoint at epoch {epoch:03d}  test_efcl={test_efcl:.4f}")
             else:
                 patience_count += 1
-                log(f"  >> No improvement ({patience_count}/3)")
-                if patience_count >= 3:
-                    log("Early stopping triggered — best model already saved")
-                    break
+                if args.no_early_stop:
+                    log(f"  >> No improvement ({patience_count}) — early stop disabled")
+                else:
+                    log(f"  >> No improvement ({patience_count}/3)")
+                    if patience_count >= 3:
+                        log("Early stopping triggered — best model already saved")
+                        break
 
         if (epoch + 1) % checkpoint_every == 0:
             periodic_path = os.path.join(run_dir, f"checkpoint_epoch_{epoch:03d}.pt")
@@ -867,8 +1065,9 @@ def main():
     torch.save(cluster_module.state_dict(), os.path.join(run_dir, "cluster_head.pt"))
     save_model_arch_params(evol_model, cluster_module, K, run_dir)
     save_plots(
-        run_dir, train_losses, test_losses, test_epochs,
+        run_dir, train_efcls, test_efcls, test_epochs,
         cluster_T_history, cost_tau_history, cap_penalty_history,
+        arm=arm,
     )
 
     # ---- Final summary ----
@@ -876,9 +1075,15 @@ def main():
     log(f"Run dir         : {run_dir}")
     log(f"Total time      : {elapsed / 60:.1f} min")
     log(f"Epochs          : {n_epochs}")
-    log(f"Best test loss  : {best_test_loss:.4f}")
-    log(f"Final train loss: {train_losses[-1]:.4f}")
-    log(f"Final test loss : {test_losses[-1]:.4f}" if test_losses else "Final test loss : N/A")
+    log(f"Pilot arm       : {arm}  seed={args.seed}")
+    log(f"Best test EFCL  : {best_test_efcl:.4f}")
+    log(f"Final train EFCL: {train_efcls[-1]:.4f}")
+    log(f"Final test EFCL : {test_efcls[-1]:.4f}" if test_efcls else "Final test EFCL : N/A")
+    if use_sinkhorn:
+        d = cluster_module.diagnostics
+        log(f"Final sinkhorn  : T={d['T']:.4f}  row_res={d['row_residual']:.2e}  "
+            f"col_res={d['col_residual']:.2e}")
+    log(f"Metrics CSV     : {metrics_path}")
     log(f"Post-train cluster_T  : {cluster_module.head.temperature.item():.4f}")
     log(f"Post-train cost_tau   : {total_cost_module.tau.item():.2f}")
     log(f"Post-train proto norm : "
@@ -887,8 +1092,8 @@ def main():
     for fname in [
         "evol_model.pt", "cluster_head.pt", "model_arch_params.json",
         "scheduler_config_snapshot.py", "cost_config_snapshot.json",
-        "checkpoint_best.pt", "checkpoint_last.pt",
-        "training_curve.png", "temperature_schedule.png", "capacity_penalty_curve.png",
+        "checkpoint_best.pt", "checkpoint_last.pt", "metrics.csv", "pilot_meta.json",
+        "training_curve.png", "temperature_schedule.png",
     ]:
         fpath  = os.path.join(run_dir, fname)
         status = "OK" if os.path.isfile(fpath) else "MISSING"
