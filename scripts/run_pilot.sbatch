@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64gb
 #SBATCH --time=00:30:00
-#SBATCH --output=logs/sinkhorn_dry_%j.log
+#SBATCH --output=logs/sinkhorn_%j.log
 
 module purge
 module load conda
@@ -23,17 +23,16 @@ python scripts/train_hipergator.py \
     --capacity_mode sinkhorn \
     --seed 0 \
     --no_early_stop \
-    --dry_run \
-    --run_tag dry_sinkhorn
+    --run_tag pilot30_sinkhorn
 
 
-echo "=== DRY RUN: SOFTMAX, seed=0 ==="
+# echo "=== DRY RUN: SOFTMAX, seed=0 ==="
 
-python scripts/train_hipergator.py \
-    --sched_cfg configs.scheduler_config \
-    --cost_cfg cost_config_v3.json \
-    --capacity_mode softmax \
-    --seed 0 \
-    --no_early_stop \
-    --dry_run \
-    --run_tag dry_softmax
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg cost_config_v3.json \
+#     --capacity_mode softmax \
+#     --seed 0 \
+#     --no_early_stop \
+#     --dry_run \
+#     --run_tag dry_softmax
