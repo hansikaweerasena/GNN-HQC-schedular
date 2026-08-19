@@ -3,10 +3,10 @@
 #SBATCH --partition=hpg-b200
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=64gb
-#SBATCH --time=00:30:00
-#SBATCH --output=logs/softmax_dry_%j.log
+#SBATCH --time=20:00:00
+#SBATCH --output=logs/softmax_%j.log
 
 module purge
 module load conda
@@ -15,13 +15,23 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 
+# echo "=== DRY RUN: SINKHORN, seed=0 ==="
+
+# python scripts/train_hipergator.py \
+#     --sched_cfg configs.scheduler_config \
+#     --cost_cfg cost_config_v3.json \
+#     --capacity_mode sinkhorn \
+#     --seed 0 \
+#     --no_early_stop \
+#     --run_tag pilot30_sinkhorn
+
+
 echo "=== DRY RUN: SOFTMAX, seed=0 ==="
 
-python scripts/train_hipergator.py \
+python scripts/train_hipergator_temp.py \
     --sched_cfg configs.scheduler_config \
     --cost_cfg cost_config_v3.json \
     --capacity_mode softmax \
     --seed 0 \
     --no_early_stop \
-    --dry_run \
-    --run_tag dry_softmax
+    --run_tag pilot30_softmax
