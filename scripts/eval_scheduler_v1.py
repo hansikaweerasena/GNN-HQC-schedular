@@ -62,6 +62,7 @@ from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost, CapacityPenalty
 from utils.inference_utils import enforce_capacity_sequence
+from utils.cost_aware_hardening import cost_aware_enforce_capacity_sequence
 from utils.cost_config_reader import load_cost_config
 from baselines_tier1 import baseline_b1, baseline_b3, rank_techs_by
 from baselines_tier2 import baseline_b4, baseline_b5
@@ -105,6 +106,13 @@ def parse_args():
     p.add_argument("--is_range",   action="store_true",
                    help="Generate circuits across sizes num_qubits .. num_qubits+10. "
                         "Sizes +0..+8 get n_circuits//10 each, +9 and +10 get n_circuits//20 each.")
+    p.add_argument("--efcl-hardener", action="store_true",
+                   help="Use EFCL-aware capacity repair for MOSAIC instead of the "
+                        "default confidence-only hardener.")
+    p.add_argument("--efcl-candidate-pool", type=int, default=8,
+                   help="When --efcl-hardener is enabled, score this many lowest-soft-loss "
+                        "legal repair moves per step with TotalCost. <=0 scores all legal moves. "
+                        "Default: 8.")
     p.add_argument("--show",       action="store_true",
                    help="Show summary comparison plot interactively")
     return p.parse_args()
@@ -174,6 +182,36 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
         activation     = gnn_arch.get("activation", "relu"),
     ).to(device)
 
+    # --- capacity mechanism (C5) ---
+    # capacity_mode / sinkhorn_iters / caps are written into model_arch_params
+    # by train_hipergator. They are needed at CONSTRUCTION time: the Sinkhorn
+    # head validates capacities in __init__, before load_state_dict can supply
+    # them from the checkpoint buffers.
+    #
+    # Runs predating C5 have none of these keys and were all softmax, so that
+    # is the backward-compatible default.
+    capacity_mode = cls_arch.get("capacity_mode", "softmax")
+    sinkhorn_iters = int(cls_arch.get("sinkhorn_iters") or 30)
+    arch_caps = cls_arch.get("caps")
+
+    if capacity_mode == "sinkhorn":
+        head_caps = torch.tensor(arch_caps, dtype=torch.float32) if arch_caps else caps
+        # A mismatch means the checkpoint and the cost-config snapshot disagree
+        # about the hardware. Every downstream number (hardener burden, capacity
+        # feasibility, the baseline comparison) would be computed against a
+        # different machine than the one the model was trained for.
+        if not torch.allclose(head_caps, caps):
+            raise ValueError(
+                f"Capacity mismatch: model_arch_params caps={head_caps.tolist()} "
+                f"but cost_config_snapshot caps={caps.tolist()}. Refusing to "
+                f"evaluate — the checkpoint and config snapshot are inconsistent."
+            )
+        log(f"  capacity    : mode=sinkhorn, caps={head_caps.tolist()}, "
+            f"C_total={int(head_caps.sum())}, sinkhorn_iters={sinkhorn_iters}")
+    else:
+        head_caps = None
+        log(f"  capacity    : mode=softmax (regularizer arm / pre-C5 run)")
+
     cluster_module = SegmentClustering(
         hidden_dim          = cls_arch["hidden_dim"],
         num_clusters        = K,
@@ -182,6 +220,9 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
         temperature_min     = cls_arch["temperature_min"],
         temperature_gamma   = cls_arch["temperature_gamma"],
         neighbor_alpha_init = cls_arch.get("neighbor_alpha_learned", 0.1),
+        capacity_mode       = capacity_mode,
+        caps                = head_caps,
+        sinkhorn_iters      = sinkhorn_iters,
     ).to(device)
 
     # --- load weights ---
@@ -207,12 +248,32 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
         evol_model.load_state_dict(ckpt_dict["evol_model"])
         cluster_module.load_state_dict(ckpt_dict["cluster_head"])
         epoch     = ckpt_dict.get("epoch", "?")
+        test_efcl = ckpt_dict.get("test_efcl", None)
         test_loss = ckpt_dict.get("test_loss", float("nan"))
+        arm       = ckpt_dict.get("arm", "?")
+        seed      = ckpt_dict.get("seed", "?")
+        score = (f"test_efcl={test_efcl:.4f}" if test_efcl is not None
+                 else f"test_loss={test_loss:.4f}")
         log(f"  weights: {os.path.basename(ckpt_file)} "
-            f"(epoch={epoch}, test_loss={test_loss:.4f})")
+            f"(epoch={epoch}, arm={arm}, seed={seed}, {score})")
 
     evol_model.eval()
     cluster_module.eval()
+
+    # Confirm the annealed temperature came back with the weights. The head
+    # keeps a Python-float mirror of its temperature buffer; if the mirror were
+    # stale the model would silently be evaluated at T_init instead of T_min,
+    # producing much softer assignments and a worse-looking scheduler.
+    head = cluster_module.head
+    log(f"  temperature : T={head._T:.4f} (buffer={float(head.temperature):.4f})")
+    if abs(head._T - float(head.temperature)) > 1e-6:
+        raise RuntimeError(
+            f"Temperature mirror is stale: _T={head._T} vs buffer="
+            f"{float(head.temperature)}. Evaluating at the wrong temperature."
+        )
+    if head.sinkhorn is not None:
+        log(f"  sinkhorn    : caps={head.sinkhorn.caps.tolist()}, "
+            f"C_total={head.sinkhorn.c_total}, n_iters={head.sinkhorn.n_iters}")
 
     # --- cost module: set tau = tau_min for eval ---
     total_cost_module = TotalCost(config).to(device)
@@ -578,6 +639,9 @@ def save_results_json(
     file_tag:         str,
     is_range:         bool = False,
     mosaic_burden:    Optional[List[dict]] = None,
+    hardener_mode:    str = "confidence",
+    efcl_candidate_pool: int = 8,
+    efcl_hardener_diag: Optional[List[dict]] = None,
 ):
     """Save per-circuit metrics for all methods as JSON for downstream use."""
     baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
@@ -602,6 +666,8 @@ def save_results_json(
         "number_of_qubits": number_of_qubits,
         "is_range":         is_range,
         "tech_names":       tech_names,
+        "hardener_mode":    hardener_mode,
+        "efcl_candidate_pool": (efcl_candidate_pool if hardener_mode == "efcl" else None),
         "win_rates":        win_rates,
         "methods":          {},
     }
@@ -637,6 +703,16 @@ def save_results_json(
             "per_circuit":        mosaic_burden,
         }
 
+    if efcl_hardener_diag:
+        summary["efcl_hardener"] = {
+            "candidate_pool": int(efcl_candidate_pool),
+            "mean_candidate_evaluations": float(np.mean([d["candidate_evaluations"] for d in efcl_hardener_diag])),
+            "mean_repaired_layers": float(np.mean([d["repaired_layers"] for d in efcl_hardener_diag])),
+            "mean_committed_moves": float(np.mean([d["committed_moves"] for d in efcl_hardener_diag])),
+            "mean_seconds": float(np.mean([d["seconds"] for d in efcl_hardener_diag])),
+            "per_circuit": efcl_hardener_diag,
+        }
+
     out_path = os.path.join(save_dir, f"comparison_results_{file_tag}.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -653,13 +729,40 @@ def save_summary_txt(
     file_tag:         str,
     is_range:         bool = False,
     mosaic_burden:    Optional[List[dict]] = None,
+    hardener_mode:    str = "confidence",
+    efcl_candidate_pool: int = 8,
+    efcl_hardener_diag: Optional[List[dict]] = None,
 ):
     """Save summary.txt mirroring the console comparison table + burden block."""
     lines = ["BASELINE COMPARISON TABLE", "=" * 72, ""]
+    lines.append(f"  MOSAIC hardener    : {hardener_mode}")
+    if hardener_mode == "efcl":
+        lines.append(f"  EFCL candidate pool: {efcl_candidate_pool}")
+    lines.append("")
     lines += _format_comparison_table_lines(
         all_metrics, tech_names, K, n_circuits, number_of_qubits, is_range)
     if mosaic_burden:
         lines += _format_mosaic_burden_lines(mosaic_burden)
+    if efcl_hardener_diag:
+        lines.append("  EFCL-AWARE HARDENER COMPUTE")
+        lines.append("  " + "-" * 60)
+        lines.append(
+            f"  Candidate TotalCost evaluations/circuit : "
+            f"{np.mean([d['candidate_evaluations'] for d in efcl_hardener_diag]):.1f}"
+        )
+        lines.append(
+            f"  Repaired layers/circuit                 : "
+            f"{np.mean([d['repaired_layers'] for d in efcl_hardener_diag]):.2f}"
+        )
+        lines.append(
+            f"  Committed repair moves/circuit          : "
+            f"{np.mean([d['committed_moves'] for d in efcl_hardener_diag]):.2f}"
+        )
+        lines.append(
+            f"  EFCL hardener time/circuit              : "
+            f"{np.mean([d['seconds'] for d in efcl_hardener_diag]):.3f}s"
+        )
+        lines.append("")
     out_path = os.path.join(save_dir, f"summary_{file_tag}.txt")
     with open(out_path, "w") as f:
         f.write("\n".join(lines))
@@ -738,10 +841,20 @@ def main():
     device = "cpu"
 
     # ---- Output directory ----
+    # Keep the original output path unchanged for the default hardener.
+    # EFCL-aware runs get an explicit prefix so they cannot overwrite the
+    # confidence-hardener results.
     if args.save_dir is None:
-        save_dir = os.path.join(args.run_dir, f"eval_syn_{args.checkpoint}")
+        base_name = f"eval_syn_{args.checkpoint}"
+        if args.efcl_hardener:
+            base_name = f"efcl_hard_{base_name}"
+        save_dir = os.path.join(args.run_dir, base_name)
     else:
         save_dir = args.save_dir
+        if args.efcl_hardener:
+            parent, leaf = os.path.split(os.path.normpath(save_dir))
+            if not leaf.startswith("efcl_hard_"):
+                save_dir = os.path.join(parent, f"efcl_hard_{leaf}")
     os.makedirs(save_dir, exist_ok=True)
 
     log_section("MOSAIC BASELINE COMPARISON EVALUATION v1")
@@ -750,6 +863,9 @@ def main():
     log(f"N circuits  : {args.n_circuits}")
     log(f"Eval seed   : {args.seed}")
     log(f"is_range    : {args.is_range}")
+    log(f"Hardener    : {'EFCL-aware' if args.efcl_hardener else 'confidence-only'}")
+    if args.efcl_hardener:
+        log(f"EFCL pool   : {args.efcl_candidate_pool}")
     log(f"Save dir    : {save_dir}")
 
     # ---- Load model + cost config ----
@@ -778,6 +894,17 @@ def main():
         number_of_qubits = default_nq
         log(f"  num_qubits  : {number_of_qubits} (from run config)")
 
+    # ---- Capacity feasibility, checked up front ----
+    c_total = int(caps.sum().item())
+    log(f"  capacity    : caps={caps.tolist()}  C_total={c_total}  "
+        f"N={number_of_qubits}  rho={number_of_qubits / c_total:.3f}")
+    if number_of_qubits > c_total:
+        raise SystemExit(
+            f"N={number_of_qubits} > C_total={c_total}: no capacity-feasible "
+            f"assignment exists. Reduce --num_qubits or use a config with "
+            f"larger capacities."
+        )
+
     # ---- File tag for outputs ----
     file_tag = f"{number_of_qubits}_range" if args.is_range else f"N{number_of_qubits}"
 
@@ -794,6 +921,7 @@ def main():
     log_section("RUNNING MOSAIC + BASELINES")
     all_metrics: Dict[str, List[dict]] = {m: [] for m in METHOD_NAMES}
     mosaic_burden: List[dict] = []
+    efcl_hardener_diag: List[dict] = []
     t0 = time.time()
     global_idx = 0
     capacity_exceeded = False
@@ -816,9 +944,52 @@ def main():
             N   = rep.num_qubits
 
             # --- MOSAIC ---
-            P_seq = run_inference(evol_model, cluster_module, layer_data_list)
+            # With a Sinkhorn head the capacity check fires inside the forward
+            # pass (C_total >= N is a precondition of the transport problem),
+            # i.e. one step EARLIER than the hardener, so it must be inside the
+            # same try block or range mode would crash instead of stopping
+            # cleanly.
             try:
-                mosaic_hard = enforce_capacity_sequence(P_seq, caps)
+                P_seq = run_inference(evol_model, cluster_module, layer_data_list)
+
+                if args.efcl_hardener:
+                    # Compute structural/gamma statistics ONCE per circuit. The
+                    # EFCL-aware hardener may score hundreds of candidate repairs;
+                    # reusing these stats is essential for reasonable runtime.
+                    precomp_stats = cost_module.stats_extractor.compute_stats_cpu(
+                        segments, rep, N=N
+                    )
+
+                    # TotalCost's ASAP validation checks circuit structure, not the
+                    # assignment itself. The same circuit has already been built and
+                    # validated, so disable that repeated assertion only while scoring
+                    # repair candidates. This does not change the cost formula.
+                    old_validate = getattr(cost_module, "asap_validate", False)
+                    cost_module.asap_validate = False
+                    try:
+                        t_hard = time.time()
+                        mosaic_hard, ca_diag = cost_aware_enforce_capacity_sequence(
+                            P_seq,
+                            caps,
+                            cost_module=cost_module,
+                            segments=segments,
+                            circuit=rep,
+                            precomp_stats=precomp_stats,
+                            candidate_pool=args.efcl_candidate_pool,
+                        )
+                        hardener_seconds = time.time() - t_hard
+                    finally:
+                        cost_module.asap_validate = old_validate
+
+                    efcl_hardener_diag.append({
+                        "candidate_evaluations": int(ca_diag.candidate_evaluations),
+                        "repaired_layers": int(ca_diag.repaired_layers),
+                        "committed_moves": int(ca_diag.committed_moves),
+                        "max_initial_overflow": int(ca_diag.max_initial_overflow),
+                        "seconds": float(hardener_seconds),
+                    })
+                else:
+                    mosaic_hard = enforce_capacity_sequence(P_seq, caps)
             except ValueError as e:
                 log(f"\n  CAPACITY EXCEEDED at N={N}: {e}")
                 log(f"  Stopping range expansion. "
@@ -868,7 +1039,9 @@ def main():
                 f"B4={b4_metrics['hard_cost']:.3f}  "
                 f"B5={b5_metrics['hard_cost']:.3f}  "
                 f"burden={burden['mean_burden']:.2f}  "
-                f"({elapsed:.1f}s)"
+                + (f"EFCL_evals={efcl_hardener_diag[-1]['candidate_evaluations']}  "
+                   if args.efcl_hardener else "")
+                + f"({elapsed:.1f}s)"
             )
             global_idx += 1
 
@@ -895,14 +1068,21 @@ def main():
                            show=args.show)
 
     log_section("SAVING RESULTS")
+    hardener_mode = "efcl" if args.efcl_hardener else "confidence"
     save_results_json(all_metrics, save_dir, n_evaluated, tech_names,
                       number_of_qubits, args.run_dir, file_tag,
                       is_range=args.is_range,
-                      mosaic_burden=mosaic_burden)
+                      mosaic_burden=mosaic_burden,
+                      hardener_mode=hardener_mode,
+                      efcl_candidate_pool=args.efcl_candidate_pool,
+                      efcl_hardener_diag=(efcl_hardener_diag if args.efcl_hardener else None))
     save_summary_txt(all_metrics, save_dir, tech_names, K, n_evaluated,
                      number_of_qubits, file_tag,
                      is_range=args.is_range,
-                     mosaic_burden=mosaic_burden)
+                     mosaic_burden=mosaic_burden,
+                     hardener_mode=hardener_mode,
+                     efcl_candidate_pool=args.efcl_candidate_pool,
+                     efcl_hardener_diag=(efcl_hardener_diag if args.efcl_hardener else None))
 
     log_section("EVALUATION COMPLETE")
     log(f"All outputs saved to: {save_dir}")

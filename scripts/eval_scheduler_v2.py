@@ -1,13 +1,13 @@
 """
 eval_scheduler_v2.py  —  MOSAIC MQT Bench Zero-Shot Evaluation Script
 
-Evaluates a trained MOSAIC model against B1-B5 baselines on real algorithm
+Evaluates a trained MOSAIC model against B1/B3/B4/B5 baselines on real algorithm
 circuits from MQT Bench. This is a zero-shot evaluation — circuits come from
 a different distribution than training (structured algorithms vs ROI-composed).
 
 Selected algorithms (measurement-free, 28-32 qubits, compatible structure):
     qaoa, qft, qftentangled, vqe_real_amp, vqe_su2, vqe_two_local,
-    wstate, qgan, qnn, portfolioqaoa, portfoliovqe
+    wstate, qgan, qnn, portfolioqaoa, portfoliovqe, bv, randomcircuit
 
 Preprocessing pipeline applied to every MQT Bench circuit:
     1. Generate at BenchmarkLevel.ALG (Qiskit QuantumCircuit objects)
@@ -22,20 +22,59 @@ Preprocessing pipeline applied to every MQT Bench circuit:
 All subsequent preprocessing (segment_circuit, build_layer_graph_arrays) and
 evaluation (compute_metrics_v1, baselines) is identical to eval_scheduler_v1.py.
 
+-----------------------------------------------------------------------------
+C5 (Sinkhorn assignment head) support — what changed in this file
+-----------------------------------------------------------------------------
+1. Head reconstruction. `capacity_mode`, `sinkhorn_iters` and `caps` are read
+   from model_arch_params.json and passed to SegmentClustering at CONSTRUCTION
+   time. The Sinkhorn head validates capacities in __init__, before
+   load_state_dict can supply them from the checkpoint buffers, so they cannot
+   be recovered from the checkpoint alone. Runs predating C5 carry none of
+   these keys and were all softmax — that is the backward-compatible default.
+
+2. Three consistency checks, each guarding a failure that would otherwise
+   produce plausible-but-wrong numbers rather than an error:
+     - capacity agreement between model_arch_params.json and
+       cost_config_snapshot.json;
+     - annealed temperature restored (the head's float mirror `_T` must match
+       the `temperature` buffer, else the model is silently evaluated at
+       T_init instead of T_min);
+     - capacity feasibility (C_total >= N) checked up front, per circuit,
+       since with a Sinkhorn head this fires inside the forward pass rather
+       than at the hardener.
+
+3. Hardener-burden metrics (ported from eval_scheduler_v1.py) plus argmax
+   overflow. Sinkhorn guarantees the SOFT P is capacity-feasible; it does not
+   guarantee its row-wise argmax is. Burden is therefore an empirical quantity
+   and must be measured on the zero-shot set, not assumed from the pilot.
+
+4. Per-circuit Sinkhorn residuals. The dummy-row count is C_total - N, so it
+   changes with circuit size (N=28 -> 12 dummy rows, N=32 -> 8). The 30-iteration
+   budget was fixed by a sweep at N=30, T_min; this evaluation reports the
+   residuals actually observed at every N so the budget is verified rather than
+   extrapolated. Reported per N in the size breakdown table.
+
 Differences from eval_scheduler_v1.py:
     - Circuit source: MQT Bench algorithms instead of ROI generator
     - Summary table and figure are grouped by algorithm type
-    - Additional per-algorithm breakdown saved to JSON
+    - Additional per-algorithm and per-size breakdowns saved to JSON
     - No --n_circuits or --seed arguments (circuit set is deterministic)
     - --qubit_min / --qubit_max / --algorithms arguments for filtering
 
 Usage:
+    # Training-matched setting (N=30 only, what the pilot checkpoint covers)
     python eval_scheduler_v2.py \\
         --run_dir  results/20250101_120000_run_v1 \\
         --checkpoint best \\
-        --save_dir eval_v2_out \\
+        --qubit_min 30 --qubit_max 30 \\
+        --save_dir eval_v2_out_N30
+
+    # Size-generalisation sweep (zero-shot across N as well as distribution)
+    python eval_scheduler_v2.py \\
+        --run_dir  results/20250101_120000_run_v1 \\
+        --checkpoint best \\
         --qubit_min 28 --qubit_max 32 \\
-        --show
+        --save_dir eval_v2_out --show
 """
 
 import argparse
@@ -138,12 +177,14 @@ def parse_args():
     p.add_argument("--save_dir",   type=str, default=None,
                    help="Directory for output files.")
     p.add_argument("--qubit_min",  type=int, default=28,
-                   help="Minimum qubit count for MQT circuits (default 28)")
+                   help="Minimum qubit count for MQT circuits (default 28). "
+                        "Use --qubit_min 30 --qubit_max 30 for the "
+                        "training-matched setting.")
     p.add_argument("--qubit_max",  type=int, default=32,
                    help="Maximum qubit count for MQT circuits (default 32)")
     p.add_argument("--algorithms", type=str, default=None,
                    help="Comma-separated list of algorithms to use. "
-                        "Defaults to all 10 selected algorithms.")
+                        "Defaults to all selected algorithms.")
     p.add_argument("--show",       action="store_true",
                    help="Show summary plots interactively")
     return p.parse_args()
@@ -266,7 +307,7 @@ def load_mqt_circuits(
 
 
 # =============================================================================
-# Load run artifacts  (identical to eval_scheduler_v1.py)
+# Load run artifacts  (C5-aware; mirrors eval_scheduler_v1.py)
 # =============================================================================
 
 def _load_snapshot_cfg(snapshot_path: str) -> dict:
@@ -277,15 +318,26 @@ def _load_snapshot_cfg(snapshot_path: str) -> dict:
 
 
 def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> dict:
+    """
+    Load every artifact saved by train_hipergator.py and reconstruct:
+      - EvolvingGNN + SegmentClustering (weights from chosen checkpoint,
+        capacity mechanism supplied at construction time)
+      - TotalCost (tau set to tau_min for eval)
+      - DATASET_CFG
+      - tech_names, caps, K, w_short, w_long, config (raw dict)
+    """
     log(f"Loading run artifacts from: {run_dir}")
 
+    # --- arch params ---
     arch_path = os.path.join(run_dir, "model_arch_params.json")
     with open(arch_path) as f:
         arch = json.load(f)
     gnn_arch = arch["EvolvingGNN"]
-    cls_arch  = arch["SegmentClustering"]
-    log(f"  arch loaded: gru_hidden={gnn_arch['gru_hidden_dim']}, K={cls_arch['num_clusters']}")
+    cls_arch = arch["SegmentClustering"]
+    log(f"  arch loaded: gru_hidden={gnn_arch['gru_hidden_dim']}, "
+        f"K={cls_arch['num_clusters']}")
 
+    # --- cost config ---
     cost_cfg_path = os.path.join(run_dir, "cost_config_snapshot.json")
     config = load_cost_config(cost_cfg_path)
     K = len(config["techs"])
@@ -298,11 +350,13 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
     log(f"  cost config: K={K}, techs={tech_names}, caps={caps.tolist()}, "
         f"w_short={w_short}, w_long={w_long}")
 
+    # --- scheduler config ---
     snap_path = os.path.join(run_dir, "scheduler_config_snapshot.py")
     snap = _load_snapshot_cfg(snap_path)
     dataset_cfg = snap["DATASET_CFG"]
     log(f"  dataset cfg: seg_mode={dataset_cfg['segmentation_mode']}")
 
+    # --- rebuild GNN ---
     evol_model = EvolvingGNN(
         node_feat_dim  = gnn_arch["node_feat_dim"],
         edge_feat_dim  = gnn_arch["edge_feat_dim"],
@@ -316,6 +370,36 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
         activation     = gnn_arch.get("activation", "relu"),
     ).to(device)
 
+    # --- capacity mechanism (C5) ---
+    # capacity_mode / sinkhorn_iters / caps are written into model_arch_params
+    # by train_hipergator. They are needed at CONSTRUCTION time: the Sinkhorn
+    # head validates capacities in __init__, before load_state_dict can supply
+    # them from the checkpoint buffers.
+    #
+    # Runs predating C5 have none of these keys and were all softmax, so that
+    # is the backward-compatible default.
+    capacity_mode  = cls_arch.get("capacity_mode", "softmax")
+    sinkhorn_iters = int(cls_arch.get("sinkhorn_iters") or 30)
+    arch_caps      = cls_arch.get("caps")
+
+    if capacity_mode == "sinkhorn":
+        head_caps = torch.tensor(arch_caps, dtype=torch.float32) if arch_caps else caps
+        # A mismatch means the checkpoint and the cost-config snapshot disagree
+        # about the hardware. Every downstream number (hardener burden, capacity
+        # feasibility, the baseline comparison) would be computed against a
+        # different machine than the one the model was trained for.
+        if not torch.allclose(head_caps, caps):
+            raise ValueError(
+                f"Capacity mismatch: model_arch_params caps={head_caps.tolist()} "
+                f"but cost_config_snapshot caps={caps.tolist()}. Refusing to "
+                f"evaluate — the checkpoint and config snapshot are inconsistent."
+            )
+        log(f"  capacity    : mode=sinkhorn, caps={head_caps.tolist()}, "
+            f"C_total={int(head_caps.sum())}, sinkhorn_iters={sinkhorn_iters}")
+    else:
+        head_caps = None
+        log(f"  capacity    : mode=softmax (regularizer arm / pre-C5 run)")
+
     cluster_module = SegmentClustering(
         hidden_dim          = cls_arch["hidden_dim"],
         num_clusters        = K,
@@ -324,15 +408,19 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
         temperature_min     = cls_arch["temperature_min"],
         temperature_gamma   = cls_arch["temperature_gamma"],
         neighbor_alpha_init = cls_arch.get("neighbor_alpha_learned", 0.1),
+        capacity_mode       = capacity_mode,
+        caps                = head_caps,
+        sinkhorn_iters      = sinkhorn_iters,
     ).to(device)
 
+    # --- load weights ---
     ckpt_lower = checkpoint.lower()
     if ckpt_lower == "final":
         evol_model.load_state_dict(
             torch.load(os.path.join(run_dir, "evol_model.pt"), map_location=device))
         cluster_module.load_state_dict(
             torch.load(os.path.join(run_dir, "cluster_head.pt"), map_location=device))
-        log(f"  weights: final")
+        log(f"  weights: final (evol_model.pt + cluster_head.pt)")
     else:
         if ckpt_lower == "best":
             ckpt_file = os.path.join(run_dir, "checkpoint_best.pt")
@@ -342,35 +430,59 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
             n = ckpt_lower.split("_")[1]
             ckpt_file = os.path.join(run_dir, f"checkpoint_epoch_{n.zfill(3)}.pt")
         else:
-            raise ValueError(f"Unknown checkpoint: '{checkpoint}'")
+            raise ValueError(f"Unknown checkpoint option: '{checkpoint}'. "
+                             f"Use: final | best | last | epoch_NNN")
         ckpt_dict = torch.load(ckpt_file, map_location=device)
         evol_model.load_state_dict(ckpt_dict["evol_model"])
         cluster_module.load_state_dict(ckpt_dict["cluster_head"])
         epoch     = ckpt_dict.get("epoch", "?")
+        test_efcl = ckpt_dict.get("test_efcl", None)
         test_loss = ckpt_dict.get("test_loss", float("nan"))
+        arm       = ckpt_dict.get("arm", "?")
+        seed      = ckpt_dict.get("seed", "?")
+        score = (f"test_efcl={test_efcl:.4f}" if test_efcl is not None
+                 else f"test_loss={test_loss:.4f}")
         log(f"  weights: {os.path.basename(ckpt_file)} "
-            f"(epoch={epoch}, test_loss={test_loss:.4f})")
+            f"(epoch={epoch}, arm={arm}, seed={seed}, {score})")
 
     evol_model.eval()
     cluster_module.eval()
 
+    # Confirm the annealed temperature came back with the weights. The head
+    # keeps a Python-float mirror of its temperature buffer; if the mirror were
+    # stale the model would silently be evaluated at T_init instead of T_min,
+    # producing much softer assignments and a worse-looking scheduler.
+    head = cluster_module.head
+    log(f"  temperature : T={head._T:.4f} (buffer={float(head.temperature):.4f})")
+    if abs(head._T - float(head.temperature)) > 1e-6:
+        raise RuntimeError(
+            f"Temperature mirror is stale: _T={head._T} vs buffer="
+            f"{float(head.temperature)}. Evaluating at the wrong temperature."
+        )
+    if head.sinkhorn is not None:
+        log(f"  sinkhorn    : caps={head.sinkhorn.caps.tolist()}, "
+            f"C_total={head.sinkhorn.c_total}, n_iters={head.sinkhorn.n_iters}")
+
+    # --- cost module: set tau = tau_min for eval ---
     total_cost_module = TotalCost(config).to(device)
     tau_min = total_cost_module._tau_min
     total_cost_module.tau.fill_(tau_min)
-    log(f"  TotalCost built (tau=tau_min={tau_min:.4f})")
+    log(f"  TotalCost built (tau set to tau_min={tau_min:.4f})")
 
     return {
-        "evol_model":    evol_model,
+        "evol_model":     evol_model,
         "cluster_module": cluster_module,
-        "cost_module":   total_cost_module,
-        "config":        config,
-        "dataset_cfg":   dataset_cfg,
-        "K":             K,
-        "tech_names":    tech_names,
-        "caps":          caps,
-        "w_short":       w_short,
-        "w_long":        w_long,
-        "device":        device,
+        "cost_module":    total_cost_module,
+        "config":         config,
+        "dataset_cfg":    dataset_cfg,
+        "K":              K,
+        "tech_names":     tech_names,
+        "caps":           caps,
+        "w_short":        w_short,
+        "w_long":         w_long,
+        "device":         device,
+        "capacity_mode":  capacity_mode,
+        "sinkhorn_iters": sinkhorn_iters if capacity_mode == "sinkhorn" else None,
     }
 
 
@@ -414,6 +526,13 @@ def run_inference(
     cluster_module:  SegmentClustering,
     layer_data_list: List[Data],
 ) -> List[torch.Tensor]:
+    """
+    Return P_seq: List[Tensor[N, K]] — soft assignment per layer.
+
+    Single-circuit path: SegmentClustering leaves n_qubits=None, so the head
+    treats each [N, K] tensor as one circuit. That is correct here — capacity
+    mass is never pooled across circuits because there is only one.
+    """
     with torch.no_grad():
         h_seq, _ = evol_model(layer_data_list)
         P_seq    = cluster_module(h_seq, graphs=layer_data_list)
@@ -501,6 +620,72 @@ def compute_metrics_v1(
     }
 
 
+def compute_mosaic_burden(
+    P_seq:            List[torch.Tensor],
+    hard_assignments: List[torch.Tensor],
+    caps:             torch.Tensor,
+) -> dict:
+    """
+    MOSAIC-only hardener burden metrics.
+
+    Compares the soft model output to the post-hardening hard assignments to
+    quantify how much work the capacity-feasible rounding step had to do.
+
+    This matters more under a Sinkhorn head than under a softmax head, and for
+    the opposite reason to the obvious one. Sinkhorn guarantees the SOFT P is
+    capacity-feasible, so `pct_violating` (expected occupancy over capacity) is
+    expected to be ~0 by construction — a nonzero value there means the
+    projection is not converging at this N. But feasibility of P does NOT imply
+    feasibility of its row-wise argmax: with caps [20,20], N=30 and every qubit
+    preferring tech 0, soft occupancy is [19.66, 10.34] (feasible) while all 30
+    rows argmax to tech 0. `mean_burden` and `mean_argmax_overflow` are
+    therefore the quantities to report.
+
+    Returns dict with:
+        mean_burden          — avg qubits reassigned per layer (soft argmax → hard)
+        max_burden           — worst-case layer
+        pct_violating        — % of layers where soft expected occupancy > capacity
+        mean_argmax_overflow — avg qubits over capacity under a plain argmax,
+                               before hardening (the burden a rounding step faces)
+    """
+    T = len(P_seq)
+    caps_cpu = caps.cpu()
+    K = caps_cpu.numel()
+
+    # --- hardening burden: qubits moved per layer ---
+    soft_argmax_list = [P_t.argmax(dim=1).cpu() for P_t in P_seq]
+    burden_per_layer = [
+        (soft_argmax_list[t] != hard_assignments[t].cpu()).float().sum().item()
+        for t in range(T)
+    ]
+    mean_burden = float(np.mean(burden_per_layer)) if burden_per_layer else 0.0
+    max_burden  = float(np.max(burden_per_layer))  if burden_per_layer else 0.0
+
+    # --- capacity overflow of the SOFT assignment (expected occupancy) ---
+    violating_layers = 0
+    for P_t in P_seq:
+        expected_counts = P_t.detach().cpu().sum(dim=0)  # [K]
+        overflow = torch.relu(expected_counts - caps_cpu).sum().item()
+        if overflow > 0:
+            violating_layers += 1
+    pct_violating = violating_layers / max(T, 1) * 100.0
+
+    # --- capacity overflow of the ARGMAX assignment (pre-hardening) ---
+    argmax_overflow = []
+    for am in soft_argmax_list:
+        counts = torch.zeros(K, dtype=torch.float32)
+        counts.scatter_add_(0, am, torch.ones_like(am, dtype=torch.float32))
+        argmax_overflow.append(torch.relu(counts - caps_cpu).sum().item())
+    mean_argmax_overflow = float(np.mean(argmax_overflow)) if argmax_overflow else 0.0
+
+    return {
+        "mean_burden":          mean_burden,
+        "max_burden":           max_burden,
+        "pct_violating":        pct_violating,
+        "mean_argmax_overflow": mean_argmax_overflow,
+    }
+
+
 # =============================================================================
 # Summary table, per-algorithm table, figures, JSON
 # =============================================================================
@@ -572,9 +757,55 @@ def _format_aggregate_table_lines(
     return lines
 
 
+def _format_burden_lines(
+    mosaic_burden: List[dict],
+    capacity_mode: str,
+    caps:          torch.Tensor,
+) -> List[str]:
+    """
+    Hardener burden block.
+
+    Under `sinkhorn`, pct_violating is the sanity check (should be ~0: the soft
+    P is feasible by construction) and mean_burden / mean_argmax_overflow are
+    the reported quantities.
+    """
+    lines = []
+    if not mosaic_burden:
+        return ["  (no burden data)", ""]
+
+    keys = [
+        ("mean_burden",          "Mean hardener burden (qubits/layer)"),
+        ("max_burden",           "Max hardener burden (qubits, worst layer)"),
+        ("mean_argmax_overflow", "Mean argmax overflow (qubits/layer)"),
+        ("pct_violating",        "Layers with soft occupancy > capacity (%)"),
+    ]
+    lines.append(f"  capacity_mode = {capacity_mode}, caps = {caps.tolist()}, "
+                 f"C_total = {int(caps.sum().item())}")
+    lines.append("")
+    for key, label in keys:
+        vals = [b[key] for b in mosaic_burden]
+        lines.append(f"  {label:<48} {np.mean(vals):8.4f} ± {np.std(vals):.4f}")
+
+    if capacity_mode == "sinkhorn":
+        worst_viol = max(b["pct_violating"] for b in mosaic_burden)
+        lines.append("")
+        if worst_viol > 1e-6:
+            lines.append(
+                f"  WARNING: soft capacity violated on some layers "
+                f"(worst circuit: {worst_viol:.2f}% of layers). Under a Sinkhorn "
+                f"head this should be 0 — check convergence at this N."
+            )
+        else:
+            lines.append("  Soft capacity feasibility: OK on every layer "
+                         "(as expected under the Sinkhorn head).")
+    lines.append("")
+    return lines
+
+
 def _format_per_algorithm_table_lines(
     all_metrics:  Dict[str, List[dict]],
     circuit_info: List[Tuple[str, int]],
+    mosaic_burden: Optional[List[dict]] = None,
 ) -> List[str]:
     """Build per-algorithm breakdown as lines (shared by print and txt save)."""
     algo_groups: Dict[str, List[int]] = {}
@@ -585,9 +816,10 @@ def _format_per_algorithm_table_lines(
     lines = []
     lines.append(
         f"  {'Algorithm':<{col_w}}  {'N_circ':>6}  "
-        f"{'MOSAIC':>10}  {'BestBase':>10}  {'Winner':>10}  {'MOSAIC_cut%':>11}"
+        f"{'MOSAIC':>10}  {'BestBase':>10}  {'Winner':>10}  "
+        f"{'MOSAIC_cut%':>11}  {'Burden':>8}"
     )
-    lines.append("  " + "-" * 72)
+    lines.append("  " + "-" * 84)
 
     for algo in sorted(algo_groups.keys()):
         idxs = algo_groups[algo]
@@ -606,12 +838,69 @@ def _format_per_algorithm_table_lines(
 
         mosaic_cut = np.mean([all_metrics["MOSAIC"][i]["remote_2q_cut_rate"] * 100
                               for i in idxs])
+        if mosaic_burden:
+            burden_cell = f"{np.mean([mosaic_burden[i]['mean_burden'] for i in idxs]):8.2f}"
+        else:
+            burden_cell = f"{'—':>8}"
 
         lines.append(
             f"  {algo:<{col_w}}  {len(idxs):>6}  "
             f"{mosaic_mean:>10.4f}  {best_base_cost:>10.4f}  "
-            f"{winner:>10}  {mosaic_cut:>10.1f}%"
+            f"{winner:>10}  {mosaic_cut:>10.1f}%  {burden_cell}"
         )
+    lines.append("")
+    return lines
+
+
+def _format_per_size_table_lines(
+    all_metrics:   Dict[str, List[dict]],
+    circuit_info:  List[Tuple[str, int]],
+    mosaic_burden: List[dict],
+    residuals:     List[dict],
+    caps:          torch.Tensor,
+) -> List[str]:
+    """
+    Per-N breakdown.
+
+    The dummy-row count is C_total - N, so it changes with circuit size. The
+    Sinkhorn iteration budget was fixed at N=30; this table is what verifies
+    the budget still holds at the other sizes in the sweep rather than assuming
+    it does.
+    """
+    c_total = int(caps.sum().item())
+    size_groups: Dict[int, List[int]] = {}
+    for i, (_algo, nq) in enumerate(circuit_info):
+        size_groups.setdefault(nq, []).append(i)
+
+    lines = []
+    lines.append(
+        f"  {'N':>4}  {'dummy':>6}  {'N_circ':>6}  {'MOSAIC':>10}  "
+        f"{'BestBase':>10}  {'Burden':>8}  {'row_res':>10}  {'col_res':>10}"
+    )
+    lines.append("  " + "-" * 76)
+
+    for nq in sorted(size_groups.keys()):
+        idxs = size_groups[nq]
+        mosaic_mean = np.mean([all_metrics["MOSAIC"][i]["hard_cost"] for i in idxs])
+        base_by_m = {m: np.mean([all_metrics[m][i]["hard_cost"] for i in idxs])
+                     for m in METHOD_NAMES if m != "MOSAIC"}
+        best_base = min(base_by_m.values())
+        burden    = (np.mean([mosaic_burden[i]["mean_burden"] for i in idxs])
+                     if mosaic_burden else float("nan"))
+        if residuals and any(residuals[i] for i in idxs):
+            row_res = max(residuals[i].get("row_residual", 0.0) for i in idxs)
+            col_res = max(residuals[i].get("col_residual", 0.0) for i in idxs)
+            res_cells = f"  {row_res:>10.2e}  {col_res:>10.2e}"
+        else:
+            res_cells = f"  {'—':>10}  {'—':>10}"
+
+        lines.append(
+            f"  {nq:>4}  {c_total - nq:>6}  {len(idxs):>6}  {mosaic_mean:>10.4f}  "
+            f"{best_base:>10.4f}  {burden:>8.2f}{res_cells}"
+        )
+    lines.append("")
+    lines.append("  row_res / col_res: worst Sinkhorn marginal residual observed at "
+                 "that size (max over circuits).")
     lines.append("")
     return lines
 
@@ -629,13 +918,37 @@ def print_aggregate_table(
     print()
 
 
+def print_burden_table(mosaic_burden: List[dict], capacity_mode: str,
+                       caps: torch.Tensor):
+    log_section("MOSAIC HARDENER BURDEN (capacity-feasible rounding)")
+    for line in _format_burden_lines(mosaic_burden, capacity_mode, caps):
+        print(line)
+    print()
+
+
 def print_per_algorithm_table(
-    all_metrics:  Dict[str, List[dict]],
-    circuit_info: List[Tuple[str, int]],
+    all_metrics:   Dict[str, List[dict]],
+    circuit_info:  List[Tuple[str, int]],
+    mosaic_burden: Optional[List[dict]] = None,
 ):
     """Print a compact per-algorithm breakdown showing MOSAIC vs best baseline."""
     log_section("PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)")
-    for line in _format_per_algorithm_table_lines(all_metrics, circuit_info):
+    for line in _format_per_algorithm_table_lines(all_metrics, circuit_info,
+                                                  mosaic_burden):
+        print(line)
+    print()
+
+
+def print_per_size_table(
+    all_metrics:   Dict[str, List[dict]],
+    circuit_info:  List[Tuple[str, int]],
+    mosaic_burden: List[dict],
+    residuals:     List[dict],
+    caps:          torch.Tensor,
+):
+    log_section("PER-SIZE BREAKDOWN (zero-shot across N; Sinkhorn residuals)")
+    for line in _format_per_size_table_lines(all_metrics, circuit_info,
+                                             mosaic_burden, residuals, caps):
         print(line)
     print()
 
@@ -732,11 +1045,15 @@ def plot_mqt_figures(
 
 
 def save_results_json(
-    all_metrics:  Dict[str, List[dict]],
-    circuit_info: List[Tuple[str, int]],
-    save_dir:     str,
-    tech_names:   List[str],
-    run_dir:      str,
+    all_metrics:    Dict[str, List[dict]],
+    circuit_info:   List[Tuple[str, int]],
+    save_dir:       str,
+    tech_names:     List[str],
+    run_dir:        str,
+    checkpoint:     str,
+    capacity_meta:  dict,
+    mosaic_burden:  List[dict],
+    residuals:      List[dict],
 ):
     """Save per-circuit metrics with algorithm labels for all methods."""
     baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
@@ -756,12 +1073,17 @@ def save_results_json(
     }
 
     summary = {
-        "run_dir":      run_dir,
-        "n_circuits":   len(circuit_info),
-        "circuit_info": [{"algo": a, "nq": nq} for a, nq in circuit_info],
-        "tech_names":   tech_names,
-        "win_rates":    win_rates,
-        "methods":      {},
+        "run_dir":       run_dir,
+        "checkpoint":    checkpoint,
+        "n_circuits":    len(circuit_info),
+        "circuit_info":  [{"algo": a, "nq": nq} for a, nq in circuit_info],
+        "tech_names":    tech_names,
+        # Provenance: which capacity mechanism produced these numbers. Without
+        # this a sinkhorn result and a regularizer result are indistinguishable
+        # once the JSON leaves the run directory.
+        "capacity":      capacity_meta,
+        "win_rates":     win_rates,
+        "methods":       {},
     }
     for method in METHOD_NAMES:
         mlist = all_metrics[method]
@@ -783,7 +1105,39 @@ def save_results_json(
             },
         }
 
-    # Per-algorithm means
+    # --- MOSAIC-only: hardener burden + Sinkhorn residuals ---
+    if mosaic_burden:
+        burden_keys = ["mean_burden", "max_burden", "pct_violating",
+                       "mean_argmax_overflow"]
+        summary["mosaic_burden"] = {
+            "per_circuit": [
+                {"algo": circuit_info[i][0], "nq": circuit_info[i][1],
+                 **{k: float(b[k]) for k in burden_keys}}
+                for i, b in enumerate(mosaic_burden)
+            ],
+            "aggregate_means": {
+                k: float(np.mean([b[k] for b in mosaic_burden])) for k in burden_keys
+            },
+            "aggregate_stds": {
+                k: float(np.std([b[k] for b in mosaic_burden])) for k in burden_keys
+            },
+        }
+    if residuals and any(residuals):
+        summary["sinkhorn_residuals"] = {
+            "per_circuit": [
+                {"algo": circuit_info[i][0], "nq": circuit_info[i][1],
+                 "row_residual": float(r.get("row_residual", 0.0)),
+                 "col_residual": float(r.get("col_residual", 0.0)),
+                 "T":            float(r.get("T", float("nan")))}
+                for i, r in enumerate(residuals) if r
+            ],
+            "max_row_residual": float(max(
+                (r.get("row_residual", 0.0) for r in residuals if r), default=0.0)),
+            "max_col_residual": float(max(
+                (r.get("col_residual", 0.0) for r in residuals if r), default=0.0)),
+        }
+
+    # --- Per-algorithm means ---
     algo_groups: Dict[str, List[int]] = {}
     for i, (algo, _nq) in enumerate(circuit_info):
         algo_groups.setdefault(algo, []).append(i)
@@ -798,6 +1152,25 @@ def save_results_json(
                 for key, *_ in METRICS_CFG
             }
 
+    # --- Per-size means (zero-shot-across-N view) ---
+    size_groups: Dict[int, List[int]] = {}
+    for i, (_algo, nq) in enumerate(circuit_info):
+        size_groups.setdefault(nq, []).append(i)
+
+    summary["per_size"] = {}
+    for nq, idxs in size_groups.items():
+        entry = {"n_circuits": len(idxs)}
+        for method in METHOD_NAMES:
+            entry[method] = {
+                key: float(np.mean([_scale(key, all_metrics[method][i][key])
+                                    for i in idxs]))
+                for key, *_ in METRICS_CFG
+            }
+        if mosaic_burden:
+            entry["mean_burden"] = float(
+                np.mean([mosaic_burden[i]["mean_burden"] for i in idxs]))
+        summary["per_size"][str(nq)] = entry
+
     out_path = os.path.join(save_dir, "mqt_results.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -805,17 +1178,27 @@ def save_results_json(
 
 
 def save_summary_txt(
-    all_metrics:  Dict[str, List[dict]],
-    circuit_info: List[Tuple[str, int]],
-    save_dir:     str,
-    tech_names:   List[str],
-    K:            int,
+    all_metrics:   Dict[str, List[dict]],
+    circuit_info:  List[Tuple[str, int]],
+    save_dir:      str,
+    tech_names:    List[str],
+    K:             int,
+    capacity_mode: str,
+    caps:          torch.Tensor,
+    mosaic_burden: List[dict],
+    residuals:     List[dict],
 ):
-    """Save summary.txt with aggregate table and per-algorithm breakdown."""
+    """Save summary.txt with aggregate table, burden, and breakdowns."""
     lines = ["AGGREGATE COMPARISON TABLE (all MQT circuits)", "=" * 72, ""]
     lines += _format_aggregate_table_lines(all_metrics, circuit_info, tech_names, K)
-    lines += ["", "PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)", "=" * 72, ""]
-    lines += _format_per_algorithm_table_lines(all_metrics, circuit_info)
+    lines += ["", "MOSAIC HARDENER BURDEN", "=" * 72, ""]
+    lines += _format_burden_lines(mosaic_burden, capacity_mode, caps)
+    lines += ["", "PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)",
+              "=" * 72, ""]
+    lines += _format_per_algorithm_table_lines(all_metrics, circuit_info, mosaic_burden)
+    lines += ["", "PER-SIZE BREAKDOWN", "=" * 72, ""]
+    lines += _format_per_size_table_lines(all_metrics, circuit_info,
+                                          mosaic_burden, residuals, caps)
     out_path = os.path.join(save_dir, "summary.txt")
     with open(out_path, "w") as f:
         f.write("\n".join(lines))
@@ -868,6 +1251,26 @@ def main():
     caps           = art["caps"]
     w_short        = art["w_short"]
     w_long         = art["w_long"]
+    capacity_mode  = art["capacity_mode"]
+    sinkhorn_iters = art["sinkhorn_iters"]
+
+    # ---- Capacity feasibility, checked up front ----
+    # With a Sinkhorn head, C_total >= N is a precondition of the transport
+    # problem and fires inside the forward pass — one step EARLIER than the
+    # hardener. Screening the circuit set here turns what would be a mid-loop
+    # crash into a logged skip.
+    c_total = int(caps.sum().item())
+    log(f"  capacity    : caps={caps.tolist()}  C_total={c_total}")
+    if args.qubit_max > c_total:
+        log(f"  NOTE: --qubit_max={args.qubit_max} exceeds C_total={c_total}; "
+            f"circuits above {c_total} qubits have no capacity-feasible "
+            f"assignment and will be skipped.")
+    if args.qubit_min > c_total:
+        raise SystemExit(
+            f"--qubit_min={args.qubit_min} > C_total={c_total}: every circuit "
+            f"in the requested range is capacity-infeasible. Lower --qubit_min "
+            f"or use a config with larger capacities."
+        )
 
     # ---- Load and preprocess MQT circuits ----
     log_section("LOADING MQT BENCH CIRCUITS")
@@ -877,12 +1280,28 @@ def main():
         log("ERROR: No circuits loaded. Check mqt.bench installation and algorithm names.")
         return
 
+    # Drop capacity-infeasible sizes before the loop rather than catching them
+    # inside it — a skipped circuit here is a property of the hardware, not of
+    # the model, and belongs in the load log.
+    feasible = [(a, nq, qc) for (a, nq, qc) in mqt_circuits if nq <= c_total]
+    dropped  = len(mqt_circuits) - len(feasible)
+    if dropped:
+        log(f"  Dropped {dropped} circuits with N > C_total={c_total} "
+            f"(capacity-infeasible).")
+    mqt_circuits = feasible
+
+    if not mqt_circuits:
+        log("ERROR: No capacity-feasible circuits remain. Exiting.")
+        return
+
     log(f"  Total circuits loaded: {len(mqt_circuits)}")
 
     # ---- Per-circuit evaluation loop ----
     log_section("RUNNING MOSAIC + BASELINES ON MQT CIRCUITS")
     all_metrics: Dict[str, List[dict]] = {m: [] for m in METHOD_NAMES}
-    circuit_info: List[Tuple[str, int]] = []
+    circuit_info:  List[Tuple[str, int]] = []
+    mosaic_burden: List[dict] = []
+    residuals:     List[dict] = []
     t0 = time.time()
 
     for i, (algo, nq, qc) in enumerate(mqt_circuits):
@@ -906,11 +1325,24 @@ def main():
             depth_note = f" [T={T} < train min=55, extrapolation]"
 
         # --- MOSAIC ---
+        # Residuals are reset per circuit so the reported value is that
+        # circuit's worst layer, not a running max over everything before it.
+        # The dummy-row count is C_total - N, so this is genuinely per-size
+        # information.
         try:
+            cluster_module.reset_diagnostics()
             P_seq       = run_inference(evol_model, cluster_module, layer_data_list)
+            diag        = dict(cluster_module.diagnostics)   # {} in softmax mode
             mosaic_hard = enforce_capacity_sequence(P_seq, caps)
             mosaic_m    = compute_metrics_v1(
                 mosaic_hard, rep, segments, cost_module, caps, K, config, device)
+            burden      = compute_mosaic_burden(P_seq, mosaic_hard, caps)
+        except ValueError as e:
+            # Capacity infeasibility inside the Sinkhorn forward, or in the
+            # hardener. Should be unreachable after the screen above; logged
+            # rather than raised so one bad circuit does not lose the run.
+            log(f"  [{i+1:3d}] SKIP {algo}(N={nq}): capacity infeasible — {e}")
+            continue
         except Exception as e:
             log(f"  [{i+1:3d}] SKIP {algo}(N={nq}): MOSAIC inference failed — {e}")
             continue
@@ -936,8 +1368,14 @@ def main():
         all_metrics["B4"].append(b4_m)
         all_metrics["B5"].append(b5_m)
         circuit_info.append((algo, nq))
+        mosaic_burden.append(burden)
+        residuals.append(diag)
 
         elapsed = time.time() - t_circ
+        res_note = ""
+        if diag:
+            res_note = (f" res=({diag.get('row_residual', 0.0):.1e},"
+                        f"{diag.get('col_residual', 0.0):.1e})")
         log(
             f"  [{i+1:3d}] {algo:15s} N={N:2d} T={T:4d}{depth_note} | "
             f"MOSAIC={mosaic_m['hard_cost']:.3f} "
@@ -945,6 +1383,7 @@ def main():
             f"B3={b3_m['hard_cost']:.3f} "
             f"B4={b4_m['hard_cost']:.3f} "
             f"B5={b5_m['hard_cost']:.3f} "
+            f"burden={burden['mean_burden']:.2f}{res_note} "
             f"({elapsed:.1f}s)"
         )
 
@@ -959,14 +1398,26 @@ def main():
 
     # ---- Summary ----
     print_aggregate_table(all_metrics, circuit_info, tech_names, K)
-    print_per_algorithm_table(all_metrics, circuit_info)
+    print_burden_table(mosaic_burden, capacity_mode, caps)
+    print_per_algorithm_table(all_metrics, circuit_info, mosaic_burden)
+    print_per_size_table(all_metrics, circuit_info, mosaic_burden, residuals, caps)
 
     log_section("GENERATING FIGURES")
     plot_mqt_figures(all_metrics, circuit_info, save_dir, show=args.show)
 
     log_section("SAVING RESULTS")
-    save_results_json(all_metrics, circuit_info, save_dir, tech_names, args.run_dir)
-    save_summary_txt(all_metrics, circuit_info, save_dir, tech_names, K)
+    capacity_meta = {
+        "capacity_mode":  capacity_mode,
+        "caps":           caps.tolist(),
+        "C_total":        c_total,
+        "sinkhorn_iters": sinkhorn_iters,
+        "temperature":    float(cluster_module.head._T),
+    }
+    save_results_json(all_metrics, circuit_info, save_dir, tech_names,
+                      args.run_dir, args.checkpoint, capacity_meta,
+                      mosaic_burden, residuals)
+    save_summary_txt(all_metrics, circuit_info, save_dir, tech_names, K,
+                     capacity_mode, caps, mosaic_burden, residuals)
 
     log_section("EVALUATION COMPLETE")
     log(f"All outputs saved to: {save_dir}")
