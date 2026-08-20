@@ -7,8 +7,9 @@ Design:
   - One graph per circuit layer (no segmentation)
   - Backbone graph at layer t: edge (u,v) exists iff pair has >= 1 interaction
     within the symmetric window [t - W_long, t + W_long]
-  - Node features [N, NODE_FEAT_DIM=16]: local activity booleans + windowed
-    interaction rates + positional encoding
+  - Node features [N, node_feat_dim(global_features)]: local activity booleans
+    + windowed interaction rates + positional encoding, optionally followed by
+    two remaining-horizon ("global") features
   - Edge features [E_t, EDGE_FEAT_DIM=5]: current-layer activity flag +
     short/long windowed interaction rates (past and future)
 
@@ -19,7 +20,7 @@ technologies — the same scales used by gamma_scoring.py:
 This means window sizes are NOT hyperparameters; they follow from the
 cost model's topology parameters.
 
-Node feature layout  (NODE_FEAT_DIM = 16):
+Node feature layout  (base block, NODE_FEAT_DIM = 16):
   [0]  is_idle_now           no gate of any kind in layer t
   [1]  is_1q_now             has >= 1 one-qubit gate in layer t
   [2]  is_2q_now             participates in >= 1 two-qubit gate in layer t
@@ -37,6 +38,27 @@ Node feature layout  (NODE_FEAT_DIM = 16):
   [14] rate_2q_future_long
   [15] layer_position        t / (T-1), in [0, 1]
 
+Optional global block (GLOBAL_FEAT_DIM = 2), appended only when
+`global_features=True`:
+  [16] future_idle_fraction  idle layers in [t+1, T-1] / (T-1-t)
+  [17] future_2q_fraction    2Q participations in [t+1, T-1] / (T-1-t)
+
+Both are remaining-horizon statistics: they summarise the whole rest of the
+circuit rather than a fixed window. The existing features [4,6,8,10,12,14]
+look ahead only w_short/w_long layers, which is enough to see the next few
+gates but not enough to answer "will this qubit stay idle long enough for a
+migration to pay off?". At t=0 these two features equal the whole-circuit idle
+and 2Q fractions, so a separate pair of constant `global_*` features would be
+redundant with them.
+
+Using future information is legitimate here: MOSAIC is an offline compiler
+pass and the complete circuit is known before execution, exactly as SABRE and
+other transpiler passes assume. The base block already looks ahead; this only
+extends the horizon.
+
+Both columns are in [0, 1]. At t = T-1 the window is empty and `node_rate`
+returns zeros, matching the behaviour of the existing future-window features.
+
 Edge feature layout  (EDGE_FEAT_DIM = 5):
   [0] active_now         1 if pair has a gate in layer t, else 0
   [1] rate_past_short    interactions in [t-W_short, t-1] / W_short
@@ -45,8 +67,14 @@ Edge feature layout  (EDGE_FEAT_DIM = 5):
   [4] rate_future_long   interactions in [t+1, t+W_long]  / W_long
 
 Main API:
-    build_layer_graph_arrays(circuit, w_short, w_long)
-        -> List of T tuples: (x [N,16], edge_index [2,E], edge_attr [E,5])
+    build_layer_graph_arrays(circuit, w_short, w_long, global_features=False)
+        -> List of T tuples: (x [N,D], edge_index [2,E], edge_attr [E,5])
+           where D = node_feat_dim(global_features) = 16 or 18
+
+    node_feat_dim(global_features)
+        -> effective node feature width. Use this instead of NODE_FEAT_DIM
+           anywhere a model is constructed, so the width has a single source
+           of truth.
 
     compute_window_sizes(tech_configs)
         -> (w_short, w_long)  derived from GammaTechConfig list
@@ -62,9 +90,26 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-# Public dimension constants — import these wherever you build models
+# Public dimension constants — import these wherever you build models.
+#
+# NODE_FEAT_DIM is the BASE width and deliberately stays at 16: every caller
+# that predates the global-feature flag keeps working unchanged, because the
+# flag defaults to False everywhere. Construct models from
+# node_feat_dim(global_features) rather than from NODE_FEAT_DIM directly.
 NODE_FEAT_DIM: int = 16
+GLOBAL_FEAT_DIM: int = 2
 EDGE_FEAT_DIM: int = 5
+
+
+def node_feat_dim(global_features: bool = False) -> int:
+    """
+    Effective node feature width.
+
+    Single source of truth for the width, so the trainer, the model and the
+    dataset assertion cannot disagree. Returns 16 with the base block only,
+    18 when the remaining-horizon block is appended.
+    """
+    return NODE_FEAT_DIM + (GLOBAL_FEAT_DIM if global_features else 0)
 
 
 # =============================================================================
@@ -126,12 +171,13 @@ def build_layer_graph_arrays(
     circuit,       # CircuitRepresentation
     w_short: int,
     w_long: int,
+    global_features: bool = False,
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Build per-layer graph arrays ready for conversion to PyG Data objects.
 
     For each layer t (0 .. T-1):
-      - x          [N, NODE_FEAT_DIM]   node feature matrix
+      - x          [N, node_feat_dim(global_features)]  node feature matrix
       - edge_index [2, E_t]             backbone edge connectivity (undirected;
                                         both directions included for GATv2)
       - edge_attr  [E_t, EDGE_FEAT_DIM] edge features
@@ -147,6 +193,19 @@ def build_layer_graph_arrays(
                   and .num_qubits (int)
         w_short:  short window radius = ceil(max_kappa)
         w_long:   long  window radius = 2 * w_short
+        global_features:
+                  when True, append the two remaining-horizon columns
+                  described in the module docstring, giving width 18 instead
+                  of 16.
+
+                  This is an explicit argument rather than a module-level
+                  config read on purpose. The evaluation scripts load
+                  `scheduler_config_snapshot.py` from a run directory, not the
+                  live `scheduler_config.py`, so a module-level flag would let
+                  eval build features according to today's config instead of
+                  the config the checkpoint was trained under — silently
+                  changing what the model is fed. Passing it explicitly means
+                  a mismatch surfaces as a shape error at the first matmul.
 
     Returns:
         List of T tuples [(x_0, ei_0, ea_0), ..., (x_{T-1}, ei_{T-1}, ea_{T-1})]
@@ -276,7 +335,7 @@ def build_layer_graph_arrays(
 
     for t in range(T):
 
-        # ---- Node features [N, 16] ----
+        # ---- Node features [N, node_feat_dim(global_features)] ----
         is_idle_now = q_idle[t]
         is_1q_now   = (q_1q[t] > 0.0).astype(np.float32)
         is_2q_now   = (q_2q[t] > 0.0).astype(np.float32)
@@ -301,13 +360,25 @@ def build_layer_graph_arrays(
 
         layer_pos = np.full(N, t / T_norm, dtype=np.float32)
 
-        x = np.stack([
+        feat_cols = [
             is_idle_now, is_1q_now, is_2q_now,
             r_1q_ps, r_1q_fs, r_1q_pl, r_1q_fl,
             r_idle_ps, r_idle_fs, r_idle_pl, r_idle_fl,
             r_2q_ps, r_2q_fs, r_2q_pl, r_2q_fl,
             layer_pos,
-        ], axis=1)  # [N, 16]
+        ]  # base block, 16 columns
+
+        if global_features:
+            # Remaining-horizon statistics: the window runs to the end of the
+            # circuit instead of stopping at t+w_long. node_rate clamps the
+            # upper end to T-1 and divides by the ACTUAL window length, so
+            # these stay comparable across t and do not deflate near the tail;
+            # at t = T-1 the range is empty and it returns zeros.
+            r_idle_future_all = node_rate(prefix_idle, t + 1, T - 1)
+            r_2q_future_all   = node_rate(prefix_2q,   t + 1, T - 1)
+            feat_cols.extend([r_idle_future_all, r_2q_future_all])
+
+        x = np.stack(feat_cols, axis=1)  # [N, node_feat_dim(global_features)]
 
         # ---- Backbone edges ----
         if P == 0:
