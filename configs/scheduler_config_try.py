@@ -53,7 +53,7 @@ CLUSTER_CFG = {
     "temperature_init":  3.0,
     "temperature_min":   0.5,
     "temperature_gamma": 0.9764,
-    "sinkhorn_iters": 50,
+    "sinkhorn_iters": 100,
 
     # Neighbor-logit coordination initial mixing weight.
     # Specifies the actual alpha value in (0, 1): fraction of a qubit's logits
