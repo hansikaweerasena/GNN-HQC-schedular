@@ -103,6 +103,7 @@ from src.evolving_gnn import EvolvingGNN
 from src.clustering_head import SegmentClustering
 from src.cost_function import TotalCost
 from utils.inference_utils import enforce_capacity_sequence
+from utils.cost_aware_hardening import cost_aware_enforce_capacity_sequence
 from utils.cost_config_reader import load_cost_config
 from baselines_tier1 import baseline_b1, baseline_b3, rank_techs_by
 from baselines_tier2 import baseline_b4, baseline_b5
@@ -185,6 +186,12 @@ def parse_args():
     p.add_argument("--algorithms", type=str, default=None,
                    help="Comma-separated list of algorithms to use. "
                         "Defaults to all selected algorithms.")
+    p.add_argument("--efcl-hardener", action="store_true",
+                   help="Use EFCL-aware cost-sensitive hardening instead of the "
+                        "default confidence-only hardener.")
+    p.add_argument("--efcl-candidate-pool", type=int, default=8,
+                   help="When --efcl-hardener is enabled, score this many "
+                        "lowest-soft-loss repair candidates per step (default 8).")
     p.add_argument("--show",       action="store_true",
                    help="Show summary plots interactively")
     return p.parse_args()
@@ -1068,6 +1075,9 @@ def save_results_json(
     capacity_meta:  dict,
     mosaic_burden:  List[dict],
     residuals:      List[dict],
+    hardener_mode:  str = "confidence",
+    efcl_candidate_pool: int = 8,
+    efcl_hardener_diag: Optional[List[dict]] = None,
 ):
     """Save per-circuit metrics with algorithm labels for all methods."""
     baselines = [m for m in METHOD_NAMES if m != "MOSAIC"]
@@ -1096,6 +1106,9 @@ def save_results_json(
         # this a sinkhorn result and a regularizer result are indistinguishable
         # once the JSON leaves the run directory.
         "capacity":      capacity_meta,
+        "hardener_mode": hardener_mode,
+        "efcl_candidate_pool": (
+            efcl_candidate_pool if hardener_mode == "efcl" else None),
         "win_rates":     win_rates,
         "methods":       {},
     }
@@ -1151,6 +1164,20 @@ def save_results_json(
                 (r.get("col_residual", 0.0) for r in residuals if r), default=0.0)),
         }
 
+    if efcl_hardener_diag:
+        summary["efcl_hardener"] = {
+            "candidate_pool": int(efcl_candidate_pool),
+            "mean_candidate_evaluations": float(np.mean(
+                [d["candidate_evaluations"] for d in efcl_hardener_diag])),
+            "mean_repaired_layers": float(np.mean(
+                [d["repaired_layers"] for d in efcl_hardener_diag])),
+            "mean_committed_moves": float(np.mean(
+                [d["committed_moves"] for d in efcl_hardener_diag])),
+            "mean_seconds": float(np.mean(
+                [d["seconds"] for d in efcl_hardener_diag])),
+            "per_circuit": efcl_hardener_diag,
+        }
+
     # --- Per-algorithm means ---
     algo_groups: Dict[str, List[int]] = {}
     for i, (algo, _nq) in enumerate(circuit_info):
@@ -1201,12 +1228,33 @@ def save_summary_txt(
     caps:          torch.Tensor,
     mosaic_burden: List[dict],
     residuals:     List[dict],
+    hardener_mode: str = "confidence",
+    efcl_candidate_pool: int = 8,
+    efcl_hardener_diag: Optional[List[dict]] = None,
 ):
     """Save summary.txt with aggregate table, burden, and breakdowns."""
     lines = ["AGGREGATE COMPARISON TABLE (all MQT circuits)", "=" * 72, ""]
+    lines.append(f"  MOSAIC hardener    : {hardener_mode}")
+    if hardener_mode == "efcl":
+        lines.append(f"  EFCL candidate pool: {efcl_candidate_pool}")
+    lines.append("")
     lines += _format_aggregate_table_lines(all_metrics, circuit_info, tech_names, K)
     lines += ["", "MOSAIC HARDENER BURDEN", "=" * 72, ""]
     lines += _format_burden_lines(mosaic_burden, capacity_mode, caps)
+    if efcl_hardener_diag:
+        lines += ["", "EFCL-AWARE HARDENER COMPUTE", "=" * 72, ""]
+        lines.append(
+            "  Candidate TotalCost evaluations/circuit : "
+            f"{np.mean([d['candidate_evaluations'] for d in efcl_hardener_diag]):.1f}")
+        lines.append(
+            "  Repaired layers/circuit                 : "
+            f"{np.mean([d['repaired_layers'] for d in efcl_hardener_diag]):.2f}")
+        lines.append(
+            "  Committed repair moves/circuit          : "
+            f"{np.mean([d['committed_moves'] for d in efcl_hardener_diag]):.2f}")
+        lines.append(
+            "  EFCL hardener time/circuit              : "
+            f"{np.mean([d['seconds'] for d in efcl_hardener_diag]):.3f}s")
     lines += ["", "PER-ALGORITHM BREAKDOWN (MOSAIC hard cost vs best baseline)",
               "=" * 72, ""]
     lines += _format_per_algorithm_table_lines(all_metrics, circuit_info, mosaic_burden)
@@ -1229,15 +1277,25 @@ def main():
 
     # ---- Output directory ----
     if args.save_dir is None:
-        save_dir = os.path.join(args.run_dir, f"eval_mqt_{args.checkpoint}")
+        base_name = f"eval_mqt_{args.checkpoint}"
+        if args.efcl_hardener:
+            base_name = f"efcl_hard_{base_name}"
+        save_dir = os.path.join(args.run_dir, base_name)
     else:
         save_dir = args.save_dir
+        if args.efcl_hardener:
+            parent, leaf = os.path.split(os.path.normpath(save_dir))
+            if not leaf.startswith("efcl_hard_"):
+                save_dir = os.path.join(parent, f"efcl_hard_{leaf}")
     os.makedirs(save_dir, exist_ok=True)
 
     log_section("MOSAIC MQT BENCH ZERO-SHOT EVALUATION v2")
     log(f"Run dir     : {args.run_dir}")
     log(f"Checkpoint  : {args.checkpoint}")
     log(f"Qubit range : [{args.qubit_min}, {args.qubit_max}]")
+    log(f"Hardener    : {'EFCL-aware' if args.efcl_hardener else 'confidence-only'}")
+    if args.efcl_hardener:
+        log(f"EFCL pool   : {args.efcl_candidate_pool}")
     log(f"Save dir    : {save_dir}")
 
     # ---- Parse algorithm list ----
@@ -1317,6 +1375,7 @@ def main():
     circuit_info:  List[Tuple[str, int]] = []
     mosaic_burden: List[dict] = []
     residuals:     List[dict] = []
+    efcl_hardener_diag: List[dict] = []
     t0 = time.time()
 
     for i, (algo, nq, qc) in enumerate(mqt_circuits):
@@ -1348,7 +1407,34 @@ def main():
             cluster_module.reset_diagnostics()
             P_seq       = run_inference(evol_model, cluster_module, layer_data_list)
             diag        = dict(cluster_module.diagnostics)   # {} in softmax mode
-            mosaic_hard = enforce_capacity_sequence(P_seq, caps)
+            if args.efcl_hardener:
+                precomp_stats = cost_module.stats_extractor.compute_stats_cpu(
+                    segments, rep, N=N)
+                old_validate = getattr(cost_module, "asap_validate", False)
+                cost_module.asap_validate = False
+                try:
+                    t_hard = time.time()
+                    mosaic_hard, ca_diag = cost_aware_enforce_capacity_sequence(
+                        P_seq,
+                        caps,
+                        cost_module=cost_module,
+                        segments=segments,
+                        circuit=rep,
+                        precomp_stats=precomp_stats,
+                        candidate_pool=args.efcl_candidate_pool,
+                    )
+                    hardener_seconds = time.time() - t_hard
+                finally:
+                    cost_module.asap_validate = old_validate
+                efcl_hardener_diag.append({
+                    "candidate_evaluations": int(ca_diag.candidate_evaluations),
+                    "repaired_layers": int(ca_diag.repaired_layers),
+                    "committed_moves": int(ca_diag.committed_moves),
+                    "max_initial_overflow": int(ca_diag.max_initial_overflow),
+                    "seconds": float(hardener_seconds),
+                })
+            else:
+                mosaic_hard = enforce_capacity_sequence(P_seq, caps)
             mosaic_m    = compute_metrics_v1(
                 mosaic_hard, rep, segments, cost_module, caps, K, config, device)
             burden      = compute_mosaic_burden(P_seq, mosaic_hard, caps)
@@ -1391,6 +1477,10 @@ def main():
         if diag:
             res_note = (f" res=({diag.get('row_residual', 0.0):.1e},"
                         f"{diag.get('col_residual', 0.0):.1e})")
+        efcl_note = (
+            f"EFCL_evals={efcl_hardener_diag[-1]['candidate_evaluations']} "
+            if args.efcl_hardener else ""
+        )
         log(
             f"  [{i+1:3d}] {algo:15s} N={N:2d} T={T:4d}{depth_note} | "
             f"MOSAIC={mosaic_m['hard_cost']:.3f} "
@@ -1399,6 +1489,7 @@ def main():
             f"B4={b4_m['hard_cost']:.3f} "
             f"B5={b5_m['hard_cost']:.3f} "
             f"burden={burden['mean_burden']:.2f}{res_note} "
+            f"{efcl_note}"
             f"({elapsed:.1f}s)"
         )
 
@@ -1430,9 +1521,17 @@ def main():
     }
     save_results_json(all_metrics, circuit_info, save_dir, tech_names,
                       args.run_dir, args.checkpoint, capacity_meta,
-                      mosaic_burden, residuals)
+                      mosaic_burden, residuals,
+                      hardener_mode=("efcl" if args.efcl_hardener else "confidence"),
+                      efcl_candidate_pool=args.efcl_candidate_pool,
+                      efcl_hardener_diag=(
+                          efcl_hardener_diag if args.efcl_hardener else None))
     save_summary_txt(all_metrics, circuit_info, save_dir, tech_names, K,
-                     capacity_mode, caps, mosaic_burden, residuals)
+                     capacity_mode, caps, mosaic_burden, residuals,
+                     hardener_mode=("efcl" if args.efcl_hardener else "confidence"),
+                     efcl_candidate_pool=args.efcl_candidate_pool,
+                     efcl_hardener_diag=(
+                         efcl_hardener_diag if args.efcl_hardener else None))
 
     log_section("EVALUATION COMPLETE")
     log(f"All outputs saved to: {save_dir}")

@@ -9,22 +9,23 @@
 
 set -euo pipefail
 
-RUN_DIR="../results/pilot30_sinkhorn2"
+RUN_DIR="../results/global30_sinkhorn"
 
-echo "=== v1: synthetic circuits, N=30, MOSAIC vs B1/B3/B4/B5 ==="
-python eval_scheduler_v1.py \
-    --run_dir    "${RUN_DIR}" \
-    --checkpoint best \
-    --n_circuits 300 \
-    --seed       99999 \
-    --num_qubits 30 \
-    --efcl-hardener
-
-# echo "=== v2: MQT benchmark circuits, N=30, MOSAIC vs B1/B3/B4/B5 ==="
-# python eval_scheduler_v2.py \
-#     --run_dir "${RUN_DIR}" \
+# echo "=== v1: synthetic circuits, N=30, MOSAIC vs B1/B3/B4/B5 ==="
+# python eval_scheduler_v1.py \
+#     --run_dir    "${RUN_DIR}" \
 #     --checkpoint best \
-#     --qubit_min 30 --qubit_max 30 \
+#     --n_circuits 300 \
+#     --seed       99999 \
+#     --num_qubits 30 \
+#     --efcl-hardener
+
+echo "=== v2: MQT benchmark circuits, N=30, MOSAIC vs B1/B3/B4/B5 ==="
+python eval_scheduler_v2.py \
+    --run_dir "${RUN_DIR}" \
+    --checkpoint best \
+    --qubit_min 30 --qubit_max 30 \
+    --efcl-hardener
 
 echo ""
 echo "Results -> ${RUN_DIR}/eval_syn_best/"
