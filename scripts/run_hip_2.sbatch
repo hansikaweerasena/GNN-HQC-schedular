@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=qnn_train
+#SBATCH --job-name=sca_mia
 #SBATCH --partition=hpg-b200
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
