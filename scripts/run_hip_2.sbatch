@@ -22,4 +22,4 @@ python scripts/train_hipergator_glo.py \
     --cost_cfg cost_config_v3.json \
     --run_tag global30 \
     --global_features \
-    --dry_run
+    --capacity_mode sinkhorn
