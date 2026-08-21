@@ -7,7 +7,7 @@
 #SBATCH --mem=64gb
 #SBATCH --time=48:00:00
 #SBATCH --chdir=/blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
-#SBATCH --output=/blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular/logs/mosaic_%j.log
+#SBATCH --output=/blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular/logs/tee_%j.log
 
 module purge
 module load conda
