@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=gnn_train
+#SBATCH --job-name=tee
 #SBATCH --partition=hpg-b200
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64gb
 #SBATCH --time=12:00:00
-#SBATCH --output=logs/mosaic_%j.log
+#SBATCH --output=logs/tee_%j.log
 
 module purge
 module load conda
@@ -25,7 +25,9 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 #   --dry_run  
 
 
-python scripts/train_hipergator.py \
-  --sched_cfg configs.scheduler_config_new \
-  --cost_cfg  cost_config_v3.json \
-  --run_tag   asap_smoke
+python scripts/train_hipergator_glo.py \
+    --sched_cfg configs.scheduler_config_glo \
+    --cost_cfg cost_config_v3.json \
+    --run_tag gf30 \
+    --global_features \
+    --dry_run    
