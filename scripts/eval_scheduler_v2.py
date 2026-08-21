@@ -336,6 +336,15 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
     cls_arch = arch["SegmentClustering"]
     log(f"  arch loaded: gru_hidden={gnn_arch['gru_hidden_dim']}, "
         f"K={cls_arch['num_clusters']}")
+    # --- global (remaining-horizon) node features ---
+    # Read from arch params, not from the live scheduler_config: this script
+    # loads scheduler_config_snapshot.py from the run directory, so a
+    # module-level flag would let eval build features according to today's
+    # config instead of the config the checkpoint was trained under. Absent
+    # key => False, matching every run that predates the flag.
+    global_features = bool(gnn_arch.get("global_features", False))
+    log(f"  features    : global_features={global_features}, "
+        f"node_feat_dim={gnn_arch['node_feat_dim']}")
 
     # --- cost config ---
     cost_cfg_path = os.path.join(run_dir, "cost_config_snapshot.json")
@@ -480,6 +489,7 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
         "caps":           caps,
         "w_short":        w_short,
         "w_long":         w_long,
+        "global_features": global_features,
         "device":         device,
         "capacity_mode":  capacity_mode,
         "sinkhorn_iters": sinkhorn_iters if capacity_mode == "sinkhorn" else None,
@@ -491,8 +501,10 @@ def load_run_artifacts(run_dir: str, checkpoint: str, device: str = "cpu") -> di
 # =============================================================================
 
 def _build_layer_data_list(rep: CircuitRepresentation,
-                            w_short: int, w_long: int) -> List[Data]:
-    arrays = build_layer_graph_arrays(rep, w_short, w_long)
+                            w_short: int, w_long: int,
+                            global_features: bool = False) -> List[Data]:
+    arrays = build_layer_graph_arrays(rep, w_short, w_long,
+                                      global_features=global_features)
     return [
         Data(
             x          = torch.tensor(x_np,  dtype=torch.float32),
@@ -504,7 +516,8 @@ def _build_layer_data_list(rep: CircuitRepresentation,
 
 
 def preprocess_circuit(qc: QuantumCircuit, dataset_cfg: dict,
-                        w_short: int, w_long: int):
+                        w_short: int, w_long: int,
+                        global_features: bool = False):
     """
     Convert a clean QuantumCircuit to the internal representation used by
     the training pipeline. Identical to eval_scheduler_v1.py.
@@ -513,7 +526,8 @@ def preprocess_circuit(qc: QuantumCircuit, dataset_cfg: dict,
     seg_mode = dataset_cfg["segmentation_mode"]
     seg_thr  = float(dataset_cfg["segment_threshold"])
     segments, _ = segment_circuit(rep.layers, mode=seg_mode, threshold=seg_thr)
-    layer_data_list = _build_layer_data_list(rep, w_short, w_long)
+    layer_data_list = _build_layer_data_list(rep, w_short, w_long,
+                                             global_features)
     return rep, segments, layer_data_list
 
 
@@ -1251,6 +1265,7 @@ def main():
     caps           = art["caps"]
     w_short        = art["w_short"]
     w_long         = art["w_long"]
+    global_features = art["global_features"]
     capacity_mode  = art["capacity_mode"]
     sinkhorn_iters = art["sinkhorn_iters"]
 
@@ -1309,7 +1324,7 @@ def main():
 
         try:
             rep, segments, layer_data_list = preprocess_circuit(
-                qc, dataset_cfg, w_short, w_long)
+                qc, dataset_cfg, w_short, w_long, global_features)
         except Exception as e:
             log(f"  [{i+1:3d}] SKIP {algo}(N={nq}): preprocess failed — {e}")
             continue
