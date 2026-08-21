@@ -27,7 +27,7 @@
       "name": "spin",
       "gate_fidelity": { "f1q": 0.9998, "f2q": 0.9985, "fm": 0.9930 },
       "coherence": { "T2": 1000000.0 },
-      "routing": { "kappa": 2.7 },
+      "routing": { "kappa": 2.7,         "all_to_all": false },
       "gate_time": { "t1q": 100.0, "t2q": 1000.0, "tm": 1500.0 },
       "capacity": { "max_qubits": 20 }
     }
