@@ -9,15 +9,18 @@ Selected algorithms (measurement-free, 28-32 qubits, compatible structure):
     qaoa, qft, qftentangled, vqe_real_amp, vqe_su2, vqe_two_local,
     wstate, qgan, qnn, portfolioqaoa, portfoliovqe, bv, randomcircuit
 
-Preprocessing pipeline applied to every MQT Bench circuit:
+Preprocessing pipeline applied to every MQT Bench circuit (default: native):
     1. Generate at BenchmarkLevel.ALG (Qiskit QuantumCircuit objects)
-    2. Transpile to {cx, rz, h, x, sx} basis — ensures all gates are 1Q or 2Q,
-       no multi-qubit gates that CircuitRepresentation cannot parse
-    3. Remove final measurements (remove_final_measurements)
-    4. Strip classical registers (rebuild QuantumCircuit with quantum regs only)
+    2. Remove final measurements and classical registers
+    3. Preserve every native 1Q/2Q operation exactly as supplied by MQT Bench
+    4. Recursively decompose ONLY operations acting on 3+ qubits, using each
+       operation's Qiskit definition, until every retained operation is <=2Q
     5. Verify num_clbits == 0, num_qubits in [qubit_min, qubit_max]
-    6. Verify no 3+-qubit gates remain after transpilation
-    7. Pass clean QuantumCircuit directly to CircuitRepresentation
+    6. Verify no 3+-qubit gates remain
+    7. Pass the minimally transformed QuantumCircuit to CircuitRepresentation
+
+Legacy full-basis transpilation to {cx, rz, h, x, sx} is retained behind
+--mqt-preprocess basis for reproducibility with older MQT results.
 
 All subsequent preprocessing (segment_circuit, build_layer_graph_arrays) and
 evaluation (compute_metrics_v1, baselines) is identical to eval_scheduler_v1.py.
@@ -144,8 +147,12 @@ MQT_ALGORITHMS = [
     "randomcircuit",  # Random circuit (good diversity proxy)
 ]
 
-# Basis gate set for transpilation — ensures all gates are exactly 1Q or 2Q
+# Legacy basis used only with --mqt-preprocess basis.  The default native
+# mode deliberately does NOT normalize 1Q/2Q gates into this basis.
 MQT_BASIS_GATES = ["cx", "rz", "h", "x", "sx"]
+
+# Scheduling-inert operations.  They should not become graph/cost operations.
+_MQT_DROPPABLE = {"barrier", "delay"}
 
 
 # =============================================================================
@@ -186,6 +193,12 @@ def parse_args():
     p.add_argument("--algorithms", type=str, default=None,
                    help="Comma-separated list of algorithms to use. "
                         "Defaults to all selected algorithms.")
+    p.add_argument("--mqt-preprocess", choices=("native", "basis"),
+                   default="native",
+                   help="MQT preprocessing mode. 'native' (default) preserves all "
+                        "native 1Q/2Q gates and recursively decomposes only 3+Q "
+                        "operations. 'basis' reproduces the previous full transpile "
+                        "to {cx,rz,h,x,sx}.")
     p.add_argument("--efcl-hardener", action="store_true",
                    help="Use EFCL-aware cost-sensitive hardening instead of the "
                         "default confidence-only hardener.")
@@ -216,31 +229,105 @@ def _strip_classical_registers(qc: QuantumCircuit) -> QuantumCircuit:
 
 
 def _has_multiqubit_gates(qc: QuantumCircuit) -> bool:
-    """Return True if any gate acts on 3+ qubits."""
+    """Return True if any retained operation acts on 3+ qubits."""
     for instruction in qc.data:
         if len(instruction.qubits) >= 3:
             return True
     return False
 
 
+def _arity_counts(qc: QuantumCircuit) -> Tuple[int, int, int]:
+    """Return (#1Q, #2Q, #3+Q) for retained quantum operations."""
+    n1 = n2 = nwide = 0
+    for inst in qc.data:
+        nq = len(inst.qubits)
+        if nq == 1:
+            n1 += 1
+        elif nq == 2:
+            n2 += 1
+        elif nq >= 3:
+            nwide += 1
+    return n1, n2, nwide
+
+
+def _decompose_wide_ops_only(qc: QuantumCircuit, max_depth: int = 12) -> QuantumCircuit:
+    """
+    Preserve every <=2Q operation exactly; recursively expand only 3+Q ops.
+
+    No backend, coupling map, basis normalization, routing, or optimization is
+    invoked.  Therefore a native CP/CZ/RZZ/etc. remains one logical 2Q event.
+    Only an operation whose arity exceeds what CircuitRepresentation can consume
+    is replaced by its definition.  Barrier/delay are dropped because they are
+    scheduling-inert in MOSAIC; terminal measurements should already be removed.
+    """
+    out = QuantumCircuit(qc.num_qubits, name=qc.name)
+
+    def emit(op, mapped_qubits, depth: int):
+        name = str(getattr(op, "name", "")).lower()
+
+        # These are not logical gate events for MOSAIC.
+        if name in _MQT_DROPPABLE:
+            return
+        if name in {"measure", "reset"}:
+            raise ValueError(
+                f"unsupported mid-circuit/non-unitary operation '{name}' in MQT circuit")
+
+        nq = int(getattr(op, "num_qubits", len(mapped_qubits)))
+        if nq == 0:
+            return  # global-phase-like instruction; irrelevant to scheduling
+        if nq <= 2:
+            out.append(op, mapped_qubits)
+            return
+
+        if depth >= max_depth:
+            raise ValueError(
+                f"gate '{name}' acts on {nq} qubits and could not be reduced "
+                f"to <=2Q within {max_depth} definition levels")
+
+        definition = getattr(op, "definition", None)
+        if definition is None:
+            raise ValueError(
+                f"gate '{name}' acts on {nq} qubits but has no Qiskit definition; "
+                f"cannot minimally decompose it")
+
+        # definition qubit i maps to mapped_qubits[i] of the parent operation.
+        for subinst in definition.data:
+            subop = subinst.operation
+            sub_qidx = [definition.find_bit(q).index for q in subinst.qubits]
+            sub_mapped = [mapped_qubits[j] for j in sub_qidx]
+            emit(subop, sub_mapped, depth + 1)
+
+    for inst in qc.data:
+        if len(inst.clbits) != 0:
+            # Terminal measurements are removed before this helper. Any remaining
+            # classical dependence would not be modeled by MOSAIC.
+            raise ValueError(
+                f"operation '{inst.operation.name}' still references classical bits")
+        qidx = [qc.find_bit(q).index for q in inst.qubits]
+        emit(inst.operation, qidx, 0)
+
+    return out
+
+
 def load_mqt_circuits(
     algorithms:  List[str],
     qubit_min:   int,
     qubit_max:   int,
+    preprocess_mode: str = "native",
 ) -> List[Tuple[str, int, QuantumCircuit]]:
     """
-    Load, transpile, and filter MQT Bench circuits.
+    Load and minimally normalize MQT Bench circuits.
 
-    For each algorithm in `algorithms`, attempts to generate circuits for
-    qubit counts in [qubit_min, qubit_max]. Applies full preprocessing pipeline:
-        1. Generate at BenchmarkLevel.ALG
-        2. Transpile to MQT_BASIS_GATES
-        3. Remove final measurements
-        4. Strip classical registers
-        5. Filter: num_clbits == 0, num_qubits in range, no 3+-qubit gates
+    preprocess_mode='native' (recommended):
+      - generate BenchmarkLevel.ALG
+      - remove final measurements/classical registers
+      - preserve native 1Q/2Q gates
+      - recursively decompose ONLY 3+Q operations
 
-    Returns list of (algorithm_name, num_qubits, QuantumCircuit) triples.
-    Logs each circuit's status.
+    preprocess_mode='basis' (legacy):
+      - reproduce the previous full transpilation to MQT_BASIS_GATES at O1
+
+    Both modes return circuits containing only 1Q/2Q logical operations.
     """
     try:
         from mqt.bench import BenchmarkLevel, get_benchmark
@@ -252,56 +339,73 @@ def load_mqt_circuits(
     circuits = []
     skipped  = []
 
+    if preprocess_mode not in {"native", "basis"}:
+        raise ValueError(f"Unknown MQT preprocess mode: {preprocess_mode}")
+
     for algo in algorithms:
         for nq in range(qubit_min, qubit_max + 1):
             try:
-                # Step 1: generate at algorithmic level
+                # Step 1: algorithm-level MQT circuit.
                 qc_raw = get_benchmark(
                     benchmark=algo,
                     level=BenchmarkLevel.ALG,
                     circuit_size=nq,
                 )
 
-                # Step 2: transpile to 1Q/2Q basis
-                qc_basis = transpile(
-                    qc_raw,
-                    basis_gates=MQT_BASIS_GATES,
-                    optimization_level=1,
-                )
+                # Remove terminal measurements BEFORE arity/decomposition accounting.
+                qc_alg = qc_raw.copy()
+                qc_alg.remove_final_measurements(inplace=True)
+                qc_alg = _strip_classical_registers(qc_alg)
 
-                # Step 3: remove final measurements
-                qc_basis.remove_final_measurements(inplace=True)
+                raw_n1, raw_n2, raw_nwide = _arity_counts(qc_alg)
+                raw_size  = qc_alg.size()
+                raw_depth = qc_alg.depth()
 
-                # Step 4: strip classical registers
-                qc_clean = _strip_classical_registers(qc_basis)
+                if preprocess_mode == "native":
+                    # Minimal transform: preserve every <=2Q gate and only expand
+                    # operations that CircuitRepresentation cannot consume directly.
+                    qc_clean = _decompose_wide_ops_only(qc_alg)
+                else:
+                    # Legacy path for exact comparison with earlier MQT results.
+                    qc_basis = transpile(
+                        qc_alg,
+                        basis_gates=MQT_BASIS_GATES,
+                        optimization_level=1,
+                    )
+                    qc_clean = _strip_classical_registers(qc_basis)
 
-                # Step 5: validate
+                # Validation.
                 if qc_clean.num_clbits != 0:
                     skipped.append((algo, nq, "classical bits remain"))
                     continue
 
                 if qc_clean.num_qubits < qubit_min or qc_clean.num_qubits > qubit_max:
-                    # Transpilation may have added ancillas
                     skipped.append((algo, nq,
                         f"qubit count changed to {qc_clean.num_qubits}"))
                     continue
 
-                # Step 6: no 3+-qubit gates
                 if _has_multiqubit_gates(qc_clean):
-                    skipped.append((algo, nq, "3+-qubit gates after transpile"))
+                    skipped.append((algo, nq, "3+-qubit gates after preprocessing"))
                     continue
 
-                # Step 7: must have at least some gates
                 if qc_clean.size() == 0:
                     skipped.append((algo, nq, "empty circuit after preprocessing"))
                     continue
 
+                out_n1, out_n2, out_nwide = _arity_counts(qc_clean)
                 circuits.append((algo, qc_clean.num_qubits, qc_clean))
-                log(f"  [OK] {algo:20s} N={qc_clean.num_qubits:2d}  "
-                    f"gates={qc_clean.size():5d}")
+
+                # This log makes gate inflation explicit instead of hiding it.
+                log(
+                    f"  [OK] {algo:20s} N={qc_clean.num_qubits:2d} mode={preprocess_mode:6s} | "
+                    f"ALG gates={raw_size:5d} depth={raw_depth:4d} "
+                    f"(1Q={raw_n1},2Q={raw_n2},3+Q={raw_nwide}) -> "
+                    f"sched gates={qc_clean.size():5d} depth={qc_clean.depth():4d} "
+                    f"(1Q={out_n1},2Q={out_n2},3+Q={out_nwide})"
+                )
 
             except Exception as e:
-                skipped.append((algo, nq, str(e)[:60]))
+                skipped.append((algo, nq, str(e)[:100]))
 
     if skipped:
         log(f"  Skipped {len(skipped)} (algo, nq) combinations:")
@@ -1077,6 +1181,7 @@ def save_results_json(
     residuals:      List[dict],
     hardener_mode:  str = "confidence",
     efcl_candidate_pool: int = 8,
+    mqt_preprocess_mode: str = "native",
     efcl_hardener_diag: Optional[List[dict]] = None,
 ):
     """Save per-circuit metrics with algorithm labels for all methods."""
@@ -1106,6 +1211,7 @@ def save_results_json(
         # this a sinkhorn result and a regularizer result are indistinguishable
         # once the JSON leaves the run directory.
         "capacity":      capacity_meta,
+        "mqt_preprocess_mode": mqt_preprocess_mode,
         "hardener_mode": hardener_mode,
         "efcl_candidate_pool": (
             efcl_candidate_pool if hardener_mode == "efcl" else None),
@@ -1230,10 +1336,12 @@ def save_summary_txt(
     residuals:     List[dict],
     hardener_mode: str = "confidence",
     efcl_candidate_pool: int = 8,
+    mqt_preprocess_mode: str = "native",
     efcl_hardener_diag: Optional[List[dict]] = None,
 ):
     """Save summary.txt with aggregate table, burden, and breakdowns."""
     lines = ["AGGREGATE COMPARISON TABLE (all MQT circuits)", "=" * 72, ""]
+    lines.append(f"  MQT preprocessing : {mqt_preprocess_mode}")
     lines.append(f"  MOSAIC hardener    : {hardener_mode}")
     if hardener_mode == "efcl":
         lines.append(f"  EFCL candidate pool: {efcl_candidate_pool}")
@@ -1278,21 +1386,27 @@ def main():
     # ---- Output directory ----
     if args.save_dir is None:
         base_name = f"eval_mqt_{args.checkpoint}"
+        if args.mqt_preprocess == "native":
+            base_name = f"native_{base_name}"
         if args.efcl_hardener:
             base_name = f"efcl_hard_{base_name}"
         save_dir = os.path.join(args.run_dir, base_name)
     else:
         save_dir = args.save_dir
-        if args.efcl_hardener:
-            parent, leaf = os.path.split(os.path.normpath(save_dir))
-            if not leaf.startswith("efcl_hard_"):
-                save_dir = os.path.join(parent, f"efcl_hard_{leaf}")
+        parent, leaf = os.path.split(os.path.normpath(save_dir))
+        if args.mqt_preprocess == "native" and not leaf.startswith("native_"):
+            leaf = f"native_{leaf}"
+        if args.efcl_hardener and not leaf.startswith("efcl_hard_"):
+            leaf = f"efcl_hard_{leaf}"
+        save_dir = os.path.join(parent, leaf)
     os.makedirs(save_dir, exist_ok=True)
 
     log_section("MOSAIC MQT BENCH ZERO-SHOT EVALUATION v2")
     log(f"Run dir     : {args.run_dir}")
     log(f"Checkpoint  : {args.checkpoint}")
     log(f"Qubit range : [{args.qubit_min}, {args.qubit_max}]")
+    log(f"MQT preprocess: {args.mqt_preprocess} "
+        f"({'preserve native <=2Q; decompose only 3+Q' if args.mqt_preprocess == 'native' else 'legacy full basis transpile'})")
     log(f"Hardener    : {'EFCL-aware' if args.efcl_hardener else 'confidence-only'}")
     if args.efcl_hardener:
         log(f"EFCL pool   : {args.efcl_candidate_pool}")
@@ -1347,7 +1461,9 @@ def main():
 
     # ---- Load and preprocess MQT circuits ----
     log_section("LOADING MQT BENCH CIRCUITS")
-    mqt_circuits = load_mqt_circuits(algorithms, args.qubit_min, args.qubit_max)
+    mqt_circuits = load_mqt_circuits(
+        algorithms, args.qubit_min, args.qubit_max,
+        preprocess_mode=args.mqt_preprocess)
 
     if not mqt_circuits:
         log("ERROR: No circuits loaded. Check mqt.bench installation and algorithm names.")
@@ -1524,12 +1640,14 @@ def main():
                       mosaic_burden, residuals,
                       hardener_mode=("efcl" if args.efcl_hardener else "confidence"),
                       efcl_candidate_pool=args.efcl_candidate_pool,
+                      mqt_preprocess_mode=args.mqt_preprocess,
                       efcl_hardener_diag=(
                           efcl_hardener_diag if args.efcl_hardener else None))
     save_summary_txt(all_metrics, circuit_info, save_dir, tech_names, K,
                      capacity_mode, caps, mosaic_burden, residuals,
                      hardener_mode=("efcl" if args.efcl_hardener else "confidence"),
                      efcl_candidate_pool=args.efcl_candidate_pool,
+                     mqt_preprocess_mode=args.mqt_preprocess,
                      efcl_hardener_diag=(
                          efcl_hardener_diag if args.efcl_hardener else None))
 
