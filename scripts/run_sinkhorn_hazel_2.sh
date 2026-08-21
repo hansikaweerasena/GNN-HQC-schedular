@@ -9,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=/share/liuquantumproj/hlokuka/GNN-HQC-runs/logs/mosaic_global_%j.out
 #SBATCH --error=/share/liuquantumproj/hlokuka/GNN-HQC-runs/logs/mosaic_global_%j.err
 
@@ -79,8 +79,26 @@ echo "---- Starting MOSAIC dry run ----"
 
 "$PYTHON" scripts/train_hipergator_glo.py \
     --sched_cfg configs.scheduler_config_glo \
-    --cost_cfg cost_config_v3.json \
-    --run_tag gf30 \
+    --cost_cfg cost_config_v3_2.json \
+    --run_tag gf30_2 \
+    --results_root "$RUN_ROOT/results" \
+    --global_features \
+    --capacity_mode sinkhorn
+
+
+"$PYTHON" scripts/train_hipergator_glo.py \
+    --sched_cfg configs.scheduler_config_glo \
+    --cost_cfg cost_config_v3_3.json \
+    --run_tag gf30_3 \
+    --results_root "$RUN_ROOT/results" \
+    --global_features \
+    --capacity_mode sinkhorn
+
+
+"$PYTHON" scripts/train_hipergator_glo.py \
+    --sched_cfg configs.scheduler_config_glo \
+    --cost_cfg cost_config_v3_4.json \
+    --run_tag gf30_4 \
     --results_root "$RUN_ROOT/results" \
     --global_features \
     --capacity_mode sinkhorn
