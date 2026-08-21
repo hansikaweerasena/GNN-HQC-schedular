@@ -7,7 +7,7 @@
 #SBATCH --mem=64gb
 #SBATCH --time=48:00:00
 #SBATCH --chdir=/blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
-#SBATCH --output=/blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular/logs/tee_%j.log
+#SBATCH --output=/blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular/logs/global_%j.log
 
 module purge
 module load conda
@@ -20,6 +20,6 @@ cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 python scripts/train_hipergator_glo.py \
     --sched_cfg configs.scheduler_config_glo \
     --cost_cfg cost_config_v3.json \
-    --run_tag gf30 \
+    --run_tag global30 \
     --global_features \
-    --dry_run    
+    --dry_run
