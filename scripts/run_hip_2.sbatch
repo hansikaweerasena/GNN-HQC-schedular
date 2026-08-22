@@ -17,9 +17,23 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd /blue/prabhat/hansikam.lokukat/NoC/traceGNN/GNN-HQC-schedular
 
+# python scripts/train_hipergator_glo.py \
+#     --sched_cfg configs.scheduler_config_glo \
+#     --cost_cfg cost_config_v3.json \
+#     --run_tag global30 \
+#     --global_features \
+#     --capacity_mode sinkhorn
+
 python scripts/train_hipergator_glo.py \
     --sched_cfg configs.scheduler_config_glo \
-    --cost_cfg cost_config_v3.json \
-    --run_tag global30 \
+    --cost_cfg cost_config_v3_8.json \
+    --run_tag global30_tp8 \
     --global_features \
-    --capacity_mode sinkhorn
+    --capacity_mode sinkhorn    
+
+python scripts/train_hipergator_glo.py \
+    --sched_cfg configs.scheduler_config_glo \
+    --cost_cfg cost_config_v3_9.json \
+    --run_tag global30_tp9 \
+    --global_features \
+    --capacity_mode sinkhorn      
