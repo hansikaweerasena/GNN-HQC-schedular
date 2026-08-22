@@ -32,7 +32,7 @@ python scripts/train_hipergator_glo.py \
     --capacity_mode sinkhorn    
 
 python scripts/train_hipergator_glo.py \
-    --sched_cfg configs.scheduler_config_glo \
+    --sched_cfg configs.scheduler_config_glo_try \
     --cost_cfg cost_config_v3_9.json \
     --run_tag global30_tp9 \
     --global_features \
